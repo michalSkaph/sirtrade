@@ -1,0 +1,63 @@
+{
+  "week": 1,
+  "generation": 1,
+  "symbol": "BTCUSDT",
+  "market_source": "binance",
+  "champion": {
+    "model_id": "M2",
+    "name": "Průřezové momentum + carry",
+    "generation": 1,
+    "sortino": 5.6692383282532814,
+    "calmar": 9.900997767579643,
+    "cvar95": 0.010356720285881348,
+    "max_dd": 0.038706669481692435,
+    "cost": 7.196734168563814e-05,
+    "turnover": 0.07196734168563813,
+    "score": 3.7525585133305253,
+    "passed": true,
+    "reward_usd": 1.0
+  },
+  "decision_matrix": {
+    "formula": "S = 0.28*Sortino + 0.22*Calmar - 0.18*CVaR95 - 0.14*MaxDD - 0.10*Cost - 0.08*Turnover",
+    "weights": {
+      "sortino": 0.28,
+      "calmar": 0.22,
+      "cvar95": -0.18,
+      "max_dd": -0.14,
+      "cost": -0.1,
+      "turnover": -0.08
+    },
+    "thresholds": {
+      "min_sortino": 1.25,
+      "min_calmar": 0.8,
+      "max_dd": 0.16,
+      "max_cvar95": 0.021
+    }
+  },
+  "proposed_orders": [
+    {
+      "model_id": "M2",
+      "symbol": "BTCUSDT",
+      "side": "BUY",
+      "instrument": "spot",
+      "quantity_usd": 20.0,
+      "confidence": 1.0
+    },
+    {
+      "model_id": "M1",
+      "symbol": "BTCUSDT",
+      "side": "BUY",
+      "instrument": "spot",
+      "quantity_usd": 20.0,
+      "confidence": 1.0
+    },
+    {
+      "model_id": "M5",
+      "symbol": "BTCUSDT",
+      "side": "BUY",
+      "instrument": "spot",
+      "quantity_usd": 20.0,
+      "confidence": 0.7793262648203456
+    }
+  ]
+}

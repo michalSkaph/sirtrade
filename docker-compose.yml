@@ -1,0 +1,36 @@
+services:
+  sirtrade-ui:
+    build: .
+    container_name: sirtrade-ui
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+    restart: unless-stopped
+
+  sirtrade-runner:
+    build: .
+    container_name: sirtrade-runner
+    command: ["python", "run_automation_loop.py"]
+    environment:
+      - SIRTRADE_SOURCE=binance
+      - SIRTRADE_SYMBOL=BTCUSDT
+      - SIRTRADE_DAYS=365
+      - SIRTRADE_INTERVAL_MINUTES=15
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+    restart: unless-stopped
+
+  sirtrade-health:
+    build: .
+    container_name: sirtrade-health
+    command: ["python", "run_health_server.py"]
+    environment:
+      - SIRTRADE_HEALTH_PORT=8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
