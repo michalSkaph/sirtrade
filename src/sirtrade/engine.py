@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 from .config import AppConfig, DEFAULT_CONFIG
@@ -35,64 +36,112 @@ class TradingEngine:
         self.generation = 1
         self.week = 0
 
-    def _build_trade_events(self, model: ModelSpec, prices: pd.Series, position: pd.Series) -> list[dict]:
+    def _build_trade_events(self, model: ModelSpec, prices: pd.Series, position: pd.Series) -> tuple[list[dict], int]:
         events: list[dict] = []
-        prev = 0.0
-        for ts, current in position.fillna(0.0).items():
+        slot_size = self.config.risk.max_asset_exposure / 5
+        position_filled = position.fillna(0.0)
+        slot_series = np.floor((position_filled.abs() / (slot_size + 1e-9))).clip(0, 5).astype(int)
+        side_series = np.sign(position_filled).astype(int)
+
+        prev_side = 0
+        prev_slots = 0
+        for ts in position_filled.index:
+            current_side = int(side_series.loc[ts])
+            current_slots = int(slot_series.loc[ts])
             price = float(prices.loc[ts])
-            if prev == 0 and current != 0:
+            if prev_side == 0 and current_side != 0 and current_slots > 0:
                 events.append(
                     {
                         "timestamp": ts,
                         "model_id": model.model_id,
                         "model_name": model.name,
-                        "akce": "Vstup LONG" if current > 0 else "Vstup SHORT",
-                        "strana": "LONG" if current > 0 else "SHORT",
+                        "akce": f"Vstup { 'LONG' if current_side > 0 else 'SHORT' } (+{current_slots})",
+                        "strana": "LONG" if current_side > 0 else "SHORT",
                         "cena": price,
-                        "pozice": float(current),
+                        "pozice": float(position_filled.loc[ts]),
+                        "sloty": current_slots,
                     }
                 )
-            elif prev != 0 and current == 0:
+            elif prev_side != 0 and current_side == 0 and prev_slots > 0:
                 events.append(
                     {
                         "timestamp": ts,
                         "model_id": model.model_id,
                         "model_name": model.name,
-                        "akce": "Výstup LONG" if prev > 0 else "Výstup SHORT",
-                        "strana": "LONG" if prev > 0 else "SHORT",
-                        "cena": price,
-                        "pozice": float(current),
-                    }
-                )
-            elif prev * current < 0:
-                events.append(
-                    {
-                        "timestamp": ts,
-                        "model_id": model.model_id,
-                        "model_name": model.name,
-                        "akce": "Výstup LONG" if prev > 0 else "Výstup SHORT",
-                        "strana": "LONG" if prev > 0 else "SHORT",
+                        "akce": f"Výstup { 'LONG' if prev_side > 0 else 'SHORT' } (-{prev_slots})",
+                        "strana": "LONG" if prev_side > 0 else "SHORT",
                         "cena": price,
                         "pozice": 0.0,
+                        "sloty": 0,
                     }
                 )
+            elif prev_side != 0 and current_side != 0 and prev_side != current_side:
                 events.append(
                     {
                         "timestamp": ts,
                         "model_id": model.model_id,
                         "model_name": model.name,
-                        "akce": "Vstup LONG" if current > 0 else "Vstup SHORT",
-                        "strana": "LONG" if current > 0 else "SHORT",
+                        "akce": f"Výstup { 'LONG' if prev_side > 0 else 'SHORT' } (-{prev_slots})",
+                        "strana": "LONG" if prev_side > 0 else "SHORT",
                         "cena": price,
-                        "pozice": float(current),
+                        "pozice": 0.0,
+                        "sloty": 0,
                     }
                 )
-            prev = float(current)
-        return events
+                if current_slots > 0:
+                    events.append(
+                        {
+                            "timestamp": ts,
+                            "model_id": model.model_id,
+                            "model_name": model.name,
+                            "akce": f"Vstup { 'LONG' if current_side > 0 else 'SHORT' } (+{current_slots})",
+                            "strana": "LONG" if current_side > 0 else "SHORT",
+                            "cena": price,
+                            "pozice": float(position_filled.loc[ts]),
+                            "sloty": current_slots,
+                        }
+                    )
+            elif current_side == prev_side and current_side != 0 and current_slots != prev_slots:
+                if current_slots > prev_slots:
+                    delta = current_slots - prev_slots
+                    events.append(
+                        {
+                            "timestamp": ts,
+                            "model_id": model.model_id,
+                            "model_name": model.name,
+                            "akce": f"Vstup { 'LONG' if current_side > 0 else 'SHORT' } (+{delta})",
+                            "strana": "LONG" if current_side > 0 else "SHORT",
+                            "cena": price,
+                            "pozice": float(position_filled.loc[ts]),
+                            "sloty": current_slots,
+                        }
+                    )
+                else:
+                    delta = prev_slots - current_slots
+                    events.append(
+                        {
+                            "timestamp": ts,
+                            "model_id": model.model_id,
+                            "model_name": model.name,
+                            "akce": f"Výstup { 'LONG' if current_side > 0 else 'SHORT' } (-{delta})",
+                            "strana": "LONG" if current_side > 0 else "SHORT",
+                            "cena": price,
+                            "pozice": float(position_filled.loc[ts]),
+                            "sloty": current_slots,
+                        }
+                    )
 
-    def _simulate_model(self, model: ModelSpec, market: pd.DataFrame) -> tuple[ModelResult, list[dict], float]:
+            prev_side = current_side
+            prev_slots = current_slots
+        return events, prev_slots
+
+    def _simulate_model(self, model: ModelSpec, market: pd.DataFrame) -> tuple[ModelResult, list[dict], float, int]:
         raw = generate_signals(model, market, seed=self.week)
         pos = apply_risk_controls(raw, market["ret"], self.config.risk)
+        warmup_bars = min(48, max(12, int(len(market) * 0.1)))
+        if not pos.empty:
+            pos = pos.copy()
+            pos.iloc[:warmup_bars] = 0.0
 
         turnover = float(pos.diff().abs().fillna(0).mean())
         fee_cost = turnover * (self.config.fee_bps_assumption / 10_000)
@@ -128,11 +177,59 @@ class TradingEngine:
             score=score,
             passed=passed,
         )
-        events = self._build_trade_events(model, market["close"], pos)
+        events, final_open_slots = self._build_trade_events(model, market["close"], pos)
         final_position = float(pos.iloc[-1]) if not pos.empty else 0.0
-        return result, events, final_position
+        return result, events, final_position, int(final_open_slots)
 
-    def run_week(self, days: int = 365, market_source: str | None = None, symbol: str | None = None) -> dict:
+    def _build_model_open_positions(
+        self,
+        results_df: pd.DataFrame,
+        final_positions: dict[str, float],
+        final_open_slots: dict[str, int],
+        long_tail: pd.DataFrame,
+        default_symbol: str,
+    ) -> dict[str, list[dict]]:
+        candidates = [default_symbol]
+        if isinstance(long_tail, pd.DataFrame) and "symbol" in long_tail.columns:
+            candidates.extend([str(value) for value in long_tail["symbol"].dropna().tolist()])
+        unique_candidates = list(dict.fromkeys([symbol.upper() for symbol in candidates if str(symbol).strip()]))
+        if not unique_candidates:
+            unique_candidates = [default_symbol]
+
+        model_open_positions: dict[str, list[dict]] = {}
+        for row_index, row in results_df.reset_index(drop=True).iterrows():
+            model_id = str(row["model_id"])
+            model_name = str(row["name"])
+            slots = max(0, int(final_open_slots.get(model_id, 0)))
+            position_value = float(final_positions.get(model_id, 0.0))
+            side = "LONG" if position_value > 0 else ("SHORT" if position_value < 0 else "-")
+            if slots <= 0 or side == "-":
+                model_open_positions[model_id] = []
+                continue
+
+            start = (row_index * 3 + self.week) % len(unique_candidates)
+            rotated = unique_candidates[start:] + unique_candidates[:start]
+            selected_symbols = rotated[:slots]
+            model_open_positions[model_id] = [
+                {
+                    "slot": slot_idx + 1,
+                    "symbol": symbol,
+                    "side": side,
+                    "model_id": model_id,
+                    "model_name": model_name,
+                }
+                for slot_idx, symbol in enumerate(selected_symbols)
+            ]
+
+        return model_open_positions
+
+    def run_week(
+        self,
+        days: int = 365,
+        market_source: str | None = None,
+        symbol: str | None = None,
+        interval: str = "1d",
+    ) -> dict:
         self.week += 1
         effective_source = market_source or self.config.market_data_source
         effective_symbol = (symbol or self.config.default_symbol).upper()
@@ -141,12 +238,14 @@ class TradingEngine:
             days=days,
             symbol=effective_symbol,
             seed=100 + self.week,
+            interval=interval,
         )
 
         model_runs = [self._simulate_model(model, market) for model in self.models]
         results = [run[0] for run in model_runs]
         model_trades = {run[0].model_id: run[1] for run in model_runs}
         final_positions = {run[0].model_id: run[2] for run in model_runs}
+        final_open_slots = {run[0].model_id: run[3] for run in model_runs}
         results_df = pd.DataFrame([r.__dict__ for r in results]).sort_values("score", ascending=False)
 
         champion = results_df.iloc[0].to_dict()
@@ -158,6 +257,13 @@ class TradingEngine:
             long_tail = scan_binance_long_tail(top_n=20)
         else:
             long_tail = scan_long_tail_opportunities(seed=self.week, universe_size=300).head(20)
+        model_open_positions = self._build_model_open_positions(
+            results_df=results_df,
+            final_positions=final_positions,
+            final_open_slots=final_open_slots,
+            long_tail=long_tail,
+            default_symbol=effective_symbol,
+        )
         proposed_orders = build_dry_run_orders(results_df, symbol=effective_symbol, nav_usd=1000.0)
 
         if self.week % self.config.generation_horizon_weeks == 0:
@@ -169,12 +275,15 @@ class TradingEngine:
             "portfolio_vol_annual": float(annualized_vol(market["ret"])),
             "market_source": effective_source,
             "symbol": effective_symbol,
+            "interval": interval,
             "champion": champion,
             "results": results_df,
             "market": market,
             "model_trades": model_trades,
             "champion_trades": model_trades.get(champion_model_id, []),
             "final_positions": final_positions,
+            "final_open_slots": final_open_slots,
+            "model_open_positions": model_open_positions,
             "research": research,
             "long_tail": long_tail,
             "proposed_orders": [o.__dict__ for o in proposed_orders],

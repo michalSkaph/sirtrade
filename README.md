@@ -64,6 +64,14 @@ Launcher automaticky:
 
 ## Deploy na VPS (Docker)
 
+### One-shot produkční deploy
+Na VM můžeš spustit vše jedním příkazem:
+
+```bash
+cd ~/sirtrade
+bash deploy_production.sh
+```
+
 ### 1) Spusť služby
 ```bash
 docker compose up -d --build

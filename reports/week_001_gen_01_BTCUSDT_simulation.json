@@ -4,16 +4,16 @@
   "symbol": "BTCUSDT",
   "market_source": "simulation",
   "champion": {
-    "model_id": "M4",
-    "name": "On-chain + sentimentní vrstva",
+    "model_id": "M5",
+    "name": "Meta ansámbl",
     "generation": 1,
-    "sortino": 0.051027237258497386,
-    "calmar": 0.03351672731912636,
-    "cvar95": 0.0013052235384004023,
-    "max_dd": 0.012281718664846841,
-    "cost": 1.8325583861049184e-05,
-    "turnover": 0.018325583861049183,
-    "score": 0.0182390463253264,
+    "sortino": -4.444212301578722,
+    "calmar": -1.2099042098465806,
+    "cvar95": 0.001081683587201106,
+    "max_dd": 0.021419957577106352,
+    "cost": 7.087341272908917e-05,
+    "turnover": 0.07087341272908917,
+    "score": -1.5194288280743813,
     "passed": false,
     "reward_usd": 1.0
   },
@@ -36,20 +36,20 @@
   },
   "proposed_orders": [
     {
-      "model_id": "M4",
-      "symbol": "BTCUSDT",
-      "side": "BUY",
-      "instrument": "spot",
-      "quantity_usd": 20.0,
-      "confidence": 0.5036478092650652
-    },
-    {
       "model_id": "M5",
       "symbol": "BTCUSDT",
       "side": "SELL",
       "instrument": "perpetual",
       "quantity_usd": 20.0,
-      "confidence": 0.3430510109207317
+      "confidence": 0.19611423438512376
+    },
+    {
+      "model_id": "M1",
+      "symbol": "BTCUSDT",
+      "side": "SELL",
+      "instrument": "perpetual",
+      "quantity_usd": 20.0,
+      "confidence": 0.08185775280593194
     },
     {
       "model_id": "M2",
@@ -57,7 +57,7 @@
       "side": "SELL",
       "instrument": "perpetual",
       "quantity_usd": 20.0,
-      "confidence": 0.3358397049396522
+      "confidence": 0.0
     }
   ]
 }

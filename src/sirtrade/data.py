@@ -10,6 +10,24 @@ import pandas as pd
 
 BINANCE_BASE_URL = "https://api.binance.com"
 
+INTERVAL_TO_STEPS_PER_DAY = {
+    "1m": 1440,
+    "5m": 288,
+    "15m": 96,
+    "1h": 24,
+    "4h": 6,
+    "1d": 1,
+}
+
+INTERVAL_TO_PANDAS_FREQ = {
+    "1m": "min",
+    "5m": "5min",
+    "15m": "15min",
+    "1h": "h",
+    "4h": "4h",
+    "1d": "D",
+}
+
 
 def _http_get_json(base_url: str, path: str, params: dict | None = None) -> list | dict:
     query = urlencode(params or {})
@@ -20,19 +38,23 @@ def _http_get_json(base_url: str, path: str, params: dict | None = None) -> list
         return json.loads(response.read().decode("utf-8"))
 
 
-def simulate_market(days: int = 365, seed: int = 42) -> pd.DataFrame:
+def simulate_market(days: int = 365, seed: int = 42, interval: str = "1d") -> pd.DataFrame:
     rng = np.random.default_rng(seed)
-    idx = pd.date_range(end=pd.Timestamp.utcnow().normalize(), periods=days, freq="D")
+    steps_per_day = INTERVAL_TO_STEPS_PER_DAY.get(interval, 1)
+    periods = max(30, min(days * steps_per_day, 50_000))
+    freq = INTERVAL_TO_PANDAS_FREQ.get(interval, "D")
+    idx = pd.date_range(end=pd.Timestamp.utcnow().floor("min"), periods=periods, freq=freq)
 
-    regime = rng.choice([0, 1, 2], size=days, p=[0.5, 0.35, 0.15])
+    regime = rng.choice([0, 1, 2], size=periods, p=[0.5, 0.35, 0.15])
     drift = np.select([regime == 0, regime == 1, regime == 2], [0.0005, 0.001, -0.001], default=0.0)
     vol = np.select([regime == 0, regime == 1, regime == 2], [0.02, 0.035, 0.05], default=0.03)
-    ret = drift + rng.normal(0, vol)
+    scale = np.sqrt(max(1, steps_per_day))
+    ret = (drift / scale) + rng.normal(0, vol / scale)
 
     close = 100 * np.exp(np.cumsum(ret))
     open_ = np.roll(close, 1)
     open_[0] = close[0] * (1 - ret[0])
-    intraday = np.clip(np.abs(rng.normal(0.01, 0.006, days)), 0.002, 0.06)
+    intraday = np.clip(np.abs(rng.normal(0.01, 0.006, periods)), 0.002, 0.06)
     high = np.maximum(open_, close) * (1 + intraday)
     low = np.minimum(open_, close) * (1 - intraday)
     sentiment = np.clip(rng.normal(0, 1, days) + 0.5 * np.sign(pd.Series(ret).rolling(5).mean().fillna(0)), -3, 3)
@@ -88,13 +110,15 @@ def fetch_binance_market(symbol: str = "BTCUSDT", interval: str = "1d", limit: i
     return out
 
 
-def get_market_data(source: str, days: int, symbol: str, seed: int) -> pd.DataFrame:
+def get_market_data(source: str, days: int, symbol: str, seed: int, interval: str = "1d") -> pd.DataFrame:
+    steps_per_day = INTERVAL_TO_STEPS_PER_DAY.get(interval, 1)
+    limit = max(30, min(days * steps_per_day, 1000))
     if source == "binance":
         try:
-            return fetch_binance_market(symbol=symbol, interval="1d", limit=days)
+            return fetch_binance_market(symbol=symbol, interval=interval, limit=limit)
         except Exception:
-            return simulate_market(days=days, seed=seed)
-    return simulate_market(days=days, seed=seed)
+            return simulate_market(days=days, seed=seed, interval=interval)
+    return simulate_market(days=days, seed=seed, interval=interval)
 
 
 def scan_long_tail_opportunities(seed: int = 0, universe_size: int = 200) -> pd.DataFrame:

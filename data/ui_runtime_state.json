@@ -1,0 +1,14 @@
+{
+  "simulation_running": true,
+  "auto_center_last_candle": true,
+  "profile": "Intraday",
+  "interval": "15m",
+  "sim_days": 7,
+  "data_source": "binance",
+  "symbol": "",
+  "weeks_to_run": 1,
+  "live_refresh_enabled": true,
+  "live_refresh_seconds": 1,
+  "live_refresh_when_stopped": true,
+  "active_view": "Grafy"
+}
