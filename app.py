@@ -37,6 +37,26 @@ from src.sirtrade.ui_state import (
 st.set_page_config(page_title="SirTrade", page_icon="📈", layout="wide")
 init_db()
 
+
+def _format_datetime_label(value: object) -> str:
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return "N/A"
+    return ts.strftime("%d.%m.%y %H:%M")
+
+
+def _split_datetime_column(frame: pd.DataFrame, source_column: str, label_prefix: str) -> pd.DataFrame:
+    if source_column not in frame.columns:
+        return frame
+
+    out = frame.copy()
+    ts = pd.to_datetime(out[source_column], errors="coerce")
+    insert_at = out.columns.get_loc(source_column)
+    out.insert(insert_at, f"{label_prefix} - Datum", ts.dt.strftime("%d.%m.%y").where(ts.notna(), None))
+    out.insert(insert_at + 1, f"{label_prefix} - Čas", ts.dt.strftime("%H:%M").where(ts.notna(), None))
+    out = out.drop(columns=[source_column])
+    return out
+
 st.title("SirTrade — Autonomní obchodování krypta (Paper režim)")
 st.caption("Bezpečný simulační režim: spot + perpetuals logika, bez páky, týdenní governance.")
 st.info(
@@ -52,12 +72,12 @@ elif automation_status.get("ok"):
     result = automation_status.get("result", {})
     champ = result.get("champion", {})
     st.success(
-        f"Worker běží správně | Poslední aktualizace: {automation_status.get('updated_at')} | "
+        f"Worker běží správně | Poslední aktualizace: {_format_datetime_label(automation_status.get('updated_at'))} | "
         f"Symbol: {result.get('symbol', 'N/A')} | Vítěz: {champ.get('name', 'N/A')}"
     )
 else:
     st.error(
-        f"Worker hlásí chybu | Poslední aktualizace: {automation_status.get('updated_at')} | "
+        f"Worker hlásí chybu | Poslední aktualizace: {_format_datetime_label(automation_status.get('updated_at'))} | "
         f"Chyba: {automation_status.get('error', 'Neznámá chyba')}"
     )
 
@@ -441,6 +461,7 @@ else:
             )
 
         model_positions_df = pd.DataFrame(model_position_rows)
+        model_positions_df = _split_datetime_column(model_positions_df, "Otevřeno od", "Otevřeno")
 
         def _style_side(value):
             if value == "LONG":
@@ -483,6 +504,7 @@ else:
                 }
             )
             open_view["Zdroj dat"] = open_view["Zdroj dat"].replace({"simulation": "Simulace", "binance": "Binance"})
+            open_view = _split_datetime_column(open_view, "Naposledy aktualizováno", "Aktualizace")
             if "Směr" in open_view.columns:
                 open_view["Směr"] = (
                     open_view["Směr"]
@@ -553,6 +575,8 @@ else:
                         }
                     )
                     overview["Zdroj dat"] = overview["Zdroj dat"].replace({"simulation": "Simulace", "binance": "Binance"})
+                    overview = _split_datetime_column(overview, "Uzavřeno", "Uzavřeno")
+                    overview = _split_datetime_column(overview, "Otevřeno", "Otevřeno")
 
                     wins = int((overview["PnL %"] > 0).sum())
                     losses = int((overview["PnL %"] < 0).sum())
@@ -994,9 +1018,11 @@ else:
         }
     )
         persisted_view["Zdroj dat"] = persisted_view["Zdroj dat"].replace({"simulation": "Simulace", "binance": "Binance"})
+        persisted_view = _split_datetime_column(persisted_view, "Vytvořeno", "Vytvořeno")
         persisted_config = {
         "ID": st.column_config.NumberColumn("ID", help="Interní ID uloženého běhu."),
-        "Vytvořeno": st.column_config.TextColumn("Vytvořeno", help="Čas uložení záznamu do SQLite."),
+        "Vytvořeno - Datum": st.column_config.TextColumn("Vytvořeno - Datum", help="Datum uložení záznamu (dd.mm.yy)."),
+        "Vytvořeno - Čas": st.column_config.TextColumn("Vytvořeno - Čas", help="Čas uložení záznamu (hh:mm)."),
         "Týden": st.column_config.NumberColumn("Týden", help="Pořadí týdenního vyhodnocení."),
         "Generace": st.column_config.NumberColumn("Generace", help="Generace modelové populace."),
         "Zdroj dat": st.column_config.TextColumn("Zdroj dat", help="Použitý zdroj tržních dat (Simulace/Binance)."),
