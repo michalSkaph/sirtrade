@@ -57,8 +57,17 @@ def simulate_market(days: int = 365, seed: int = 42, interval: str = "1d") -> pd
     intraday = np.clip(np.abs(rng.normal(0.01, 0.006, periods)), 0.002, 0.06)
     high = np.maximum(open_, close) * (1 + intraday)
     low = np.minimum(open_, close) * (1 - intraday)
-    sentiment = np.clip(rng.normal(0, 1, days) + 0.5 * np.sign(pd.Series(ret).rolling(5).mean().fillna(0)), -3, 3)
-    onchain = np.clip(rng.normal(0, 1, days) + 0.7 * np.sign(pd.Series(ret).rolling(10).mean().fillna(0)), -3, 3)
+    ret_series = pd.Series(ret)
+    sentiment = np.clip(
+        rng.normal(0, 1, periods) + 0.5 * np.sign(ret_series.rolling(5).mean().fillna(0)).to_numpy(),
+        -3,
+        3,
+    )
+    onchain = np.clip(
+        rng.normal(0, 1, periods) + 0.7 * np.sign(ret_series.rolling(10).mean().fillna(0)).to_numpy(),
+        -3,
+        3,
+    )
 
     df = pd.DataFrame(
         {
