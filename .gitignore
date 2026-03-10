@@ -13,9 +13,5 @@ reports/*
 !data/.gitkeep
 !reports/.gitkeep
 
-# Keep folders in repository
-data/.gitkeep
-reports/.gitkeep
-
 # Editor
 .vscode/
