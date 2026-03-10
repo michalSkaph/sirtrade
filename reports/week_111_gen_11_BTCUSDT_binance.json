@@ -1,19 +1,19 @@
 {
-  "week": 1,
-  "generation": 1,
+  "week": 111,
+  "generation": 11,
   "symbol": "BTCUSDT",
   "market_source": "binance",
   "champion": {
-    "model_id": "SC_M4",
-    "name": "Scalp | On-chain + sentimentní vrstva",
-    "generation": 1,
-    "sortino": -1.2557225332636301,
-    "calmar": -0.3577468936154804,
-    "cvar95": 0.00026227171229794606,
-    "max_dd": 0.005101866260966537,
-    "cost": 6.828703703703704e-06,
-    "turnover": 0.006828703703703704,
-    "score": -0.4316150752606378,
+    "model_id": "M7",
+    "name": "Potomek B (mutované momentum)",
+    "generation": 9,
+    "sortino": -1.6445305938108847,
+    "calmar": -0.41135098334631104,
+    "cvar95": 0.0003431349425584171,
+    "max_dd": 0.007894396065883713,
+    "cost": 1.0416666666666666e-05,
+    "turnover": 0.010416666666666666,
+    "score": -0.5529671373421206,
     "passed": false,
     "reward_usd": 1.0
   },
@@ -36,28 +36,28 @@
   },
   "proposed_orders": [
     {
-      "model_id": "SC_M4",
+      "model_id": "M7",
       "symbol": "BTCUSDT",
       "side": "SELL",
       "instrument": "perpetual",
       "quantity_usd": 20.0,
-      "confidence": 0.4136769849478724
+      "confidence": 0.3894065725315759
     },
     {
-      "model_id": "SC_M2",
+      "model_id": "M7",
       "symbol": "BTCUSDT",
       "side": "SELL",
       "instrument": "perpetual",
       "quantity_usd": 20.0,
-      "confidence": 0.38972247932249576
+      "confidence": 0.3894065725315759
     },
     {
-      "model_id": "SC_M5",
+      "model_id": "M7",
       "symbol": "BTCUSDT",
       "side": "SELL",
       "instrument": "perpetual",
       "quantity_usd": 20.0,
-      "confidence": 0.3568202885476395
+      "confidence": 0.3894065725315759
     }
   ]
 }

@@ -1,5 +1,5 @@
 {
-  "week": 1,
+  "week": 7,
   "generation": 1,
   "symbol": "BTCUSDT",
   "market_source": "binance",
@@ -7,13 +7,13 @@
     "model_id": "SC_M4",
     "name": "Scalp | On-chain + sentimentní vrstva",
     "generation": 1,
-    "sortino": -1.2557225332636301,
-    "calmar": -0.3577468936154804,
-    "cvar95": 0.00026227171229794606,
-    "max_dd": 0.005101866260966537,
-    "cost": 6.828703703703704e-06,
-    "turnover": 0.006828703703703704,
-    "score": -0.4316150752606378,
+    "sortino": -1.0589522281459387,
+    "calmar": -0.25093822460746884,
+    "cvar95": 0.0002599735914705087,
+    "max_dd": 0.005718123475676462,
+    "cost": 7.175925925925926e-06,
+    "turnover": 0.007175925925925926,
+    "score": -0.35313515749423197,
     "passed": false,
     "reward_usd": 1.0
   },
@@ -41,7 +41,7 @@
       "side": "SELL",
       "instrument": "perpetual",
       "quantity_usd": 20.0,
-      "confidence": 0.4136769849478724
+      "confidence": 0.4293729685011536
     },
     {
       "model_id": "SC_M2",
@@ -49,15 +49,15 @@
       "side": "SELL",
       "instrument": "perpetual",
       "quantity_usd": 20.0,
-      "confidence": 0.38972247932249576
+      "confidence": 0.3894065725315759
     },
     {
-      "model_id": "SC_M5",
+      "model_id": "SC_M1",
       "symbol": "BTCUSDT",
       "side": "SELL",
       "instrument": "perpetual",
       "quantity_usd": 20.0,
-      "confidence": 0.3568202885476395
+      "confidence": 0.3479584913168634
     }
   ]
 }

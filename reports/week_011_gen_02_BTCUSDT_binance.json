@@ -1,19 +1,19 @@
 {
-  "week": 1,
-  "generation": 1,
+  "week": 11,
+  "generation": 2,
   "symbol": "BTCUSDT",
   "market_source": "binance",
   "champion": {
-    "model_id": "SC_M4",
-    "name": "Scalp | On-chain + sentimentní vrstva",
-    "generation": 1,
-    "sortino": -1.2557225332636301,
-    "calmar": -0.3577468936154804,
-    "cvar95": 0.00026227171229794606,
-    "max_dd": 0.005101866260966537,
-    "cost": 6.828703703703704e-06,
-    "turnover": 0.006828703703703704,
-    "score": -0.4316150752606378,
+    "model_id": "M10",
+    "name": "Stabilizační kotva overlay",
+    "generation": 2,
+    "sortino": -0.8045282645864853,
+    "calmar": -0.2373392726331911,
+    "cvar95": 0.0002518478754142636,
+    "max_dd": 0.004934062504436287,
+    "cost": 6.886574074074075e-06,
+    "turnover": 0.0068865740740740745,
+    "score": -0.27877027001504695,
     "passed": false,
     "reward_usd": 1.0
   },
@@ -36,12 +36,20 @@
   },
   "proposed_orders": [
     {
+      "model_id": "M10",
+      "symbol": "BTCUSDT",
+      "side": "SELL",
+      "instrument": "perpetual",
+      "quantity_usd": 20.0,
+      "confidence": 0.44424594599699063
+    },
+    {
       "model_id": "SC_M4",
       "symbol": "BTCUSDT",
       "side": "SELL",
       "instrument": "perpetual",
       "quantity_usd": 20.0,
-      "confidence": 0.4136769849478724
+      "confidence": 0.3903299008254557
     },
     {
       "model_id": "SC_M2",
@@ -49,15 +57,7 @@
       "side": "SELL",
       "instrument": "perpetual",
       "quantity_usd": 20.0,
-      "confidence": 0.38972247932249576
-    },
-    {
-      "model_id": "SC_M5",
-      "symbol": "BTCUSDT",
-      "side": "SELL",
-      "instrument": "perpetual",
-      "quantity_usd": 20.0,
-      "confidence": 0.3568202885476395
+      "confidence": 0.3894065725315759
     }
   ]
 }

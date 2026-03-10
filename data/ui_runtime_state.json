@@ -1,14 +1,19 @@
 {
   "simulation_running": true,
+  "simulation_running_by_segment": {
+    "Scalp": true,
+    "Intraday": true,
+    "Swing": true
+  },
   "auto_center_last_candle": true,
-  "profile": "Intraday",
-  "interval": "15m",
-  "sim_days": 7,
+  "active_segment": "Scalp",
   "data_source": "binance",
   "symbol": "",
   "weeks_to_run": 1,
   "live_refresh_enabled": true,
   "live_refresh_seconds": 1,
   "live_refresh_when_stopped": true,
-  "active_view": "Grafy"
+  "simulation_cycle_seconds": 10,
+  "active_view": "Uzavřené pozice",
+  "last_simulation_tick": 1773177526.4881918
 }

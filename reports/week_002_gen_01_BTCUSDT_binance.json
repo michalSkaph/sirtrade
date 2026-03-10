@@ -4,16 +4,16 @@
   "symbol": "BTCUSDT",
   "market_source": "binance",
   "champion": {
-    "model_id": "M5",
-    "name": "Meta ansámbl",
+    "model_id": "SC_M2",
+    "name": "Scalp | Průřezové momentum + carry",
     "generation": 1,
-    "sortino": -8.506721393498879,
-    "calmar": -1.2128001091451042,
-    "cvar95": 0.0007260187008961586,
-    "max_dd": 0.027246779079776462,
-    "cost": 7.250637457150939e-05,
-    "turnover": 0.0725063745715094,
-    "score": -2.658451007232117,
+    "sortino": -1.638517000335762,
+    "calmar": -0.41184825937074543,
+    "cvar95": 0.0003431349425584171,
+    "max_dd": 0.007857763873452162,
+    "cost": 1.0416666666666666e-05,
+    "turnover": 0.010416666666666666,
+    "score": -0.5513876033875212,
     "passed": false,
     "reward_usd": 1.0
   },
@@ -36,28 +36,28 @@
   },
   "proposed_orders": [
     {
-      "model_id": "M5",
+      "model_id": "SC_M2",
       "symbol": "BTCUSDT",
       "side": "SELL",
       "instrument": "perpetual",
       "quantity_usd": 20.0,
-      "confidence": 0.0
+      "confidence": 0.38972247932249576
     },
     {
-      "model_id": "M2",
+      "model_id": "SC_M4",
       "symbol": "BTCUSDT",
       "side": "SELL",
       "instrument": "perpetual",
       "quantity_usd": 20.0,
-      "confidence": 0.0
+      "confidence": 0.3660167551160544
     },
     {
-      "model_id": "M1",
+      "model_id": "SC_M5",
       "symbol": "BTCUSDT",
       "side": "SELL",
       "instrument": "perpetual",
       "quantity_usd": 20.0,
-      "confidence": 0.0
+      "confidence": 0.35534132394509227
     }
   ]
 }
