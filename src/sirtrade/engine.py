@@ -137,11 +137,87 @@ class TradingEngine:
 
     def _simulate_model(self, model: ModelSpec, market: pd.DataFrame) -> tuple[ModelResult, list[dict], float, int]:
         raw = generate_signals(model, market, seed=self.week)
-        pos = apply_risk_controls(raw, market["ret"], self.config.risk)
+        controlled_signal = apply_risk_controls(raw, market["ret"], self.config.risk)
+
+        close = market["close"].astype(float)
+        high = market["high"].astype(float)
+        low = market["low"].astype(float)
+        ret_std = market["ret"].fillna(0.0).rolling(20).std().fillna(0.0)
+
+        slot_size = self.config.risk.max_asset_exposure / 5
+        entry_threshold = 0.17
         warmup_bars = min(48, max(12, int(len(market) * 0.1)))
-        if not pos.empty:
-            pos = pos.copy()
-            pos.iloc[:warmup_bars] = 0.0
+
+        pos = pd.Series(0.0, index=market.index, dtype=float)
+        side = 0
+        position_size = 0.0
+        stop_price = None
+        target_price = None
+        entry_price = None
+        cooldown_remaining = 0
+
+        for step, ts in enumerate(market.index):
+            signal_value = float(controlled_signal.loc[ts])
+            close_price = float(close.loc[ts])
+            high_price = float(high.loc[ts])
+            low_price = float(low.loc[ts])
+            vol_step = float(ret_std.loc[ts])
+            if np.isnan(vol_step) or vol_step <= 0:
+                vol_step = 0.01
+
+            if step < warmup_bars:
+                pos.loc[ts] = 0.0
+                continue
+
+            if side == 0:
+                if cooldown_remaining > 0:
+                    cooldown_remaining -= 1
+                    pos.loc[ts] = 0.0
+                    continue
+
+                if abs(signal_value) >= entry_threshold:
+                    direction = 1 if signal_value > 0 else -1
+                    slots = int(np.clip(np.ceil(abs(signal_value) * 5), 1, 5))
+                    position_size = float(direction * slots * slot_size)
+                    side = direction
+                    entry_price = close_price
+
+                    stop_dist = max(0.004, 1.2 * vol_step)
+                    target_dist = max(0.008, 2.4 * vol_step)
+                    if side > 0:
+                        stop_price = entry_price * (1.0 - stop_dist)
+                        target_price = entry_price * (1.0 + target_dist)
+                    else:
+                        stop_price = entry_price * (1.0 + stop_dist)
+                        target_price = entry_price * (1.0 - target_dist)
+
+                    pos.loc[ts] = position_size
+                else:
+                    pos.loc[ts] = 0.0
+                continue
+
+            hit_exit = False
+            if side > 0:
+                if stop_price is not None and low_price <= stop_price:
+                    hit_exit = True
+                if target_price is not None and high_price >= target_price:
+                    hit_exit = True
+            else:
+                if stop_price is not None and high_price >= stop_price:
+                    hit_exit = True
+                if target_price is not None and low_price <= target_price:
+                    hit_exit = True
+
+            if hit_exit:
+                pos.loc[ts] = 0.0
+                side = 0
+                position_size = 0.0
+                stop_price = None
+                target_price = None
+                entry_price = None
+                cooldown_remaining = 3
+            else:
+                pos.loc[ts] = position_size
 
         turnover = float(pos.diff().abs().fillna(0).mean())
         fee_cost = turnover * (self.config.fee_bps_assumption / 10_000)
