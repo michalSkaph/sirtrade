@@ -24,13 +24,19 @@ class ModelSpec:
     generation: int
 
 
-def default_model_specs() -> list[ModelSpec]:
+def default_model_specs(namespace: str = "", label_prefix: str = "") -> list[ModelSpec]:
+    ns = str(namespace).strip().upper()
+    prefix = f"{label_prefix.strip()} | " if str(label_prefix).strip() else ""
+
+    def _model_id(base_id: str) -> str:
+        return f"{ns}_{base_id}" if ns else base_id
+
     return [
-        ModelSpec("M1", "Trend + cílení volatility", "trend_vol", 1),
-        ModelSpec("M2", "Průřezové momentum + carry", "xsec_momentum", 1),
-        ModelSpec("M3", "Swing návrat k průměru", "mean_reversion", 1),
-        ModelSpec("M4", "On-chain + sentimentní vrstva", "onchain_sentiment_overlay", 1),
-        ModelSpec("M5", "Meta ansámbl", "meta_ensemble", 1),
+        ModelSpec(_model_id("M1"), f"{prefix}Trend + cílení volatility", "trend_vol", 1),
+        ModelSpec(_model_id("M2"), f"{prefix}Průřezové momentum + carry", "xsec_momentum", 1),
+        ModelSpec(_model_id("M3"), f"{prefix}Swing návrat k průměru", "mean_reversion", 1),
+        ModelSpec(_model_id("M4"), f"{prefix}On-chain + sentimentní vrstva", "onchain_sentiment_overlay", 1),
+        ModelSpec(_model_id("M5"), f"{prefix}Meta ansámbl", "meta_ensemble", 1),
     ]
 
 

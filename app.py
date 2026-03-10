@@ -81,24 +81,41 @@ else:
         f"Chyba: {automation_status.get('error', 'Neznámá chyba')}"
     )
 
-if "engine" not in st.session_state:
-    st.session_state.engine = TradingEngine(DEFAULT_CONFIG)
 runtime_state = load_runtime_state()
-if "history" not in st.session_state:
+SEGMENT_DEFAULTS = {
+    "Scalp": {"interval": "5m", "sim_days": 3, "namespace": "SC"},
+    "Intraday": {"interval": "15m", "sim_days": 7, "namespace": "ID"},
+    "Swing": {"interval": "4h", "sim_days": 30, "namespace": "SW"},
+}
+
+if "engines" not in st.session_state:
+    st.session_state.engines = {
+        segment: TradingEngine(
+            DEFAULT_CONFIG,
+            model_namespace=cfg["namespace"],
+            model_label_prefix=segment,
+        )
+        for segment, cfg in SEGMENT_DEFAULTS.items()
+    }
+
+if "history_by_segment" not in st.session_state:
+    st.session_state.history_by_segment = {segment: [] for segment in SEGMENT_DEFAULTS.keys()}
     restored = load_last_ui_run()
-    st.session_state.history = [restored] if restored else []
+    if restored:
+        restored_segment = str(restored.get("segment", "Swing"))
+        if restored_segment in st.session_state.history_by_segment:
+            st.session_state.history_by_segment[restored_segment] = [restored]
+
+if "active_segment" not in st.session_state:
+    st.session_state.active_segment = str(runtime_state.get("active_segment", "Swing"))
+if "interval" not in st.session_state:
+    st.session_state.interval = SEGMENT_DEFAULTS["Swing"]["interval"]
 if "last_exports" not in st.session_state:
     st.session_state.last_exports = {}
 if "simulation_running" not in st.session_state:
     st.session_state.simulation_running = bool(runtime_state.get("simulation_running", False))
 if "auto_center_last_candle" not in st.session_state:
     st.session_state.auto_center_last_candle = bool(runtime_state.get("auto_center_last_candle", True))
-if "profile" not in st.session_state:
-    st.session_state.profile = str(runtime_state.get("profile", "Swing"))
-if "interval" not in st.session_state:
-    st.session_state.interval = str(runtime_state.get("interval", "4h"))
-if "sim_days" not in st.session_state:
-    st.session_state.sim_days = int(runtime_state.get("sim_days", 30))
 if "data_source" not in st.session_state:
     st.session_state.data_source = str(runtime_state.get("data_source", "simulation"))
 if "symbol" not in st.session_state:
@@ -116,32 +133,24 @@ if "active_view" not in st.session_state:
 
 status_run = "BĚŽÍ" if st.session_state.simulation_running else "STOP"
 status_source = "Simulace" if st.session_state.data_source == "simulation" else "Binance"
-status_profile = st.session_state.profile
+status_profile = st.session_state.active_segment
 status_symbol = st.session_state.symbol
-status_interval = st.session_state.interval
+status_interval = SEGMENT_DEFAULTS.get(st.session_state.active_segment, SEGMENT_DEFAULTS["Swing"])["interval"]
 
 run_bg = "#16a34a" if st.session_state.simulation_running else "#dc2626"
 run_text = "#ffffff"
 status_badges = st.empty()
 
-PROFILE_DEFAULTS = {
-    "Scalp": {"interval": "5m", "sim_days": 3},
-    "Intraday": {"interval": "15m", "sim_days": 7},
-    "Swing": {"interval": "4h", "sim_days": 30},
-}
-
 with st.sidebar:
     st.header("Ovládání")
-    selected_profile = st.selectbox(
-        "Profil strategie",
+    st.session_state.active_segment = st.selectbox(
+        "Zobrazený segment",
         ["Scalp", "Intraday", "Swing"],
-        index=["Scalp", "Intraday", "Swing"].index(st.session_state.profile),
-        help="Přednastaví timeframe a doporučenou délku simulace.",
+        index=["Scalp", "Intraday", "Swing"].index(st.session_state.active_segment)
+        if st.session_state.active_segment in ["Scalp", "Intraday", "Swing"]
+        else 2,
+        help="Simulace běží současně pro všechny 3 segmenty. Tady vybíráš, který segment se má zobrazit v detailech.",
     )
-    if selected_profile != st.session_state.profile:
-        st.session_state.profile = selected_profile
-        st.session_state.interval = PROFILE_DEFAULTS[selected_profile]["interval"]
-        st.session_state.sim_days = PROFILE_DEFAULTS[selected_profile]["sim_days"]
 
     data_source = st.selectbox(
         "Zdroj dat",
@@ -155,23 +164,8 @@ with st.sidebar:
 
     symbol = st.session_state.symbol
     st.caption(f"Referenční trh (automaticky): {symbol}")
-    interval_index = ["1m", "5m", "15m", "1h", "4h", "1d"].index(st.session_state.interval)
-    interval = st.selectbox(
-        "Časový rámec simulace",
-        ["1m", "5m", "15m", "1h", "4h", "1d"],
-        index=interval_index,
-        help="Použije se pro výpočet modelů při novém běhu simulace.",
-    )
-    st.session_state.interval = interval
+    st.caption("Časové rámce běží paralelně: Scalp 5m/3d, Intraday 15m/7d, Swing 4h/30d.")
 
-    sim_days = st.slider(
-        "Délka simulace (dny)",
-        1,
-        365,
-        int(st.session_state.sim_days),
-        1,
-    )
-    st.session_state.sim_days = sim_days
     weeks_to_run = st.slider("Kolik týdnů spustit", 1, 12, int(st.session_state.weeks_to_run))
     st.session_state.weeks_to_run = weeks_to_run
     st.session_state.auto_center_last_candle = st.checkbox(
@@ -209,8 +203,15 @@ with st.sidebar:
     st.write(f"Maximální expozice na aktivum: {cfg.risk.max_asset_exposure:.0%}")
 
 if reset_btn:
-    st.session_state.engine = TradingEngine(DEFAULT_CONFIG)
-    st.session_state.history = []
+    st.session_state.engines = {
+        segment: TradingEngine(
+            DEFAULT_CONFIG,
+            model_namespace=cfg["namespace"],
+            model_label_prefix=segment,
+        )
+        for segment, cfg in SEGMENT_DEFAULTS.items()
+    }
+    st.session_state.history_by_segment = {segment: [] for segment in SEGMENT_DEFAULTS.keys()}
     st.session_state.simulation_running = False
     clear_last_ui_run()
     clear_runtime_state()
@@ -223,9 +224,9 @@ should_run_simulation = bool(run_btn and st.session_state.simulation_running)
 
 status_run = "BĚŽÍ" if st.session_state.simulation_running else "STOP"
 status_source = "Simulace" if st.session_state.data_source == "simulation" else "Binance"
-status_profile = st.session_state.profile
+status_profile = st.session_state.active_segment
 status_symbol = st.session_state.symbol
-status_interval = st.session_state.interval
+status_interval = SEGMENT_DEFAULTS.get(st.session_state.active_segment, SEGMENT_DEFAULTS["Swing"])["interval"]
 run_bg = "#16a34a" if st.session_state.simulation_running else "#dc2626"
 run_text = "#ffffff"
 
@@ -246,9 +247,7 @@ save_runtime_state(
     {
         "simulation_running": st.session_state.simulation_running,
         "auto_center_last_candle": st.session_state.auto_center_last_candle,
-        "profile": st.session_state.profile,
-        "interval": st.session_state.interval,
-        "sim_days": int(st.session_state.sim_days),
+        "active_segment": st.session_state.active_segment,
         "data_source": st.session_state.data_source,
         "symbol": st.session_state.symbol,
         "weeks_to_run": int(st.session_state.weeks_to_run),
@@ -261,20 +260,24 @@ save_runtime_state(
 
 if should_run_simulation:
     for _ in range(weeks_to_run):
-        result = st.session_state.engine.run_week(
-            days=sim_days,
-            market_source=data_source,
-            symbol=symbol,
-            interval=interval,
-        )
-        st.session_state.history.append(result)
-        save_week_result(result)
-        save_open_positions(result)
-        save_closed_positions(result)
-        save_last_ui_run(result)
-        st.session_state.last_exports = export_weekly_report(result, DEFAULT_CONFIG)
+        for segment, cfg in SEGMENT_DEFAULTS.items():
+            result = st.session_state.engines[segment].run_week(
+                days=int(cfg["sim_days"]),
+                market_source=data_source,
+                symbol=symbol,
+                interval=str(cfg["interval"]),
+            )
+            result["segment"] = segment
+            st.session_state.history_by_segment[segment].append(result)
+            save_week_result(result)
+            save_open_positions(result)
+            save_closed_positions(result)
+            if segment == st.session_state.active_segment:
+                save_last_ui_run(result)
+                st.session_state.last_exports = export_weekly_report(result, DEFAULT_CONFIG)
 
-if not st.session_state.history:
+has_any_history = any(len(history) > 0 for history in st.session_state.history_by_segment.values())
+if not has_any_history:
     st.info("Klikni na 'Spustit simulaci' pro první týdenní vyhodnocení.")
 else:
     if st.session_state.simulation_running:
@@ -282,7 +285,19 @@ else:
     else:
         st.info("Simulace je zastavená. Poslední výsledek zůstává zobrazený.")
 
-    latest = st.session_state.history[-1]
+    active_history = st.session_state.history_by_segment.get(st.session_state.active_segment, [])
+    if not active_history:
+        available = [segment for segment, history in st.session_state.history_by_segment.items() if history]
+        st.warning("Vybraný segment zatím nemá výsledky. Zobrazím první dostupný segment.")
+        st.session_state.active_segment = available[0]
+        active_history = st.session_state.history_by_segment[available[0]]
+
+    latest = active_history[-1]
+    latest_by_segment = {
+        segment: history[-1]
+        for segment, history in st.session_state.history_by_segment.items()
+        if history
+    }
     live_market_price = None
     live_market_change_pct = None
 
@@ -328,6 +343,27 @@ else:
             live_market_change_pct = None
 
     if st.session_state.active_view == "Dashboard":
+        st.subheader("Srovnání segmentů")
+        segment_rows = []
+        for segment in ["Scalp", "Intraday", "Swing"]:
+            summary = latest_by_segment.get(segment)
+            if summary is None:
+                continue
+            champion = summary.get("champion", {})
+            segment_rows.append(
+                {
+                    "Segment": segment,
+                    "Timeframe": summary.get("interval", SEGMENT_DEFAULTS[segment]["interval"]),
+                    "Dny": SEGMENT_DEFAULTS[segment]["sim_days"],
+                    "Skóre vítěze": round(float(champion.get("score", 0.0)), 4),
+                    "Vítězný model": champion.get("name", "N/A"),
+                    "Volatilita (roč.)": f"{summary.get('portfolio_vol_annual', 0.0):.2%}",
+                }
+            )
+        if segment_rows:
+            st.dataframe(pd.DataFrame(segment_rows), use_container_width=True)
+
+        st.subheader(f"Detail segmentu: {st.session_state.active_segment}")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Týden", latest["week"])
         c2.metric("Generace", latest["generation"])
@@ -569,6 +605,7 @@ else:
                             "quantity_slots": "Sloty",
                             "pnl_pct": "PnL %",
                             "pnl_status": "Výsledek",
+                            "exit_reason": "Důvod uzavření",
                             "market_source": "Zdroj dat",
                             "week": "Týden",
                             "generation": "Generace",

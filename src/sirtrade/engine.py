@@ -30,9 +30,9 @@ class ModelResult:
 
 
 class TradingEngine:
-    def __init__(self, config: AppConfig = DEFAULT_CONFIG):
+    def __init__(self, config: AppConfig = DEFAULT_CONFIG, model_namespace: str = "", model_label_prefix: str = ""):
         self.config = config
-        self.models: list[ModelSpec] = default_model_specs()
+        self.models: list[ModelSpec] = default_model_specs(namespace=model_namespace, label_prefix=model_label_prefix)
         self.generation = 1
         self.week = 0
 
@@ -151,10 +151,12 @@ class TradingEngine:
         pos = pd.Series(0.0, index=market.index, dtype=float)
         side = 0
         position_size = 0.0
+        current_slots = 0
         stop_price = None
         target_price = None
         entry_price = None
         cooldown_remaining = 0
+        events: list[dict] = []
 
         for step, ts in enumerate(market.index):
             signal_value = float(controlled_signal.loc[ts])
@@ -180,6 +182,7 @@ class TradingEngine:
                     slots = int(np.clip(np.ceil(abs(signal_value) * 5), 1, 5))
                     position_size = float(direction * slots * slot_size)
                     side = direction
+                    current_slots = slots
                     entry_price = close_price
 
                     stop_dist = max(0.004, 1.2 * vol_step)
@@ -191,27 +194,60 @@ class TradingEngine:
                         stop_price = entry_price * (1.0 + stop_dist)
                         target_price = entry_price * (1.0 - target_dist)
 
+                    events.append(
+                        {
+                            "timestamp": ts,
+                            "model_id": model.model_id,
+                            "model_name": model.name,
+                            "akce": f"Vstup { 'LONG' if side > 0 else 'SHORT' } (+{current_slots})",
+                            "strana": "LONG" if side > 0 else "SHORT",
+                            "cena": close_price,
+                            "pozice": position_size,
+                            "sloty": current_slots,
+                        }
+                    )
+
                     pos.loc[ts] = position_size
                 else:
                     pos.loc[ts] = 0.0
                 continue
 
             hit_exit = False
+            exit_reason = None
             if side > 0:
                 if stop_price is not None and low_price <= stop_price:
                     hit_exit = True
+                    exit_reason = "STOP"
                 if target_price is not None and high_price >= target_price:
                     hit_exit = True
+                    exit_reason = "TARGET" if exit_reason is None else exit_reason
             else:
                 if stop_price is not None and high_price >= stop_price:
                     hit_exit = True
+                    exit_reason = "STOP"
                 if target_price is not None and low_price <= target_price:
                     hit_exit = True
+                    exit_reason = "TARGET" if exit_reason is None else exit_reason
 
             if hit_exit:
+                exit_side = "LONG" if side > 0 else "SHORT"
+                events.append(
+                    {
+                        "timestamp": ts,
+                        "model_id": model.model_id,
+                        "model_name": model.name,
+                        "akce": f"Výstup {exit_side} (-{current_slots})",
+                        "strana": exit_side,
+                        "cena": close_price,
+                        "pozice": 0.0,
+                        "sloty": 0,
+                        "duvod_vystupu": exit_reason or "NEURČENO",
+                    }
+                )
                 pos.loc[ts] = 0.0
                 side = 0
                 position_size = 0.0
+                current_slots = 0
                 stop_price = None
                 target_price = None
                 entry_price = None
@@ -253,8 +289,8 @@ class TradingEngine:
             score=score,
             passed=passed,
         )
-        events, final_open_slots = self._build_trade_events(model, market["close"], pos)
         final_position = float(pos.iloc[-1]) if not pos.empty else 0.0
+        final_open_slots = int(current_slots if side != 0 else 0)
         return result, events, final_position, int(final_open_slots)
 
     def _build_model_open_positions(

@@ -101,6 +101,7 @@ def _build_closed_positions_rows(summary: dict) -> list[tuple]:
                     pnl_pct = ((avg_entry_price - price) / avg_entry_price) * 100
 
                 pnl_status = "ZISK" if pnl_pct > 0 else ("ZTRÁTA" if pnl_pct < 0 else "NULA")
+                exit_reason = str(event.get("duvod_vystupu", "NEURČENO"))
                 rows.append(
                     (
                         timestamp,
@@ -114,6 +115,7 @@ def _build_closed_positions_rows(summary: dict) -> list[tuple]:
                         float(qty),
                         float(pnl_pct),
                         pnl_status,
+                        exit_reason,
                         market_source,
                         week,
                         generation,
@@ -182,12 +184,17 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
                 quantity_slots REAL NOT NULL,
                 pnl_pct REAL NOT NULL,
                 pnl_status TEXT NOT NULL,
+                exit_reason TEXT NOT NULL DEFAULT 'NEURČENO',
                 market_source TEXT NOT NULL,
                 week INTEGER NOT NULL,
                 generation INTEGER NOT NULL
             )
             """
         )
+        try:
+            conn.execute("ALTER TABLE closed_positions ADD COLUMN exit_reason TEXT NOT NULL DEFAULT 'NEURČENO'")
+        except sqlite3.OperationalError:
+            pass
         conn.execute(
             """
             UPDATE open_positions
@@ -338,9 +345,9 @@ def save_closed_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> Non
             """
             INSERT INTO closed_positions (
                 closed_at, opened_at, model_id, model_name, symbol, side,
-                entry_price, exit_price, quantity_slots, pnl_pct, pnl_status,
+                entry_price, exit_price, quantity_slots, pnl_pct, pnl_status, exit_reason,
                 market_source, week, generation
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows_to_insert,
         )
