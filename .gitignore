@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+
+# Runtime state and generated outputs (must not block deploy)
+data/*
+reports/*
+!data/.gitkeep
+!reports/.gitkeep
+
+# Keep folders in repository
+data/.gitkeep
+reports/.gitkeep
+
+# Editor
+.vscode/
