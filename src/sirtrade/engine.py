@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 
 import numpy as np
 import pandas as pd
@@ -136,7 +137,11 @@ class TradingEngine:
         return events, prev_slots
 
     def _simulate_model(self, model: ModelSpec, market: pd.DataFrame) -> tuple[ModelResult, list[dict], float, int]:
-        raw = generate_signals(model, market, seed=self.week)
+        model_seed = int(hashlib.md5(model.model_id.encode("utf-8")).hexdigest()[:8], 16)
+        week_seed = (self.week * 100_003) + model_seed
+        rng = np.random.default_rng(week_seed)
+
+        raw = generate_signals(model, market, seed=week_seed)
         controlled_signal = apply_risk_controls(raw, market["ret"], self.config.risk)
 
         close = market["close"].astype(float)
@@ -145,8 +150,14 @@ class TradingEngine:
         ret_std = market["ret"].fillna(0.0).rolling(20).std().fillna(0.0)
 
         slot_size = self.config.risk.max_asset_exposure / 5
-        entry_threshold = 0.17
+        entry_threshold = float(rng.uniform(0.14, 0.34))
         warmup_bars = min(48, max(12, int(len(market) * 0.1)))
+        decision_interval = int(rng.integers(1, 4))
+        decision_offset = int(rng.integers(0, decision_interval))
+        min_hold_bars = int(rng.integers(1, 6))
+        cooldown_bars = int(rng.integers(2, 8))
+        stop_multiplier = float(rng.uniform(0.9, 1.6))
+        target_multiplier = float(rng.uniform(1.8, 3.2))
 
         pos = pd.Series(0.0, index=market.index, dtype=float)
         side = 0
@@ -154,8 +165,8 @@ class TradingEngine:
         current_slots = 0
         stop_price = None
         target_price = None
-        entry_price = None
         cooldown_remaining = 0
+        hold_bars = 0
         events: list[dict] = []
 
         for step, ts in enumerate(market.index):
@@ -171,28 +182,30 @@ class TradingEngine:
                 pos.loc[ts] = 0.0
                 continue
 
+            is_decision_step = ((step - decision_offset) % decision_interval) == 0
+
             if side == 0:
                 if cooldown_remaining > 0:
                     cooldown_remaining -= 1
                     pos.loc[ts] = 0.0
                     continue
 
-                if abs(signal_value) >= entry_threshold:
+                if is_decision_step and abs(signal_value) >= entry_threshold:
                     direction = 1 if signal_value > 0 else -1
                     slots = int(np.clip(np.ceil(abs(signal_value) * 5), 1, 5))
                     position_size = float(direction * slots * slot_size)
                     side = direction
                     current_slots = slots
-                    entry_price = close_price
+                    hold_bars = 0
 
-                    stop_dist = max(0.004, 1.2 * vol_step)
-                    target_dist = max(0.008, 2.4 * vol_step)
+                    stop_dist = max(0.004, stop_multiplier * vol_step)
+                    target_dist = max(0.008, target_multiplier * vol_step)
                     if side > 0:
-                        stop_price = entry_price * (1.0 - stop_dist)
-                        target_price = entry_price * (1.0 + target_dist)
+                        stop_price = close_price * (1.0 - stop_dist)
+                        target_price = close_price * (1.0 + target_dist)
                     else:
-                        stop_price = entry_price * (1.0 + stop_dist)
-                        target_price = entry_price * (1.0 - target_dist)
+                        stop_price = close_price * (1.0 + stop_dist)
+                        target_price = close_price * (1.0 - target_dist)
 
                     events.append(
                         {
@@ -214,20 +227,22 @@ class TradingEngine:
 
             hit_exit = False
             exit_reason = None
-            if side > 0:
-                if stop_price is not None and low_price <= stop_price:
-                    hit_exit = True
-                    exit_reason = "STOP"
-                if target_price is not None and high_price >= target_price:
-                    hit_exit = True
-                    exit_reason = "TARGET" if exit_reason is None else exit_reason
-            else:
-                if stop_price is not None and high_price >= stop_price:
-                    hit_exit = True
-                    exit_reason = "STOP"
-                if target_price is not None and low_price <= target_price:
-                    hit_exit = True
-                    exit_reason = "TARGET" if exit_reason is None else exit_reason
+            hold_bars += 1
+            if hold_bars >= min_hold_bars:
+                if side > 0:
+                    if stop_price is not None and low_price <= stop_price:
+                        hit_exit = True
+                        exit_reason = "STOP"
+                    if target_price is not None and high_price >= target_price:
+                        hit_exit = True
+                        exit_reason = "TARGET" if exit_reason is None else exit_reason
+                else:
+                    if stop_price is not None and high_price >= stop_price:
+                        hit_exit = True
+                        exit_reason = "STOP"
+                    if target_price is not None and low_price <= target_price:
+                        hit_exit = True
+                        exit_reason = "TARGET" if exit_reason is None else exit_reason
 
             if hit_exit:
                 exit_side = "LONG" if side > 0 else "SHORT"
@@ -250,8 +265,8 @@ class TradingEngine:
                 current_slots = 0
                 stop_price = None
                 target_price = None
-                entry_price = None
-                cooldown_remaining = 3
+                hold_bars = 0
+                cooldown_remaining = cooldown_bars
             else:
                 pos.loc[ts] = position_size
 

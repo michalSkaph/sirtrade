@@ -262,12 +262,24 @@ if reset_btn:
     clear_runtime_state()
     st.rerun()
 
+view_options = ["Dashboard", "Grafy", "Pozice", "Uzavřené pozice", "Analýza", "Historie & Export"]
+st.session_state.active_view = st.radio(
+    "Sekce",
+    view_options,
+    index=view_options.index(st.session_state.active_view)
+    if st.session_state.active_view in view_options
+    else 0,
+    horizontal=True,
+    label_visibility="collapsed",
+)
+
 active_segment_running = bool(st.session_state.simulation_running_by_segment.get(st.session_state.active_segment, False))
 has_running_segments = any(st.session_state.simulation_running_by_segment.values())
 now_ts = time.time()
 min_cycle_seconds = max(1, int(st.session_state.simulation_cycle_seconds))
 should_run_simulation = bool(
     has_running_segments
+    and (force_simulation_cycle or st.session_state.active_view == "Dashboard")
     and (
         force_simulation_cycle
         or (now_ts - float(st.session_state.last_simulation_tick)) >= float(min_cycle_seconds)
@@ -363,16 +375,6 @@ else:
     live_market_change_pct = None
 
     source_label = {"simulation": "Simulace", "binance": "Binance"}.get(latest["market_source"], latest["market_source"])
-
-    st.session_state.active_view = st.radio(
-        "Sekce",
-        ["Dashboard", "Grafy", "Pozice", "Uzavřené pozice", "Analýza", "Historie & Export"],
-        index=["Dashboard", "Grafy", "Pozice", "Uzavřené pozice", "Analýza", "Historie & Export"].index(st.session_state.active_view)
-        if st.session_state.active_view in ["Dashboard", "Grafy", "Pozice", "Uzavřené pozice", "Analýza", "Historie & Export"]
-        else 0,
-        horizontal=True,
-        label_visibility="collapsed",
-    )
 
     refreshable_views = {"Grafy"}
     if (
@@ -672,12 +674,13 @@ else:
                             "quantity_slots": "Sloty",
                             "pnl_pct": "PnL %",
                             "pnl_status": "Výsledek",
-                            "exit_reason": "Důvod uzavření",
                             "market_source": "Zdroj dat",
                             "week": "Týden",
                             "generation": "Generace",
                         }
                     )
+                    if "exit_reason" in overview.columns:
+                        overview = overview.drop(columns=["exit_reason"])
                     overview["Zdroj dat"] = overview["Zdroj dat"].replace({"simulation": "Simulace", "binance": "Binance"})
                     overview = _split_datetime_column(overview, "Uzavřeno", "Uzavřeno")
                     overview = _split_datetime_column(overview, "Otevřeno", "Otevřeno")

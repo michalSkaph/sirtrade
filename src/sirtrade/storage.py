@@ -75,7 +75,9 @@ def _build_closed_positions_rows(summary: dict) -> list[tuple]:
                 qty = _extract_slot_delta(action, entry=True)
                 if qty <= 0:
                     qty = 1.0
-                if open_qty <= 0 or current_side != side:
+                if open_qty > 0 and current_side is not None and current_side != side:
+                    continue
+                if open_qty <= 0:
                     open_qty = 0.0
                     avg_entry_price = 0.0
                     opened_at = timestamp
@@ -128,6 +130,10 @@ def _build_closed_positions_rows(summary: dict) -> list[tuple]:
                     avg_entry_price = 0.0
                     opened_at = None
                     current_side = None
+                continue
+
+            if "Výstup" in action and open_qty > 0 and current_side != side:
+                continue
 
     return rows
 
