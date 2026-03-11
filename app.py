@@ -159,6 +159,17 @@ if "active_view" not in st.session_state:
     st.session_state.active_view = str(runtime_state.get("active_view", "Dashboard"))
 if "last_simulation_tick" not in st.session_state:
     st.session_state.last_simulation_tick = float(runtime_state.get("last_simulation_tick", 0.0))
+if "ui_active_segment" not in st.session_state:
+    st.session_state.ui_active_segment = st.session_state.active_segment
+if "ui_active_view" not in st.session_state:
+    st.session_state.ui_active_view = st.session_state.active_view
+
+prev_active_segment = str(st.session_state.active_segment)
+prev_active_view = str(st.session_state.active_view)
+prev_weeks_to_run = int(st.session_state.weeks_to_run)
+prev_data_source = str(st.session_state.data_source)
+prev_live_refresh_seconds = int(st.session_state.live_refresh_seconds)
+prev_simulation_cycle_seconds = int(st.session_state.simulation_cycle_seconds)
 
 active_segment_running = bool(st.session_state.simulation_running_by_segment.get(st.session_state.active_segment, False))
 has_running_segments = any(st.session_state.simulation_running_by_segment.values())
@@ -175,14 +186,16 @@ status_badges = st.empty()
 
 with st.sidebar:
     st.header("Ovládání")
-    st.session_state.active_segment = st.selectbox(
+    st.selectbox(
         "Zobrazený segment",
         ["Scalp", "Intraday", "Swing"],
-        index=["Scalp", "Intraday", "Swing"].index(st.session_state.active_segment)
-        if st.session_state.active_segment in ["Scalp", "Intraday", "Swing"]
+        index=["Scalp", "Intraday", "Swing"].index(st.session_state.ui_active_segment)
+        if st.session_state.ui_active_segment in ["Scalp", "Intraday", "Swing"]
         else 2,
         help="Simulace běží současně pro všechny 3 segmenty. Tady vybíráš, který segment se má zobrazit v detailech.",
+        key="ui_active_segment",
     )
+    st.session_state.active_segment = st.session_state.ui_active_segment
 
     data_source = st.selectbox(
         "Zdroj dat",
@@ -263,14 +276,27 @@ if reset_btn:
     st.rerun()
 
 view_options = ["Dashboard", "Grafy", "Pozice", "Uzavřené pozice", "Analýza", "Historie & Export"]
-st.session_state.active_view = st.radio(
+st.radio(
     "Sekce",
     view_options,
-    index=view_options.index(st.session_state.active_view)
-    if st.session_state.active_view in view_options
+    index=view_options.index(st.session_state.ui_active_view)
+    if st.session_state.ui_active_view in view_options
     else 0,
     horizontal=True,
     label_visibility="collapsed",
+    key="ui_active_view",
+)
+st.session_state.active_view = st.session_state.ui_active_view
+
+ui_interaction_detected = any(
+    [
+        st.session_state.active_segment != prev_active_segment,
+        st.session_state.active_view != prev_active_view,
+        int(st.session_state.weeks_to_run) != prev_weeks_to_run,
+        st.session_state.data_source != prev_data_source,
+        int(st.session_state.live_refresh_seconds) != prev_live_refresh_seconds,
+        int(st.session_state.simulation_cycle_seconds) != prev_simulation_cycle_seconds,
+    ]
 )
 
 active_segment_running = bool(st.session_state.simulation_running_by_segment.get(st.session_state.active_segment, False))
@@ -280,6 +306,7 @@ min_cycle_seconds = max(1, int(st.session_state.simulation_cycle_seconds))
 should_run_simulation = bool(
     has_running_segments
     and (force_simulation_cycle or st.session_state.active_view == "Dashboard")
+    and (force_simulation_cycle or not ui_interaction_detected)
     and (
         force_simulation_cycle
         or (now_ts - float(st.session_state.last_simulation_tick)) >= float(min_cycle_seconds)
