@@ -14,10 +14,11 @@ def export_weekly_report(summary: dict, config: AppConfig, out_dir: Path | str =
 
     week = int(summary["week"])
     generation = int(summary["generation"])
+    segment = str(summary.get("segment", "unknown")).lower()
     symbol = str(summary.get("symbol", "BTCUSDT"))
     source = str(summary.get("market_source", "simulation"))
 
-    stem = f"week_{week:03d}_gen_{generation:02d}_{symbol}_{source}"
+    stem = f"week_{week:03d}_gen_{generation:02d}_{segment}_{symbol}_{source}"
     csv_path = report_dir / f"{stem}.csv"
     json_path = report_dir / f"{stem}.json"
 
@@ -26,10 +27,12 @@ def export_weekly_report(summary: dict, config: AppConfig, out_dir: Path | str =
         results_df.to_csv(csv_path, index=False)
 
     payload = {
+        "segment": summary.get("segment"),
         "week": week,
         "generation": generation,
         "symbol": symbol,
         "market_source": source,
+        "interval": summary.get("interval"),
         "champion": summary.get("champion", {}),
         "decision_matrix": {
             "formula": "S = 0.28*Sortino + 0.22*Calmar - 0.18*CVaR95 - 0.14*MaxDD - 0.10*Cost - 0.08*Turnover",

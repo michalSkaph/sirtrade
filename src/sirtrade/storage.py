@@ -147,10 +147,12 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
             CREATE TABLE IF NOT EXISTS weekly_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                segment TEXT,
                 week INTEGER NOT NULL,
                 generation INTEGER NOT NULL,
                 market_source TEXT NOT NULL,
                 symbol TEXT NOT NULL,
+                interval TEXT,
                 champion_model TEXT NOT NULL,
                 champion_score REAL NOT NULL,
                 champion_sortino REAL NOT NULL,
@@ -161,6 +163,14 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
             )
             """
         )
+        try:
+            conn.execute("ALTER TABLE weekly_runs ADD COLUMN segment TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE weekly_runs ADD COLUMN interval TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS open_positions (
@@ -223,16 +233,18 @@ def save_week_result(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
         conn.execute(
             """
             INSERT INTO weekly_runs (
-                week, generation, market_source, symbol,
+                segment, week, generation, market_source, symbol, interval,
                 champion_model, champion_score, champion_sortino,
                 champion_calmar, champion_max_dd, champion_cvar95, reward_usd
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                str(summary.get("segment", "")) or None,
                 int(summary["week"]),
                 int(summary["generation"]),
                 str(summary.get("market_source", "simulation")),
                 str(summary.get("symbol", "BTCUSDT")),
+                str(summary.get("interval", "")) or None,
                 str(champion.get("name", "unknown")),
                 float(champion.get("score", 0.0)),
                 float(champion.get("sortino", 0.0)),

@@ -15,7 +15,6 @@ from src.sirtrade.config import DEFAULT_CONFIG
 from src.sirtrade.data import fetch_binance_market
 from src.sirtrade.engine import TradingEngine
 from src.sirtrade.reporting import export_weekly_report
-from src.sirtrade.status import read_automation_status
 from src.sirtrade.storage import (
     init_db,
     load_closed_positions,
@@ -26,11 +25,14 @@ from src.sirtrade.storage import (
     save_week_result,
 )
 from src.sirtrade.ui_state import (
+    clear_segment_runs,
     clear_last_ui_run,
     clear_runtime_state,
     load_last_ui_run,
+    load_segment_runs,
     load_runtime_state,
     save_last_ui_run,
+    save_segment_runs,
     save_runtime_state,
 )
 
@@ -58,11 +60,10 @@ def _fetch_binance_market_cached(symbol: str, interval: str, limit: int) -> pd.D
     return fetch_binance_market(symbol=symbol, interval=interval, limit=limit)
 
 
-def _format_datetime_label(value: object) -> str:
-    ts = pd.to_datetime(value, errors="coerce")
-    if pd.isna(ts):
-        return "N/A"
-    return ts.strftime("%d.%m.%y %H:%M")
+CLOSED_POSITIONS_LIMIT = 10000
+SIMULATION_WEEKS_PER_CYCLE = 1
+FIXED_LIVE_REFRESH_SECONDS = 2
+FIXED_SIMULATION_CYCLE_SECONDS = 10
 
 
 def _split_datetime_column(frame: pd.DataFrame, source_column: str, label_prefix: str) -> pd.DataFrame:
@@ -77,29 +78,278 @@ def _split_datetime_column(frame: pd.DataFrame, source_column: str, label_prefix
     out = out.drop(columns=[source_column])
     return out
 
-st.title("SirTrade — Autonomní obchodování krypta (Paper režim)")
-st.caption("Bezpečný simulační režim: spot + perpetuals logika, bez páky, týdenní governance.")
-st.info(
-    "Aktuálně jde o paper režim: aplikace neposílá reálné ordery na Binance a nepracuje s reálnými penězi. "
-    "V režimu Binance se načítají pouze veřejná tržní data."
-)
 
-automation_status = read_automation_status()
-st.subheader("Stav automatizačního workeru")
-if automation_status is None:
-    st.warning("Stav workeru zatím není k dispozici. Spusť alespoň jednou automatizační běh.")
-elif automation_status.get("ok"):
-    result = automation_status.get("result", {})
-    champ = result.get("champion", {})
-    st.success(
-        f"Worker běží správně | Poslední aktualizace: {_format_datetime_label(automation_status.get('updated_at'))} | "
-        f"Symbol: {result.get('symbol', 'N/A')} | Vítěz: {champ.get('name', 'N/A')}"
+def _load_segment_closed_positions(segment: str, limit: int = CLOSED_POSITIONS_LIMIT) -> pd.DataFrame:
+    closed_positions = _load_closed_positions_cached(limit=limit)
+    if closed_positions.empty or "model_id" not in closed_positions.columns:
+        return pd.DataFrame()
+
+    namespace = f"{SEGMENT_DEFAULTS[segment]['namespace']}_"
+    segment_closed = closed_positions[closed_positions["model_id"].astype(str).str.startswith(namespace)].copy()
+    if segment_closed.empty:
+        return segment_closed
+
+    if "closed_at" in segment_closed.columns:
+        segment_closed["closed_at"] = pd.to_datetime(segment_closed["closed_at"], errors="coerce")
+        segment_closed = segment_closed[segment_closed["closed_at"].notna()].copy()
+    if "opened_at" in segment_closed.columns:
+        segment_closed["opened_at"] = pd.to_datetime(segment_closed["opened_at"], errors="coerce")
+    if "pnl_pct" in segment_closed.columns:
+        segment_closed["pnl_pct"] = pd.to_numeric(segment_closed["pnl_pct"], errors="coerce")
+    return segment_closed
+
+
+def _compute_closed_position_metrics(frame: pd.DataFrame) -> tuple[str, str, int, int, int]:
+    if frame.empty or "pnl_pct" not in frame.columns:
+        return "N/A", "N/A", 0, 0, 0
+
+    pnl = pd.to_numeric(frame["pnl_pct"], errors="coerce").dropna()
+    if pnl.empty:
+        return "N/A", "N/A", 0, 0, 0
+
+    wins = int((pnl > 0).sum())
+    losses = int((pnl < 0).sum())
+    decided = max(1, wins + losses)
+    win_rate_label = f"{(wins / decided) * 100:.1f}%"
+    avg_pnl_label = f"{pnl.mean():.3f}%"
+    return win_rate_label, avg_pnl_label, wins, losses, len(pnl)
+
+
+def _infer_segment_name(summary: dict[str, object] | None) -> str:
+    if isinstance(summary, dict):
+        segment = str(summary.get("segment", "")).strip()
+        if segment in SEGMENT_DEFAULTS:
+            return segment
+        interval = str(summary.get("interval", "")).strip().lower()
+        for segment_name, cfg in SEGMENT_DEFAULTS.items():
+            if str(cfg.get("interval", "")).strip().lower() == interval:
+                return segment_name
+    return "Swing"
+
+
+def _infer_segment_from_model_name(model_name: object) -> str | None:
+    normalized = str(model_name).strip()
+    for segment_name in SEGMENT_DEFAULTS:
+        if normalized.startswith(f"{segment_name} |") or normalized.startswith(segment_name):
+            return segment_name
+    return None
+
+
+def _segment_namespace(segment: str) -> str:
+    return f"{SEGMENT_DEFAULTS[segment]['namespace']}_"
+
+
+def _placeholder_market_frame(last_price: float, interval: str, periods: int = 120) -> pd.DataFrame:
+    price = float(last_price) if pd.notna(last_price) and float(last_price) > 0 else 1.0
+    freq_map = {
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "1h": "1h",
+        "4h": "4h",
+        "1d": "1D",
+    }
+    freq = freq_map.get(str(interval).lower(), "1h")
+    index = pd.date_range(end=pd.Timestamp.utcnow().floor("min"), periods=periods, freq=freq)
+    return pd.DataFrame(
+        {
+            "open": [price] * len(index),
+            "high": [price] * len(index),
+            "low": [price] * len(index),
+            "close": [price] * len(index),
+            "volume": [0.0] * len(index),
+        },
+        index=index,
     )
-else:
-    st.error(
-        f"Worker hlásí chybu | Poslední aktualizace: {_format_datetime_label(automation_status.get('updated_at'))} | "
-        f"Chyba: {automation_status.get('error', 'Neznámá chyba')}"
-    )
+
+
+def _restore_missing_segments_from_storage(existing_segments: set[str]) -> dict[str, dict[str, object]]:
+    restored: dict[str, dict[str, object]] = {}
+    recent_runs = _load_recent_runs_cached(limit=300)
+    if recent_runs.empty:
+        return restored
+
+    open_positions = _load_open_positions_cached()
+    closed_positions = _load_closed_positions_cached(limit=5000)
+
+    recent_runs = recent_runs.copy()
+    if "segment" not in recent_runs.columns:
+        recent_runs["segment"] = None
+    if "interval" not in recent_runs.columns:
+        recent_runs["interval"] = None
+
+    inferred_segments = []
+    for _, row in recent_runs.iterrows():
+        segment_value = str(row.get("segment", "")).strip()
+        if segment_value not in SEGMENT_DEFAULTS:
+            segment_value = _infer_segment_from_model_name(row.get("champion_model")) or ""
+        inferred_segments.append(segment_value)
+    recent_runs["segment_inferred"] = inferred_segments
+
+    usable_runs = recent_runs[recent_runs["segment_inferred"].isin(SEGMENT_DEFAULTS.keys())].copy()
+    if usable_runs.empty:
+        return restored
+
+    usable_runs = usable_runs.sort_values(by=["id"], ascending=False)
+    latest_by_segment = usable_runs.drop_duplicates(subset=["segment_inferred"], keep="first")
+
+    def _normalize_side(value: object) -> str:
+        side = str(value).strip().upper()
+        if side == "BUY":
+            return "LONG"
+        if side == "SELL":
+            return "SHORT"
+        return side
+
+    for _, row in latest_by_segment.iterrows():
+        segment = str(row["segment_inferred"])
+        if segment in existing_segments or segment in restored:
+            continue
+
+        namespace = _segment_namespace(segment)
+        segment_interval = str(row.get("interval") or SEGMENT_DEFAULTS[segment]["interval"])
+        symbol = str(row.get("symbol") or "BTCUSDT")
+        market_source = str(row.get("market_source") or "simulation")
+        champion_name = str(row.get("champion_model") or f"{segment} | Restored champion")
+
+        segment_open = pd.DataFrame()
+        if not open_positions.empty and "model_id" in open_positions.columns:
+            segment_open = open_positions[open_positions["model_id"].astype(str).str.startswith(namespace)].copy()
+
+        segment_closed = pd.DataFrame()
+        if not closed_positions.empty and "model_id" in closed_positions.columns:
+            segment_closed = closed_positions[closed_positions["model_id"].astype(str).str.startswith(namespace)].copy()
+
+        model_rows: list[dict[str, object]] = []
+        model_open_positions: dict[str, list[dict[str, object]]] = {}
+        final_positions: dict[str, float] = {}
+        final_open_slots: dict[str, int] = {}
+        known_models: dict[str, str] = {}
+
+        if not segment_open.empty:
+            for _, open_row in segment_open.iterrows():
+                model_id = str(open_row.get("model_id", ""))
+                model_name = str(open_row.get("model_name", model_id))
+                known_models[model_id] = model_name
+                side = _normalize_side(open_row.get("side", ""))
+                qty = float(open_row.get("position_size", 0.0) or 0.0)
+                signed_qty = qty if side == "LONG" else (-qty if side == "SHORT" else 0.0)
+                final_positions[model_id] = final_positions.get(model_id, 0.0) + signed_qty
+                final_open_slots[model_id] = final_open_slots.get(model_id, 0) + int(round(abs(qty)))
+                model_open_positions.setdefault(model_id, []).append(
+                    {
+                        "symbol": str(open_row.get("symbol", symbol)).upper(),
+                        "side": side,
+                        "model_name": model_name,
+                    }
+                )
+
+        if not segment_closed.empty:
+            for _, closed_row in segment_closed.iterrows():
+                model_id = str(closed_row.get("model_id", ""))
+                model_name = str(closed_row.get("model_name", model_id))
+                known_models.setdefault(model_id, model_name)
+
+        champion_model_id = next(
+            (model_id for model_id, model_name in known_models.items() if model_name == champion_name),
+            f"{namespace}RESTORED",
+        )
+        known_models.setdefault(champion_model_id, champion_name)
+
+        for model_id, model_name in known_models.items():
+            is_champion = model_id == champion_model_id
+            model_rows.append(
+                {
+                    "model_id": model_id,
+                    "name": model_name,
+                    "generation": int(row.get("generation") or 0),
+                    "sortino": float(row.get("champion_sortino") or 0.0) if is_champion else 0.0,
+                    "calmar": float(row.get("champion_calmar") or 0.0) if is_champion else 0.0,
+                    "cvar95": float(row.get("champion_cvar95") or 0.0) if is_champion else 0.0,
+                    "max_dd": float(row.get("champion_max_dd") or 0.0) if is_champion else 0.0,
+                    "cost": 0.0,
+                    "turnover": 0.0,
+                    "score": float(row.get("champion_score") or 0.0) if is_champion else 0.0,
+                    "passed": bool(float(row.get("champion_score") or 0.0) > 0.0) if is_champion else False,
+                }
+            )
+
+        if not model_rows:
+            model_rows.append(
+                {
+                    "model_id": champion_model_id,
+                    "name": champion_name,
+                    "generation": int(row.get("generation") or 0),
+                    "sortino": float(row.get("champion_sortino") or 0.0),
+                    "calmar": float(row.get("champion_calmar") or 0.0),
+                    "cvar95": float(row.get("champion_cvar95") or 0.0),
+                    "max_dd": float(row.get("champion_max_dd") or 0.0),
+                    "cost": 0.0,
+                    "turnover": 0.0,
+                    "score": float(row.get("champion_score") or 0.0),
+                    "passed": bool(float(row.get("champion_score") or 0.0) > 0.0),
+                }
+            )
+
+        last_price = None
+        if not segment_closed.empty and "exit_price" in segment_closed.columns:
+            last_price = pd.to_numeric(segment_closed["exit_price"], errors="coerce").dropna().iloc[0] if not pd.to_numeric(segment_closed["exit_price"], errors="coerce").dropna().empty else None
+
+        market_frame = pd.DataFrame()
+        if market_source == "binance":
+            try:
+                market_frame = _fetch_binance_market_cached(symbol=symbol, interval=segment_interval, limit=500)
+            except Exception:
+                market_frame = pd.DataFrame()
+        if market_frame.empty:
+            market_frame = _placeholder_market_frame(last_price if last_price is not None else 1.0, segment_interval)
+
+        restored[segment] = {
+            "segment": segment,
+            "week": int(row.get("week") or 0),
+            "generation": int(row.get("generation") or 0),
+            "portfolio_vol_annual": 0.0,
+            "market_source": market_source,
+            "symbol": symbol,
+            "interval": segment_interval,
+            "champion": {
+                "model_id": champion_model_id,
+                "name": champion_name,
+                "generation": int(row.get("generation") or 0),
+                "sortino": float(row.get("champion_sortino") or 0.0),
+                "calmar": float(row.get("champion_calmar") or 0.0),
+                "cvar95": float(row.get("champion_cvar95") or 0.0),
+                "max_dd": float(row.get("champion_max_dd") or 0.0),
+                "cost": 0.0,
+                "turnover": 0.0,
+                "score": float(row.get("champion_score") or 0.0),
+                "passed": bool(float(row.get("champion_score") or 0.0) > 0.0),
+                "reward_usd": float(row.get("reward_usd") or 0.0),
+            },
+            "research": [],
+            "proposed_orders": [],
+            "model_trades": {str(item["model_id"]): [] for item in model_rows},
+            "final_positions": final_positions,
+            "final_open_slots": final_open_slots,
+            "model_open_positions": model_open_positions,
+            "results": pd.DataFrame(model_rows),
+            "long_tail": pd.DataFrame(
+                columns=["symbol", "momentum", "liquidity", "spread_bps", "compliance_risk", "opportunity_score", "trades_24h"]
+            ),
+            "market": market_frame,
+        }
+
+    return restored
+
+st.markdown(
+    """
+    <div style="display:flex;align-items:center;gap:10px;margin:0 0 0.4rem 0;">
+        <div style="width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,#0f172a 0%,#1d4ed8 55%,#22c55e 100%);display:flex;align-items:center;justify-content:center;color:#ffffff;font-size:16px;font-weight:700;box-shadow:0 8px 20px rgba(29,78,216,0.25);">S</div>
+        <div style="font-size:1.35rem;font-weight:700;line-height:1;">SirTrade</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 runtime_state = load_runtime_state()
 SEGMENT_DEFAULTS = {
@@ -120,18 +370,34 @@ if "engines" not in st.session_state:
 
 if "history_by_segment" not in st.session_state:
     st.session_state.history_by_segment = {segment: [] for segment in SEGMENT_DEFAULTS.keys()}
-    restored = load_last_ui_run()
-    if restored:
-        restored_segment = str(restored.get("segment", "Swing"))
-        if restored_segment in st.session_state.history_by_segment:
-            st.session_state.history_by_segment[restored_segment] = [restored]
+    normalized_restored: dict[str, dict[str, object]] = {}
+    restored_by_segment = load_segment_runs()
+    if restored_by_segment:
+        for segment, restored in restored_by_segment.items():
+            restored_segment = _infer_segment_name(restored)
+            if restored_segment in st.session_state.history_by_segment:
+                normalized_restored[restored_segment] = restored
+    else:
+        restored = load_last_ui_run()
+        if restored:
+            restored_segment = _infer_segment_name(restored)
+            if restored_segment in st.session_state.history_by_segment:
+                restored["segment"] = restored_segment
+                normalized_restored[restored_segment] = restored
+
+    recovered_from_storage = _restore_missing_segments_from_storage(set(normalized_restored.keys()))
+    normalized_restored.update(recovered_from_storage)
+
+    for segment, restored in normalized_restored.items():
+        st.session_state.history_by_segment[segment] = [restored]
+
+    if normalized_restored:
+        save_segment_runs(normalized_restored)
 
 if "active_segment" not in st.session_state:
     st.session_state.active_segment = str(runtime_state.get("active_segment", "Swing"))
 if "interval" not in st.session_state:
     st.session_state.interval = SEGMENT_DEFAULTS["Swing"]["interval"]
-if "last_exports" not in st.session_state:
-    st.session_state.last_exports = {}
 if "simulation_running_by_segment" not in st.session_state:
     persisted_segment_state = runtime_state.get("simulation_running_by_segment", {})
     fallback_running = bool(runtime_state.get("simulation_running", False))
@@ -145,16 +411,14 @@ if "data_source" not in st.session_state:
     st.session_state.data_source = str(runtime_state.get("data_source", "simulation"))
 if "symbol" not in st.session_state:
     st.session_state.symbol = str(runtime_state.get("symbol", "BTCUSDT"))
-if "weeks_to_run" not in st.session_state:
-    st.session_state.weeks_to_run = int(runtime_state.get("weeks_to_run", 1))
 if "live_refresh_enabled" not in st.session_state:
     st.session_state.live_refresh_enabled = bool(runtime_state.get("live_refresh_enabled", True))
 if "live_refresh_seconds" not in st.session_state:
-    st.session_state.live_refresh_seconds = int(runtime_state.get("live_refresh_seconds", 1))
+    st.session_state.live_refresh_seconds = FIXED_LIVE_REFRESH_SECONDS
 if "live_refresh_when_stopped" not in st.session_state:
     st.session_state.live_refresh_when_stopped = bool(runtime_state.get("live_refresh_when_stopped", True))
 if "simulation_cycle_seconds" not in st.session_state:
-    st.session_state.simulation_cycle_seconds = int(runtime_state.get("simulation_cycle_seconds", 10))
+    st.session_state.simulation_cycle_seconds = FIXED_SIMULATION_CYCLE_SECONDS
 if "active_view" not in st.session_state:
     st.session_state.active_view = str(runtime_state.get("active_view", "Dashboard"))
 if "last_simulation_tick" not in st.session_state:
@@ -164,12 +428,12 @@ if "ui_active_segment" not in st.session_state:
 if "ui_active_view" not in st.session_state:
     st.session_state.ui_active_view = st.session_state.active_view
 
+st.session_state.live_refresh_seconds = FIXED_LIVE_REFRESH_SECONDS
+st.session_state.simulation_cycle_seconds = FIXED_SIMULATION_CYCLE_SECONDS
+
 prev_active_segment = str(st.session_state.active_segment)
 prev_active_view = str(st.session_state.active_view)
-prev_weeks_to_run = int(st.session_state.weeks_to_run)
 prev_data_source = str(st.session_state.data_source)
-prev_live_refresh_seconds = int(st.session_state.live_refresh_seconds)
-prev_simulation_cycle_seconds = int(st.session_state.simulation_cycle_seconds)
 
 active_segment_running = bool(st.session_state.simulation_running_by_segment.get(st.session_state.active_segment, False))
 has_running_segments = any(st.session_state.simulation_running_by_segment.values())
@@ -180,25 +444,21 @@ status_profile = st.session_state.active_segment
 status_symbol = st.session_state.symbol
 status_interval = SEGMENT_DEFAULTS.get(st.session_state.active_segment, SEGMENT_DEFAULTS["Swing"])["interval"]
 
-run_bg = "#16a34a" if active_segment_running else "#dc2626"
-run_text = "#ffffff"
-status_badges = st.empty()
-
 with st.sidebar:
-    st.header("Ovládání")
+    st.header("Nastavení")
     st.selectbox(
-        "Zobrazený segment",
+        "Segment",
         ["Scalp", "Intraday", "Swing"],
         index=["Scalp", "Intraday", "Swing"].index(st.session_state.ui_active_segment)
         if st.session_state.ui_active_segment in ["Scalp", "Intraday", "Swing"]
         else 2,
-        help="Simulace běží současně pro všechny 3 segmenty. Tady vybíráš, který segment se má zobrazit v detailech.",
+        help="Vybere detail segmentu v hlavní části aplikace.",
         key="ui_active_segment",
     )
     st.session_state.active_segment = st.session_state.ui_active_segment
 
     data_source = st.selectbox(
-        "Zdroj dat",
+        "Data",
         ["simulation", "binance"],
         index=["simulation", "binance"].index(st.session_state.data_source)
         if st.session_state.data_source in ["simulation", "binance"]
@@ -208,42 +468,27 @@ with st.sidebar:
     st.session_state.data_source = data_source
 
     symbol = st.session_state.symbol
-    st.caption(f"Referenční trh (automaticky): {symbol}")
-    st.caption("Časové rámce běží paralelně: Scalp 5m/3d, Intraday 15m/7d, Swing 4h/30d.")
+    st.caption(f"Trh: {symbol}")
+    st.caption(
+        f"Simulace běží do ručního vypnutí. Každý cyklus přidá {SIMULATION_WEEKS_PER_CYCLE} týden. Graf se obnovuje po {FIXED_LIVE_REFRESH_SECONDS} s, přepočet po {FIXED_SIMULATION_CYCLE_SECONDS} s."
+    )
 
-    weeks_to_run = st.slider("Kolik týdnů spustit", 1, 12, int(st.session_state.weeks_to_run))
-    st.session_state.weeks_to_run = weeks_to_run
     st.session_state.auto_center_last_candle = st.checkbox(
-        "Auto-center na poslední svíčku",
+        "Držet graf na konci",
         value=st.session_state.auto_center_last_candle,
-        help="Po každém kroku simulace automaticky posune overlay graf na nejnovější část dat.",
+        help="Po každém kroku posune graf na nejnovější data.",
     )
     st.session_state.live_refresh_enabled = st.checkbox(
-        "Realtime ceny + graf",
+        "Živý graf",
         value=st.session_state.live_refresh_enabled,
-        help="Průběžně obnovuje pouze sekci Grafy pro aktuální cenu a vývoj vybraného coinu.",
-    )
-    st.session_state.live_refresh_seconds = st.slider(
-        "Interval realtime cen (s)",
-        1,
-        10,
-        int(st.session_state.live_refresh_seconds),
-        1,
-    )
-    st.session_state.simulation_cycle_seconds = st.slider(
-        "Interval přepočtu simulace (s)",
-        3,
-        60,
-        int(st.session_state.simulation_cycle_seconds),
-        1,
-        help="Řídí, jak často běží nové simulační kroky segmentů. Je oddělený od realtime cen.",
+        help="Průběžně obnovuje sekci Grafy s aktuální cenou.",
     )
     st.session_state.live_refresh_when_stopped = st.checkbox(
-        "Realtime i při STOP simulace",
+        "Živý graf i při stopu",
         value=st.session_state.live_refresh_when_stopped,
-        help="Ponechá aktualizaci ceny a grafu i při zastavené simulaci.",
+        help="Nechá graf běžet i při zastavené simulaci.",
     )
-    st.markdown("### Řízení běhu segmentů")
+    st.markdown("### Běh segmentů")
     for segment in ["Scalp", "Intraday", "Swing"]:
         is_running = bool(st.session_state.simulation_running_by_segment.get(segment, False))
         run_label = f"{segment}: {'Zastavit' if is_running else 'Spustit'} simulaci"
@@ -272,6 +517,7 @@ if reset_btn:
     st.session_state.history_by_segment = {segment: [] for segment in SEGMENT_DEFAULTS.keys()}
     st.session_state.simulation_running_by_segment = {segment: False for segment in SEGMENT_DEFAULTS.keys()}
     clear_last_ui_run()
+    clear_segment_runs()
     clear_runtime_state()
     st.rerun()
 
@@ -292,10 +538,7 @@ ui_interaction_detected = any(
     [
         st.session_state.active_segment != prev_active_segment,
         st.session_state.active_view != prev_active_view,
-        int(st.session_state.weeks_to_run) != prev_weeks_to_run,
         st.session_state.data_source != prev_data_source,
-        int(st.session_state.live_refresh_seconds) != prev_live_refresh_seconds,
-        int(st.session_state.simulation_cycle_seconds) != prev_simulation_cycle_seconds,
     ]
 )
 
@@ -315,27 +558,6 @@ should_run_simulation = bool(
 if should_run_simulation:
     st.session_state.last_simulation_tick = now_ts
 
-status_run = "BĚŽÍ" if active_segment_running else "STOP"
-status_source = "Simulace" if st.session_state.data_source == "simulation" else "Binance"
-status_profile = st.session_state.active_segment
-status_symbol = st.session_state.symbol
-status_interval = SEGMENT_DEFAULTS.get(st.session_state.active_segment, SEGMENT_DEFAULTS["Swing"])["interval"]
-run_bg = "#16a34a" if active_segment_running else "#dc2626"
-run_text = "#ffffff"
-
-status_badges.markdown(
-    f"""
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 14px 0;">
-        <span style="background:{run_bg};color:{run_text};padding:6px 10px;border-radius:999px;font-weight:700;">Běh: {status_run}</span>
-        <span style="background:#1f2937;color:#e5e7eb;padding:6px 10px;border-radius:999px;">Profil: {status_profile}</span>
-        <span style="background:#1f2937;color:#e5e7eb;padding:6px 10px;border-radius:999px;">Zdroj: {status_source}</span>
-        <span style="background:#1f2937;color:#e5e7eb;padding:6px 10px;border-radius:999px;">Referenční trh: {status_symbol}</span>
-        <span style="background:#1f2937;color:#e5e7eb;padding:6px 10px;border-radius:999px;">Timeframe: {status_interval}</span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
 save_runtime_state(
     {
         "simulation_running": has_running_segments,
@@ -344,7 +566,6 @@ save_runtime_state(
         "active_segment": st.session_state.active_segment,
         "data_source": st.session_state.data_source,
         "symbol": st.session_state.symbol,
-        "weeks_to_run": int(st.session_state.weeks_to_run),
         "live_refresh_enabled": st.session_state.live_refresh_enabled,
         "live_refresh_seconds": int(st.session_state.live_refresh_seconds),
         "live_refresh_when_stopped": st.session_state.live_refresh_when_stopped,
@@ -355,7 +576,7 @@ save_runtime_state(
 )
 
 if should_run_simulation:
-    for _ in range(weeks_to_run):
+    for _ in range(SIMULATION_WEEKS_PER_CYCLE):
         for segment, cfg in SEGMENT_DEFAULTS.items():
             if not st.session_state.simulation_running_by_segment.get(segment, False):
                 continue
@@ -377,19 +598,21 @@ if should_run_simulation:
     _load_closed_positions_cached.clear()
     _load_recent_runs_cached.clear()
 
+latest_runs_by_segment = {
+    segment: history[-1]
+    for segment, history in st.session_state.history_by_segment.items()
+    if history
+}
+if latest_runs_by_segment:
+    save_segment_runs(latest_runs_by_segment)
+
 has_any_history = any(len(history) > 0 for history in st.session_state.history_by_segment.values())
 if not has_any_history:
-    st.info("Spusť simulaci u vybraného segmentu pro první týdenní vyhodnocení.")
+    st.caption("Spusť simulaci pro první týdenní vyhodnocení.")
 else:
-    if has_running_segments:
-        running_segments = [segment for segment, running in st.session_state.simulation_running_by_segment.items() if running]
-        st.success(f"Simulace běží pro segmenty: {', '.join(running_segments)}")
-    else:
-        st.info("Všechny segmenty jsou zastavené. Poslední výsledky zůstávají zobrazené.")
-
     active_history = st.session_state.history_by_segment.get(st.session_state.active_segment, [])
     if not active_history:
-        st.warning(f"Segment {st.session_state.active_segment} zatím nemá žádná data. Spusť simulaci pro získání výsledků.")
+        st.caption(f"Segment {st.session_state.active_segment} zatím nemá data.")
         st.stop()
 
     latest = active_history[-1]
@@ -434,22 +657,8 @@ else:
 
     if st.session_state.active_view == "Dashboard":
         st.subheader(f"Detail segmentu: {st.session_state.active_segment}")
-        namespace = f"{SEGMENT_DEFAULTS[st.session_state.active_segment]['namespace']}_"
-        closed_positions_all = _load_closed_positions_cached(limit=10000)
-        win_rate_label = "N/A"
-        avg_pnl_label = "N/A"
-        if not closed_positions_all.empty and "model_id" in closed_positions_all.columns:
-            segment_closed = closed_positions_all[
-                closed_positions_all["model_id"].astype(str).str.startswith(namespace)
-            ].copy()
-            if not segment_closed.empty and "pnl_pct" in segment_closed.columns:
-                pnl = pd.to_numeric(segment_closed["pnl_pct"], errors="coerce").dropna()
-                if not pnl.empty:
-                    wins = int((pnl > 0).sum())
-                    losses = int((pnl < 0).sum())
-                    decided = max(1, wins + losses)
-                    win_rate_label = f"{(wins / decided) * 100:.1f}%"
-                    avg_pnl_label = f"{pnl.mean():.3f}%"
+        dashboard_closed_positions = _load_segment_closed_positions(st.session_state.active_segment)
+        win_rate_label, avg_pnl_label, _, _, _ = _compute_closed_position_metrics(dashboard_closed_positions)
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Týden", latest["week"])
@@ -657,16 +866,11 @@ else:
 
     if st.session_state.active_view == "Uzavřené pozice":
         st.subheader("Přehled uzavřených pozic")
-        closed_positions = _load_closed_positions_cached(limit=5000)
-        namespace = f"{SEGMENT_DEFAULTS[st.session_state.active_segment]['namespace']}_"
-        if not closed_positions.empty and "model_id" in closed_positions.columns:
-            closed_positions = closed_positions[closed_positions["model_id"].astype(str).str.startswith(namespace)].copy()
+        closed_positions = _load_segment_closed_positions(st.session_state.active_segment)
         if closed_positions.empty:
             st.info(f"Pro segment {st.session_state.active_segment} zatím nejsou uložené žádné uzavřené obchody.")
         else:
-            closed_positions["closed_at"] = pd.to_datetime(closed_positions["closed_at"], errors="coerce")
-            closed_positions["opened_at"] = pd.to_datetime(closed_positions["opened_at"], errors="coerce")
-            valid_closed = closed_positions[closed_positions["closed_at"].notna()].copy()
+            valid_closed = closed_positions.copy()
 
             if valid_closed.empty:
                 st.info("Uzavřené obchody nemají validní datum uzavření.")
@@ -712,13 +916,11 @@ else:
                     overview = _split_datetime_column(overview, "Uzavřeno", "Uzavřeno")
                     overview = _split_datetime_column(overview, "Otevřeno", "Otevřeno")
 
-                    wins = int((overview["PnL %"] > 0).sum())
-                    losses = int((overview["PnL %"] < 0).sum())
-                    win_rate = (wins / max(1, wins + losses)) * 100
+                    win_rate_label, avg_pnl_label, _, _, _ = _compute_closed_position_metrics(filtered)
                     m1, m2, m3 = st.columns(3)
                     m1.metric("Uzavřené obchody", len(overview))
-                    m2.metric("Win rate", f"{win_rate:.1f}%")
-                    m3.metric("Průměrné PnL", f"{overview['PnL %'].mean():.3f}%")
+                    m2.metric("Win rate", win_rate_label)
+                    m3.metric("Průměrné PnL", avg_pnl_label)
 
                     def _style_result(value):
                         if value == "ZISK":
