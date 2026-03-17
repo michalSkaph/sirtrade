@@ -341,6 +341,32 @@ def _restore_missing_segments_from_storage(existing_segments: set[str]) -> dict[
 
     return restored
 
+
+def _coerce_int(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _hydrate_engines_from_history(
+    engines: dict[str, TradingEngine],
+    history_by_segment: dict[str, list[dict[str, object]]],
+) -> None:
+    for segment, engine in engines.items():
+        history = history_by_segment.get(segment, [])
+        if not history:
+            continue
+
+        latest = history[-1]
+        latest_week = max(0, _coerce_int(latest.get("week"), 0))
+        latest_generation = max(1, _coerce_int(latest.get("generation"), 1))
+
+        engine.week = max(engine.week, latest_week)
+        engine.generation = max(engine.generation, latest_generation)
+        for model in engine.models:
+            model.generation = engine.generation
+
 st.markdown(
     """
     <div style="display:flex;align-items:center;gap:10px;margin:0 0 0.4rem 0;">
@@ -394,6 +420,8 @@ if "history_by_segment" not in st.session_state:
     if normalized_restored:
         save_segment_runs(normalized_restored)
 
+_hydrate_engines_from_history(st.session_state.engines, st.session_state.history_by_segment)
+
 if "active_segment" not in st.session_state:
     st.session_state.active_segment = str(runtime_state.get("active_segment", "Swing"))
 if "interval" not in st.session_state:
@@ -423,17 +451,9 @@ if "active_view" not in st.session_state:
     st.session_state.active_view = str(runtime_state.get("active_view", "Dashboard"))
 if "last_simulation_tick" not in st.session_state:
     st.session_state.last_simulation_tick = float(runtime_state.get("last_simulation_tick", 0.0))
-if "ui_active_segment" not in st.session_state:
-    st.session_state.ui_active_segment = st.session_state.active_segment
-if "ui_active_view" not in st.session_state:
-    st.session_state.ui_active_view = st.session_state.active_view
 
 st.session_state.live_refresh_seconds = FIXED_LIVE_REFRESH_SECONDS
 st.session_state.simulation_cycle_seconds = FIXED_SIMULATION_CYCLE_SECONDS
-
-prev_active_segment = str(st.session_state.active_segment)
-prev_active_view = str(st.session_state.active_view)
-prev_data_source = str(st.session_state.data_source)
 
 active_segment_running = bool(st.session_state.simulation_running_by_segment.get(st.session_state.active_segment, False))
 has_running_segments = any(st.session_state.simulation_running_by_segment.values())
@@ -446,16 +466,14 @@ status_interval = SEGMENT_DEFAULTS.get(st.session_state.active_segment, SEGMENT_
 
 with st.sidebar:
     st.header("Nastavení")
-    st.selectbox(
+    if st.session_state.active_segment not in ["Scalp", "Intraday", "Swing"]:
+        st.session_state.active_segment = "Swing"
+    st.session_state.active_segment = st.selectbox(
         "Segment",
         ["Scalp", "Intraday", "Swing"],
-        index=["Scalp", "Intraday", "Swing"].index(st.session_state.ui_active_segment)
-        if st.session_state.ui_active_segment in ["Scalp", "Intraday", "Swing"]
-        else 2,
+        index=["Scalp", "Intraday", "Swing"].index(st.session_state.active_segment),
         help="Vybere detail segmentu v hlavní části aplikace.",
-        key="ui_active_segment",
     )
-    st.session_state.active_segment = st.session_state.ui_active_segment
 
     data_source = st.selectbox(
         "Data",
@@ -522,24 +540,14 @@ if reset_btn:
     st.rerun()
 
 view_options = ["Dashboard", "Grafy", "Pozice", "Uzavřené pozice", "Analýza", "Historie & Export"]
-st.radio(
+if st.session_state.active_view not in view_options:
+    st.session_state.active_view = "Dashboard"
+st.session_state.active_view = st.radio(
     "Sekce",
     view_options,
-    index=view_options.index(st.session_state.ui_active_view)
-    if st.session_state.ui_active_view in view_options
-    else 0,
+    index=view_options.index(st.session_state.active_view),
     horizontal=True,
     label_visibility="collapsed",
-    key="ui_active_view",
-)
-st.session_state.active_view = st.session_state.ui_active_view
-
-ui_interaction_detected = any(
-    [
-        st.session_state.active_segment != prev_active_segment,
-        st.session_state.active_view != prev_active_view,
-        st.session_state.data_source != prev_data_source,
-    ]
 )
 
 active_segment_running = bool(st.session_state.simulation_running_by_segment.get(st.session_state.active_segment, False))
@@ -548,8 +556,6 @@ now_ts = time.time()
 min_cycle_seconds = max(1, int(st.session_state.simulation_cycle_seconds))
 should_run_simulation = bool(
     has_running_segments
-    and (force_simulation_cycle or st.session_state.active_view == "Dashboard")
-    and (force_simulation_cycle or not ui_interaction_detected)
     and (
         force_simulation_cycle
         or (now_ts - float(st.session_state.last_simulation_tick)) >= float(min_cycle_seconds)
