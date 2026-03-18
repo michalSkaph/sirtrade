@@ -152,12 +152,21 @@ class TradingEngine:
         slot_size = self.config.risk.max_asset_exposure / 5
         entry_threshold = float(rng.uniform(0.14, 0.34))
         warmup_bars = min(48, max(12, int(len(market) * 0.1)))
-        decision_interval = int(rng.integers(1, 4))
-        decision_offset = int(rng.integers(0, decision_interval))
+        # Always evaluate signal each bar (remove periodic gating that caused
+        # entries to align to fixed timestamps in market data)
+        # decision_interval and decision_offset removed to allow event-driven entries
         min_hold_bars = int(rng.integers(1, 6))
         cooldown_bars = int(rng.integers(2, 8))
         stop_multiplier = float(rng.uniform(0.9, 1.6))
         target_multiplier = float(rng.uniform(1.8, 3.2))
+
+        # Tweak parameters for swing / mean_reversion models to improve PnL
+        # by requiring slightly longer holds and larger targets so winners
+        # contribute more while avoiding quick chop exits.
+        if model.kind == "mean_reversion":
+            min_hold_bars = max(min_hold_bars, int(rng.integers(3, 8)))
+            stop_multiplier = float(rng.uniform(1.0, 1.9))
+            target_multiplier = float(rng.uniform(2.4, 4.0))
 
         pos = pd.Series(0.0, index=market.index, dtype=float)
         side = 0
@@ -182,7 +191,9 @@ class TradingEngine:
                 pos.loc[ts] = 0.0
                 continue
 
-            is_decision_step = ((step - decision_offset) % decision_interval) == 0
+            # evaluate every step — entry gating is handled by `entry_threshold`,
+            # `min_hold_bars` and `cooldown_bars` to avoid excessive churn
+            is_decision_step = True
 
             if side == 0:
                 if cooldown_remaining > 0:
@@ -376,7 +387,10 @@ class TradingEngine:
         results_df = pd.DataFrame([r.__dict__ for r in results]).sort_values("score", ascending=False)
 
         champion = results_df.iloc[0].to_dict()
-        champion["reward_usd"] = 1.0
+        # Scale reward by champion score (min 1.0) so higher-performing models
+        # receive larger rewards while keeping a reasonable floor.
+        champion_score = float(champion.get("score", 1.0))
+        champion["reward_usd"] = max(1.0, champion_score * 10.0)
         champion_model_id = str(champion["model_id"])
 
         research: list[StudyInsight] = daily_deep_research(seed=10_000 + self.week)

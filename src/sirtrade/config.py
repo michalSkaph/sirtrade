@@ -15,12 +15,15 @@ class RiskPolicy:
 
 @dataclass
 class DecisionWeights:
-    sortino: float = 0.28
-    calmar: float = 0.22
-    cvar95: float = -0.18
-    max_dd: float = -0.14
-    cost: float = -0.10
-    turnover: float = -0.08
+    # Increase emphasis on risk-adjusted return (Sortino / Calmar)
+    # and reduce penalties for cost/turnover to avoid overly favoring
+    # low-turnover but low-return models.
+    sortino: float = 0.40
+    calmar: float = 0.30
+    cvar95: float = -0.12
+    max_dd: float = -0.10
+    cost: float = -0.05
+    turnover: float = -0.03
 
 
 @dataclass
