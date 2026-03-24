@@ -10,6 +10,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+import subprocess
+import os
 
 from src.sirtrade.config import DEFAULT_CONFIG
 from src.sirtrade.data import fetch_binance_market
@@ -38,6 +40,51 @@ from src.sirtrade.ui_state import (
 
 st.set_page_config(page_title="SirTrade", page_icon="📈", layout="wide")
 init_db()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _get_last_commit_info() -> str:
+    # Prefer explicit env var set during deploy
+    env_val = os.getenv("SIRTRADE_LAST_COMMIT")
+    if env_val:
+        return env_val
+
+    # Check for generated commit file
+    for fname in ("LAST_COMMIT", ".last_commit"):
+        p = Path(fname)
+        if p.exists():
+            try:
+                txt = p.read_text(encoding="utf-8").strip()
+                if txt:
+                    return txt
+            except Exception:
+                pass
+
+    # Try to read from git if .git is available
+    try:
+        if Path(".git").exists():
+            out = subprocess.check_output(["git", "log", "-1", "--format=%cI"], stderr=subprocess.DEVNULL)
+            val = out.decode().strip()
+            if val:
+                return val
+    except Exception:
+        pass
+
+    return "unknown"
+
+
+# render small badge with last commit info in bottom-right corner
+try:
+    _last_commit_label = _get_last_commit_info()
+    _badge_html = (
+        "<div style='position:fixed;right:12px;bottom:8px;z-index:9999;"
+        "background:rgba(255,255,255,0.85);padding:6px 8px;border-radius:6px;"
+        "box-shadow:0 1px 4px rgba(0,0,0,0.12);font-size:12px;color:#333;'>"
+        f"Last commit: {_last_commit_label}</div>"
+    )
+    st.markdown(_badge_html, unsafe_allow_html=True)
+except Exception:
+    pass
 
 
 @st.cache_data(ttl=3, show_spinner=False)
