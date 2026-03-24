@@ -41,7 +41,6 @@ def default_model_specs(namespace: str = "", label_prefix: str = "") -> list[Mod
 
 
 def generate_signals(model: ModelSpec, market: pd.DataFrame, seed: int = 0) -> pd.Series:
-    rng = np.random.default_rng(seed + hash(model.model_id) % 10_000)
     returns = market["ret"].fillna(0.0)
     vol = returns.rolling(20).std().fillna(returns.std() if returns.std() > 0 else 0.01)
 
@@ -60,5 +59,5 @@ def generate_signals(model: ModelSpec, market: pd.DataFrame, seed: int = 0) -> p
         rev = -np.tanh((returns - returns.rolling(20).mean().fillna(0.0)) / (vol + 1e-6))
         signal = 0.6 * trend + 0.4 * rev
 
-    noise = rng.normal(0, 0.08, len(market))
-    return pd.Series(np.clip(signal + noise, -1.0, 1.0), index=market.index)
+    smoothed = pd.Series(signal, index=market.index, dtype=float).ewm(span=3, adjust=False).mean()
+    return smoothed.clip(-1.0, 1.0)

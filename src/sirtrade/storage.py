@@ -33,7 +33,7 @@ def _extract_slot_delta(action: str, entry: bool) -> float:
 def _build_closed_positions_rows(summary: dict) -> list[tuple]:
     model_trades = summary.get("model_trades", {})
     results_df = summary.get("results")
-    symbol = str(summary.get("symbol", "BTCUSDT"))
+    default_symbol = str(summary.get("symbol", "BTCUSDT"))
     market_source = str(summary.get("market_source", "simulation"))
     week = int(summary.get("week", 0))
     generation = int(summary.get("generation", 0))
@@ -70,6 +70,7 @@ def _build_closed_positions_rows(summary: dict) -> list[tuple]:
             except Exception:
                 continue
             timestamp = str(event.get("timestamp", ""))
+            symbol = str(event.get("symbol", default_symbol)).upper()
 
             if "Vstup" in action:
                 qty = _extract_slot_delta(action, entry=True)
@@ -382,5 +383,16 @@ def load_closed_positions(limit: int = 2000, db_path: Path = DEFAULT_DB_PATH) ->
             conn,
             params=(int(limit),),
         )
+    finally:
+        conn.close()
+
+
+def clear_trade_history(db_path: Path = DEFAULT_DB_PATH) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM weekly_runs")
+        conn.execute("DELETE FROM open_positions")
+        conn.execute("DELETE FROM closed_positions")
+        conn.commit()
     finally:
         conn.close()

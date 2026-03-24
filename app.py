@@ -16,8 +16,10 @@ import os
 from src.sirtrade.config import DEFAULT_CONFIG
 from src.sirtrade.data import fetch_binance_market
 from src.sirtrade.engine import TradingEngine
+from src.sirtrade.live_worker import ensure_live_worker_started
 from src.sirtrade.reporting import export_weekly_report
 from src.sirtrade.storage import (
+    clear_trade_history,
     init_db,
     load_closed_positions,
     load_open_positions,
@@ -40,6 +42,7 @@ from src.sirtrade.ui_state import (
 
 st.set_page_config(page_title="SirTrade", page_icon="📈", layout="wide")
 init_db()
+ensure_live_worker_started()
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -111,6 +114,44 @@ CLOSED_POSITIONS_LIMIT = 10000
 SIMULATION_WEEKS_PER_CYCLE = 1
 FIXED_LIVE_REFRESH_SECONDS = 2
 FIXED_SIMULATION_CYCLE_SECONDS = 10
+FIXED_BINANCE_DECISION_SECONDS = 30
+
+
+def _report_paths_from_summary(summary: dict[str, object] | None) -> dict[str, str]:
+    if not isinstance(summary, dict):
+        return {}
+    try:
+        week = int(summary.get("week", 0))
+        generation = int(summary.get("generation", 0))
+    except (TypeError, ValueError):
+        return {}
+    segment = str(summary.get("segment", "unknown")).lower()
+    symbol = str(summary.get("symbol", "BTCUSDT"))
+    source = str(summary.get("market_source", "simulation"))
+    stem = f"week_{week:03d}_gen_{generation:02d}_{segment}_{symbol}_{source}"
+    return {
+        "csv": str(Path("reports") / f"{stem}.csv"),
+        "json": str(Path("reports") / f"{stem}.json"),
+    }
+
+
+def _reset_summary_trade_state(summary: dict[str, object] | None) -> dict[str, object] | None:
+    if not isinstance(summary, dict):
+        return None
+
+    reset_summary = dict(summary)
+    results = summary.get("results")
+    model_ids: list[str] = []
+    if isinstance(results, pd.DataFrame) and "model_id" in results.columns:
+        model_ids = [str(value) for value in results["model_id"].tolist()]
+
+    reset_summary["model_trades"] = {model_id: [] for model_id in model_ids}
+    reset_summary["champion_trades"] = []
+    reset_summary["final_positions"] = {model_id: 0.0 for model_id in model_ids}
+    reset_summary["final_open_slots"] = {model_id: 0 for model_id in model_ids}
+    reset_summary["model_open_positions"] = {model_id: [] for model_id in model_ids}
+    reset_summary["proposed_orders"] = []
+    return reset_summary
 
 
 def _split_datetime_column(frame: pd.DataFrame, source_column: str, label_prefix: str) -> pd.DataFrame:
@@ -483,7 +524,7 @@ if "simulation_running_by_segment" not in st.session_state:
 if "auto_center_last_candle" not in st.session_state:
     st.session_state.auto_center_last_candle = bool(runtime_state.get("auto_center_last_candle", True))
 if "data_source" not in st.session_state:
-    st.session_state.data_source = str(runtime_state.get("data_source", "simulation"))
+    st.session_state.data_source = str(runtime_state.get("data_source", "binance"))
 if "symbol" not in st.session_state:
     st.session_state.symbol = str(runtime_state.get("symbol", "BTCUSDT"))
 if "live_refresh_enabled" not in st.session_state:
@@ -498,6 +539,14 @@ if "active_view" not in st.session_state:
     st.session_state.active_view = str(runtime_state.get("active_view", "Dashboard"))
 if "last_simulation_tick" not in st.session_state:
     st.session_state.last_simulation_tick = float(runtime_state.get("last_simulation_tick", 0.0))
+if "live_segment_cursor" not in st.session_state:
+    st.session_state.live_segment_cursor = int(runtime_state.get("live_segment_cursor", 0))
+if "last_exports" not in st.session_state:
+    st.session_state.last_exports = {}
+if "reset_token" not in st.session_state:
+    st.session_state.reset_token = int(runtime_state.get("reset_token", 0))
+if "paper_trade_cutoff_ts" not in st.session_state:
+    st.session_state.paper_trade_cutoff_ts = runtime_state.get("paper_trade_cutoff_ts")
 
 st.session_state.live_refresh_seconds = FIXED_LIVE_REFRESH_SECONDS
 st.session_state.simulation_cycle_seconds = FIXED_SIMULATION_CYCLE_SECONDS
@@ -508,7 +557,7 @@ force_simulation_cycle = False
 status_run = "BĚŽÍ" if active_segment_running else "STOP"
 status_source = "Simulace" if st.session_state.data_source == "simulation" else "Binance"
 status_profile = st.session_state.active_segment
-status_symbol = st.session_state.symbol
+status_symbol = "Dynamické Top 20" if st.session_state.data_source == "binance" else "Simulační Top 20"
 status_interval = SEGMENT_DEFAULTS.get(st.session_state.active_segment, SEGMENT_DEFAULTS["Swing"])["interval"]
 
 with st.sidebar:
@@ -532,11 +581,16 @@ with st.sidebar:
     )
     st.session_state.data_source = data_source
 
-    symbol = st.session_state.symbol
-    st.caption(f"Trh: {symbol}")
-    st.caption(
-        f"Simulace běží do ručního vypnutí. Každý cyklus přidá {SIMULATION_WEEKS_PER_CYCLE} týden. Graf se obnovuje po {FIXED_LIVE_REFRESH_SECONDS} s, přepočet po {FIXED_SIMULATION_CYCLE_SECONDS} s."
-    )
+    if st.session_state.data_source == "binance":
+        st.caption("Univerzum: dynamické Top 20 coiny z Binance podle aktuální atraktivity a likvidity.")
+        st.caption(
+            f"Paper-trading běží nad živými Binance daty. Graf se obnovuje po {FIXED_LIVE_REFRESH_SECONDS} s, rozhodovací přepočet po {FIXED_BINANCE_DECISION_SECONDS} s."
+        )
+    else:
+        st.caption("Univerzum: dynamické Top 20 simulovaných coinů podle aktuální atraktivity.")
+        st.caption(
+            f"Simulace běží do ručního vypnutí. Každý cyklus přidá {SIMULATION_WEEKS_PER_CYCLE} týden. Graf se obnovuje po {FIXED_LIVE_REFRESH_SECONDS} s, přepočet po {FIXED_SIMULATION_CYCLE_SECONDS} s."
+        )
 
     st.session_state.auto_center_last_candle = st.checkbox(
         "Držet graf na konci",
@@ -571,45 +625,69 @@ with st.sidebar:
     st.write(f"Maximální expozice na aktivum: {cfg.risk.max_asset_exposure:.0%}")
 
 if reset_btn:
-    st.session_state.engines = {
-        segment: TradingEngine(
-            DEFAULT_CONFIG,
-            model_namespace=cfg["namespace"],
-            model_label_prefix=segment,
-        )
-        for segment, cfg in SEGMENT_DEFAULTS.items()
-    }
-    st.session_state.history_by_segment = {segment: [] for segment in SEGMENT_DEFAULTS.keys()}
     st.session_state.simulation_running_by_segment = {segment: False for segment in SEGMENT_DEFAULTS.keys()}
+    st.session_state.reset_token += 1
+    st.session_state.paper_trade_cutoff_ts = pd.Timestamp.utcnow().isoformat()
+    clear_trade_history()
     clear_last_ui_run()
-    clear_segment_runs()
-    clear_runtime_state()
+
+    reset_segment_runs: dict[str, dict[str, object]] = {}
+    for segment in SEGMENT_DEFAULTS.keys():
+        history = st.session_state.history_by_segment.get(segment, [])
+        latest_summary = history[-1] if history else None
+        reset_summary = _reset_summary_trade_state(latest_summary)
+        st.session_state.history_by_segment[segment] = [reset_summary] if isinstance(reset_summary, dict) else []
+        if isinstance(reset_summary, dict):
+            reset_segment_runs[segment] = reset_summary
+
+    if reset_segment_runs:
+        save_segment_runs(reset_segment_runs)
+        active_reset_summary = reset_segment_runs.get(st.session_state.active_segment)
+        if isinstance(active_reset_summary, dict):
+            save_last_ui_run(active_reset_summary)
+            st.session_state.last_exports = _report_paths_from_summary(active_reset_summary)
+    else:
+        clear_last_ui_run()
+        clear_segment_runs()
+        st.session_state.last_exports = {}
+
+    save_runtime_state(
+        {
+            "simulation_running": False,
+            "simulation_running_by_segment": st.session_state.simulation_running_by_segment,
+            "auto_center_last_candle": st.session_state.auto_center_last_candle,
+            "active_segment": st.session_state.active_segment,
+            "data_source": st.session_state.data_source,
+            "symbol": st.session_state.symbol,
+            "live_refresh_enabled": st.session_state.live_refresh_enabled,
+            "live_refresh_seconds": int(st.session_state.live_refresh_seconds),
+            "live_refresh_when_stopped": st.session_state.live_refresh_when_stopped,
+            "simulation_cycle_seconds": int(st.session_state.simulation_cycle_seconds),
+            "active_view": st.session_state.active_view,
+            "last_simulation_tick": 0.0,
+            "live_segment_cursor": int(st.session_state.live_segment_cursor),
+            "reset_token": int(st.session_state.reset_token),
+            "paper_trade_cutoff_ts": st.session_state.paper_trade_cutoff_ts,
+        }
+    )
+    _load_open_positions_cached.clear()
+    _load_closed_positions_cached.clear()
+    _load_recent_runs_cached.clear()
     st.rerun()
 
 view_options = ["Dashboard", "Grafy", "Pozice", "Uzavřené pozice", "Analýza", "Historie & Export"]
 if st.session_state.active_view not in view_options:
     st.session_state.active_view = "Dashboard"
-st.session_state.active_view = st.radio(
+st.radio(
     "Sekce",
     view_options,
-    index=view_options.index(st.session_state.active_view),
     horizontal=True,
     label_visibility="collapsed",
+    key="active_view",
 )
 
 active_segment_running = bool(st.session_state.simulation_running_by_segment.get(st.session_state.active_segment, False))
 has_running_segments = any(st.session_state.simulation_running_by_segment.values())
-now_ts = time.time()
-min_cycle_seconds = max(1, int(st.session_state.simulation_cycle_seconds))
-should_run_simulation = bool(
-    has_running_segments
-    and (
-        force_simulation_cycle
-        or (now_ts - float(st.session_state.last_simulation_tick)) >= float(min_cycle_seconds)
-    )
-)
-if should_run_simulation:
-    st.session_state.last_simulation_tick = now_ts
 
 save_runtime_state(
     {
@@ -625,39 +703,41 @@ save_runtime_state(
         "simulation_cycle_seconds": int(st.session_state.simulation_cycle_seconds),
         "active_view": st.session_state.active_view,
         "last_simulation_tick": float(st.session_state.last_simulation_tick),
+        "live_segment_cursor": int(st.session_state.live_segment_cursor),
+        "reset_token": int(st.session_state.reset_token),
+        "paper_trade_cutoff_ts": st.session_state.paper_trade_cutoff_ts,
     }
 )
 
-if should_run_simulation:
-    for _ in range(SIMULATION_WEEKS_PER_CYCLE):
-        for segment, cfg in SEGMENT_DEFAULTS.items():
-            if not st.session_state.simulation_running_by_segment.get(segment, False):
-                continue
-            result = st.session_state.engines[segment].run_week(
-                days=int(cfg["sim_days"]),
-                market_source=data_source,
-                symbol=symbol,
-                interval=str(cfg["interval"]),
+persisted_segment_runs = load_segment_runs()
+if persisted_segment_runs:
+    for segment, summary in persisted_segment_runs.items():
+        normalized_segment = _infer_segment_name(summary)
+        if normalized_segment in st.session_state.history_by_segment:
+            current_history = st.session_state.history_by_segment.get(normalized_segment, [])
+            current_latest = current_history[-1] if current_history else None
+            current_key = (
+                int(current_latest.get("week", 0)) if isinstance(current_latest, dict) else -1,
+                int(current_latest.get("generation", 0)) if isinstance(current_latest, dict) else -1,
             )
-            result["segment"] = segment
-            st.session_state.history_by_segment[segment].append(result)
-            save_week_result(result)
-            save_open_positions(result)
-            save_closed_positions(result)
-            if segment == st.session_state.active_segment:
-                save_last_ui_run(result)
-                st.session_state.last_exports = export_weekly_report(result, DEFAULT_CONFIG)
-    _load_open_positions_cached.clear()
-    _load_closed_positions_cached.clear()
-    _load_recent_runs_cached.clear()
+            incoming_key = (
+                int(summary.get("week", 0)) if isinstance(summary, dict) else -1,
+                int(summary.get("generation", 0)) if isinstance(summary, dict) else -1,
+            )
+            if incoming_key >= current_key:
+                st.session_state.history_by_segment[normalized_segment] = [summary]
+                if normalized_segment == st.session_state.active_segment:
+                    st.session_state.last_exports = _report_paths_from_summary(summary)
+
+_load_open_positions_cached.clear()
+_load_closed_positions_cached.clear()
+_load_recent_runs_cached.clear()
 
 latest_runs_by_segment = {
     segment: history[-1]
     for segment, history in st.session_state.history_by_segment.items()
     if history
 }
-if latest_runs_by_segment:
-    save_segment_runs(latest_runs_by_segment)
 
 has_any_history = any(len(history) > 0 for history in st.session_state.history_by_segment.values())
 if not has_any_history:
@@ -679,7 +759,7 @@ else:
 
     source_label = {"simulation": "Simulace", "binance": "Binance"}.get(latest["market_source"], latest["market_source"])
 
-    refreshable_views = {"Grafy"}
+    refreshable_views = {"Dashboard", "Grafy", "Pozice"}
     if (
         st.session_state.live_refresh_enabled
         and st.session_state.active_view in refreshable_views
@@ -728,7 +808,7 @@ else:
                 None if live_market_change_pct is None else f"{live_market_change_pct:.3f}%",
             )
         st.caption(
-            f"Zdroj dat: {source_label} | Symbol: {latest['symbol']} | Timeframe: {latest.get('interval', '1d')} | Exekuce: pouze dry-run"
+            f"Zdroj dat: {source_label} | Champion coin: {latest['symbol']} | Univerzum: {len(latest.get('candidate_symbols', [])) or 1} coinů | Timeframe: {latest.get('interval', '1d')} | Exekuce: pouze dry-run"
         )
         if (
             active_segment_running
@@ -756,6 +836,7 @@ else:
             columns={
                 "model_id": "ID modelu",
                 "name": "Název modelu",
+                "symbol": "Vybraný coin",
                 "generation": "Generace",
                 "sortino": "Sortino",
                 "calmar": "Calmar",
@@ -770,6 +851,7 @@ else:
         leaderboard_config = {
             "ID modelu": st.column_config.TextColumn("ID modelu", help="Interní identifikátor modelu."),
             "Název modelu": st.column_config.TextColumn("Název modelu", help="Název obchodního modelu."),
+            "Vybraný coin": st.column_config.TextColumn("Vybraný coin", help="Coin, který model aktuálně vybral z top 20 univerza."),
             "Generace": st.column_config.NumberColumn("Generace", help="Generace evolučního cyklu modelů."),
             "Sortino": st.column_config.NumberColumn("Sortino", help="Výnos očištěný o downside volatilitu. Vyšší je lepší."),
             "Calmar": st.column_config.NumberColumn("Calmar", help="Poměr výnosu k max drawdownu. Vyšší je lepší."),
@@ -784,22 +866,27 @@ else:
 
     if st.session_state.active_view == "Pozice":
         st.subheader("Detail pozic modelů")
-        st.caption("Modely alokují pozice autonomně napříč více coiny (max 5 slotů na model).")
+        st.caption("Modely vybírají coin z dynamického top 20 univerza a na něm otevírají paper pozice podle aktuálních Binance dat.")
         model_position_rows = []
-        latest_market_price = float(latest["market"]["close"].iloc[-1])
-        if live_market_price is not None:
-            latest_market_price = live_market_price
-        vol_latest = float(latest["market"]["close"].pct_change().rolling(20).std().iloc[-1])
-        if pd.isna(vol_latest) or vol_latest <= 0:
-            vol_latest = 0.015
+        model_markets = latest.get("model_markets", {})
+        latest_prices = latest.get("latest_prices", {})
 
         for _, row in latest["results"].iterrows():
             model_id = str(row["model_id"])
             model_name = str(row["name"])
+            model_symbol = str(row.get("symbol") or latest.get("model_selected_symbols", {}).get(model_id, latest["symbol"])).upper()
             position_value = float(latest.get("final_positions", {}).get(model_id, 0.0))
             open_slots = int(latest.get("final_open_slots", {}).get(model_id, 0))
             side = "LONG" if position_value > 0 else ("SHORT" if position_value < 0 else "-")
             is_open = abs(position_value) > 1e-9
+            model_market = model_markets.get(model_id, latest["market"])
+            latest_market_price = latest_prices.get(model_symbol)
+            if latest_market_price is None:
+                close_series = pd.to_numeric(model_market["close"], errors="coerce").dropna() if not model_market.empty else pd.Series(dtype=float)
+                latest_market_price = float(close_series.iloc[-1]) if not close_series.empty else 0.0
+            vol_latest = float(model_market["close"].pct_change().rolling(20).std().iloc[-1]) if not model_market.empty else 0.0
+            if pd.isna(vol_latest) or vol_latest <= 0:
+                vol_latest = 0.015
 
             entry_price = None
             opened_at = None
@@ -831,11 +918,11 @@ else:
                     "Model": model_name,
                     "Symbol": ", ".join(
                         [
-                            str(item.get("symbol", latest["symbol"]))
+                            str(item.get("symbol", model_symbol))
                             for item in latest.get("model_open_positions", {}).get(model_id, [])
                         ]
                     )
-                    or latest["symbol"],
+                    or model_symbol,
                     "Pozice otevřená": "ANO" if is_open else "NE",
                     "Směr": side,
                     "Sloty": f"{open_slots}/5",
@@ -1014,6 +1101,7 @@ else:
         )
 
         market_df = latest["market"].copy()
+        model_markets = latest.get("model_markets", {})
         model_options = [(row["model_id"], row["name"]) for _, row in latest["results"].iterrows()]
         default_model = next((i for i, opt in enumerate(model_options) if opt[0] == latest["champion"]["model_id"]), 0)
         selected_model = st.selectbox(
@@ -1024,10 +1112,12 @@ else:
         )
 
         selected_model_id = selected_model[0]
+        market_df = model_markets.get(selected_model_id, latest["market"]).copy()
         trades = latest["model_trades"].get(selected_model_id, [])
         trades_df = pd.DataFrame(trades)
         model_coin_positions = latest.get("model_open_positions", {}).get(selected_model_id, [])
-        model_coin_symbols = [str(item.get("symbol", latest["symbol"])).upper() for item in model_coin_positions]
+        default_model_symbol = str(latest.get("model_selected_symbols", {}).get(selected_model_id, latest["symbol"])).upper()
+        model_coin_symbols = [str(item.get("symbol", default_model_symbol)).upper() for item in model_coin_positions]
 
         def _extract_slots_from_action(action: str, is_entry: bool) -> int:
             pattern = r"\(\+(\d+)\)" if is_entry else r"\(-?(\d+)\)"
@@ -1053,24 +1143,30 @@ else:
 
                 if "Vstup" in action:
                     qty = _extract_slots_from_action(action, is_entry=True)
+                    event_symbol = str(event.get("symbol", default_model_symbol)).upper()
                     for _ in range(qty):
                         open_legs.append(
                             {
                                 "side": side,
+                                "symbol": event_symbol,
                                 "entry_price": price,
                                 "entry_time": ts,
                             }
                         )
                 elif "Výstup" in action:
                     qty = _extract_slots_from_action(action, is_entry=False)
-                    same_side_idx = [i for i, leg in enumerate(open_legs) if leg["side"] == side]
+                    event_symbol = str(event.get("symbol", default_model_symbol)).upper()
+                    same_side_idx = [
+                        i for i, leg in enumerate(open_legs)
+                        if leg["side"] == side and str(leg.get("symbol", event_symbol)).upper() == event_symbol
+                    ]
                     for index in same_side_idx[:qty]:
                         open_legs[index]["_close"] = True
                     open_legs = [leg for leg in open_legs if not leg.get("_close")]
 
         if model_coin_symbols:
             for idx, leg in enumerate(open_legs):
-                leg["symbol"] = model_coin_symbols[idx % len(model_coin_symbols)]
+                leg.setdefault("symbol", model_coin_symbols[idx % len(model_coin_symbols)])
 
         position_options = []
         for idx, leg in enumerate(open_legs, start=1):
@@ -1090,13 +1186,14 @@ else:
             )
             selected_leg = open_legs[selected_position_option[0]]
 
-        available_symbols = [str(latest["symbol"]).upper()]
+        available_symbols = [default_model_symbol]
+        available_symbols.extend([str(symbol).upper() for symbol in latest.get("candidate_symbols", []) if symbol])
         available_symbols.extend([str(symbol).upper() for symbol in model_coin_symbols if symbol])
         if selected_leg is not None:
-            available_symbols.append(str(selected_leg.get("symbol", latest["symbol"])).upper())
+            available_symbols.append(str(selected_leg.get("symbol", default_model_symbol)).upper())
         available_symbols = sorted(list(dict.fromkeys(available_symbols)))
 
-        default_symbol = str(selected_leg.get("symbol", latest["symbol"])).upper() if selected_leg else str(latest["symbol"]).upper()
+        default_symbol = str(selected_leg.get("symbol", default_model_symbol)).upper() if selected_leg else default_model_symbol
         selected_symbol_for_overlay = st.selectbox(
             "Coin pro realtime graf",
             options=available_symbols,
@@ -1162,7 +1259,7 @@ else:
         p3.metric("Počet vstupů", pocet_vstupu)
         p4.metric("Počet výstupů", pocet_vystupu)
         p5.metric("Otevřené pozice", f"{selected_slots}/5")
-        st.caption("Každý model může mít současně otevřeno maximálně 5 pozic (slotů) na zvoleném symbolu.")
+        st.caption("Každý model může mít současně otevřeno maximálně 5 slotů na aktuálně vybraném coinu z top 20 univerza.")
 
         st.markdown("**Realtime interní graf: vstupy/výstupy + target/stop**")
 
@@ -1296,6 +1393,7 @@ else:
 
     if st.session_state.active_view == "Analýza":
         st.subheader("Long-tail příležitosti (Top 20)")
+        st.caption("Seznam se průběžně mění podle aktuálních Binance dat a slouží jako obchodní univerzum pro modely.")
         long_tail = latest["long_tail"].rename(
             columns={
                 "symbol": "Symbol",

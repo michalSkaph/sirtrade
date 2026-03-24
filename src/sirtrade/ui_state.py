@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import time
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -11,6 +14,63 @@ import pandas as pd
 UI_STATE_FILE = Path("data/ui_last_run.json")
 UI_RUNTIME_FILE = Path("data/ui_runtime_state.json")
 UI_SEGMENT_STATE_FILE = Path("data/ui_segment_runs.json")
+
+
+def _write_json_atomic(file_path: Path, payload: Any) -> None:
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = file_path.with_name(
+        f"{file_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temp_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
+        last_error: OSError | None = None
+        for attempt in range(6):
+            try:
+                os.replace(temp_path, file_path)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                time.sleep(0.05 * (attempt + 1))
+
+        if last_error is not None:
+            raise last_error
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
+
+
+def _load_json_resilient(file_path: Path, default: Any) -> Any:
+    if not file_path.exists():
+        return default
+
+    try:
+        raw = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return default
+
+    if not raw.strip():
+        return default
+
+    try:
+        payload = json.loads(raw)
+        return payload
+    except json.JSONDecodeError:
+        pass
+
+    # Recover the first valid JSON value and ignore trailing garbage.
+    try:
+        decoder = json.JSONDecoder()
+        payload, _ = decoder.raw_decode(raw.lstrip())
+        return payload
+    except json.JSONDecodeError:
+        return default
 
 
 def _value(obj: Any, key: str) -> Any:
@@ -59,6 +119,7 @@ def _df_from_payload(payload: dict[str, Any], parse_datetime_index: bool = False
 
 
 def _serialize_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    model_markets = summary.get("model_markets", {})
     payload: dict[str, Any] = {
         "segment": summary.get("segment"),
         "week": summary.get("week"),
@@ -84,14 +145,23 @@ def _serialize_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "final_positions": summary.get("final_positions", {}),
         "final_open_slots": summary.get("final_open_slots", {}),
         "model_open_positions": summary.get("model_open_positions", {}),
+        "model_selected_symbols": summary.get("model_selected_symbols", {}),
+        "candidate_symbols": summary.get("candidate_symbols", []),
+        "latest_prices": summary.get("latest_prices", {}),
         "results": _df_to_payload(summary.get("results", pd.DataFrame())),
         "long_tail": _df_to_payload(summary.get("long_tail", pd.DataFrame())),
         "market": _df_to_payload(summary.get("market", pd.DataFrame())),
+        "model_markets": {
+            str(model_id): _df_to_payload(frame)
+            for model_id, frame in model_markets.items()
+            if isinstance(frame, pd.DataFrame)
+        },
     }
     return _sanitize_json(payload)
 
 
 def _deserialize_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    model_markets_payload = payload.get("model_markets", {})
     return {
         "segment": payload.get("segment"),
         "week": payload.get("week"),
@@ -107,47 +177,44 @@ def _deserialize_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "final_positions": payload.get("final_positions", {}),
         "final_open_slots": payload.get("final_open_slots", {}),
         "model_open_positions": payload.get("model_open_positions", {}),
+        "model_selected_symbols": payload.get("model_selected_symbols", {}),
+        "candidate_symbols": payload.get("candidate_symbols", []),
+        "latest_prices": payload.get("latest_prices", {}),
         "results": _df_from_payload(payload.get("results", {}), parse_datetime_index=False),
         "long_tail": _df_from_payload(payload.get("long_tail", {}), parse_datetime_index=False),
         "market": _df_from_payload(payload.get("market", {}), parse_datetime_index=True),
+        "model_markets": {
+            str(model_id): _df_from_payload(frame_payload, parse_datetime_index=True)
+            for model_id, frame_payload in model_markets_payload.items()
+            if isinstance(frame_payload, dict)
+        },
     }
 
 
 def save_last_ui_run(summary: dict[str, Any], file_path: Path = UI_STATE_FILE) -> None:
-    file_path.parent.mkdir(parents=True, exist_ok=True)
     payload = _serialize_summary(summary)
-
-    with file_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _write_json_atomic(file_path, payload)
 
 
 def load_last_ui_run(file_path: Path = UI_STATE_FILE) -> dict[str, Any] | None:
-    if not file_path.exists():
+    payload = _load_json_resilient(file_path, None)
+    if not isinstance(payload, dict):
         return None
-
-    with file_path.open("r", encoding="utf-8") as f:
-        payload = json.load(f)
 
     return _deserialize_summary(payload)
 
 
 def save_segment_runs(segment_runs: dict[str, dict[str, Any]], file_path: Path = UI_SEGMENT_STATE_FILE) -> None:
-    file_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         str(segment): _serialize_summary(summary)
         for segment, summary in segment_runs.items()
         if isinstance(summary, dict)
     }
-    with file_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _write_json_atomic(file_path, payload)
 
 
 def load_segment_runs(file_path: Path = UI_SEGMENT_STATE_FILE) -> dict[str, dict[str, Any]]:
-    if not file_path.exists():
-        return {}
-
-    with file_path.open("r", encoding="utf-8") as f:
-        payload = json.load(f)
+    payload = _load_json_resilient(file_path, {})
 
     if not isinstance(payload, dict):
         return {}
@@ -170,16 +237,11 @@ def clear_segment_runs(file_path: Path = UI_SEGMENT_STATE_FILE) -> None:
 
 
 def save_runtime_state(state: dict[str, Any], file_path: Path = UI_RUNTIME_FILE) -> None:
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    with file_path.open("w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    _write_json_atomic(file_path, state)
 
 
 def load_runtime_state(file_path: Path = UI_RUNTIME_FILE) -> dict[str, Any]:
-    if not file_path.exists():
-        return {}
-    with file_path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
+    data = _load_json_resilient(file_path, {})
     return data if isinstance(data, dict) else {}
 
 

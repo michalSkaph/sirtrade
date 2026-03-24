@@ -31,6 +31,7 @@ def export_weekly_report(summary: dict, config: AppConfig, out_dir: Path | str =
         "week": week,
         "generation": generation,
         "symbol": symbol,
+        "candidate_symbols": summary.get("candidate_symbols", []),
         "market_source": source,
         "interval": summary.get("interval"),
         "champion": summary.get("champion", {}),
