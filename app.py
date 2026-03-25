@@ -1,21 +1,23 @@
 from __future__ import annotations
 
 import io
+import json
 import re
+import subprocess
 import time
 import zipfile
+import os
 from pathlib import Path
 
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
-import subprocess
-import os
 
-from src.sirtrade.config import DEFAULT_CONFIG
+from src.sirtrade.config import DEFAULT_CONFIG, INITIAL_PAPER_WALLET_CZK, PAPER_TRADE_SIZE_CZK
 from src.sirtrade.data import fetch_binance_market
 from src.sirtrade.engine import TradingEngine
+from src.sirtrade.health_server import DEFAULT_HEALTH_PORT, ensure_health_server_started
 from src.sirtrade.live_worker import ensure_live_worker_started
 from src.sirtrade.reporting import export_weekly_report
 from src.sirtrade.storage import (
@@ -29,65 +31,86 @@ from src.sirtrade.storage import (
     save_week_result,
 )
 from src.sirtrade.ui_state import (
-    clear_segment_runs,
     clear_last_ui_run,
     clear_runtime_state,
+    clear_segment_runs,
     load_last_ui_run,
-    load_segment_runs,
     load_runtime_state,
+    load_segment_runs,
     save_last_ui_run,
-    save_segment_runs,
     save_runtime_state,
+    save_segment_runs,
 )
 
-st.set_page_config(page_title="SirTrade", page_icon="📈", layout="wide")
+st.set_page_config(page_title="SirTrade", page_icon="S", layout="wide")
 init_db()
 ensure_live_worker_started()
+ensure_health_server_started()
 
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _get_last_commit_info() -> str:
-    # Prefer explicit env var set during deploy
     env_val = os.getenv("SIRTRADE_LAST_COMMIT")
     if env_val:
         return env_val
 
-    # Check for generated commit file
     for fname in ("LAST_COMMIT", ".last_commit"):
-        p = Path(fname)
-        if p.exists():
-            try:
-                txt = p.read_text(encoding="utf-8").strip()
-                if txt:
-                    return txt
-            except Exception:
-                pass
+        path = Path(fname)
+        if not path.exists():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except Exception:
+            continue
+        if content:
+            return content
 
-    # Try to read from git if .git is available
     try:
         if Path(".git").exists():
-            out = subprocess.check_output(["git", "log", "-1", "--format=%cI"], stderr=subprocess.DEVNULL)
-            val = out.decode().strip()
-            if val:
-                return val
+            output = subprocess.check_output(
+                ["git", "log", "-1", "--format=%cI"],
+                stderr=subprocess.DEVNULL,
+            )
+            value = output.decode().strip()
+            if value:
+                return value
     except Exception:
         pass
 
     return "unknown"
 
 
-# render small badge with last commit info in bottom-right corner
 try:
     _last_commit_label = _get_last_commit_info()
-    _badge_html = (
-        "<div style='position:fixed;right:12px;bottom:8px;z-index:9999;"
-        "background:rgba(255,255,255,0.85);padding:6px 8px;border-radius:6px;"
-        "box-shadow:0 1px 4px rgba(0,0,0,0.12);font-size:12px;color:#333;'>"
-        f"Last commit: {_last_commit_label}</div>"
+    st.markdown(
+        (
+            "<div style='position:fixed;right:12px;bottom:8px;z-index:9999;"
+            "background:rgba(255,255,255,0.85);padding:6px 8px;border-radius:6px;"
+            "box-shadow:0 1px 4px rgba(0,0,0,0.12);font-size:12px;color:#333;'>"
+            f"Last commit: {_last_commit_label}</div>"
+        ),
+        unsafe_allow_html=True,
     )
-    st.markdown(_badge_html, unsafe_allow_html=True)
 except Exception:
     pass
+
+
+@st.cache_data(ttl=2, show_spinner=False)
+def _load_runtime_state_cached() -> dict[str, object]:
+    state = load_runtime_state()
+    return state if isinstance(state, dict) else {}
+
+
+@st.cache_data(ttl=2, show_spinner=False)
+def _load_last_ui_run_cached() -> dict[str, object] | None:
+    summary = load_last_ui_run()
+    return summary if isinstance(summary, dict) else None
+
+
+@st.cache_data(ttl=2, show_spinner=False)
+def _load_segment_runs_cached() -> dict[str, dict[str, object]]:
+    runs = load_segment_runs()
+    return runs if isinstance(runs, dict) else {}
 
 
 @st.cache_data(ttl=3, show_spinner=False)
@@ -108,6 +131,16 @@ def _load_recent_runs_cached(limit: int) -> pd.DataFrame:
 @st.cache_data(ttl=1, show_spinner=False)
 def _fetch_binance_market_cached(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     return fetch_binance_market(symbol=symbol, interval=interval, limit=limit)
+
+
+def _save_runtime_state_if_changed(state: dict[str, object]) -> None:
+    serialized = json.dumps(state, sort_keys=True, ensure_ascii=False, default=str)
+    previous = st.session_state.get("_runtime_state_signature")
+    if previous == serialized:
+        return
+    save_runtime_state(state)
+    st.session_state["_runtime_state_signature"] = serialized
+    _load_runtime_state_cached.clear()
 
 
 CLOSED_POSITIONS_LIMIT = 10000
@@ -159,10 +192,10 @@ def _split_datetime_column(frame: pd.DataFrame, source_column: str, label_prefix
         return frame
 
     out = frame.copy()
-    ts = pd.to_datetime(out[source_column], errors="coerce")
+    timestamps = pd.to_datetime(out[source_column], errors="coerce")
     insert_at = out.columns.get_loc(source_column)
-    out.insert(insert_at, f"{label_prefix} - Datum", ts.dt.strftime("%d.%m.%y").where(ts.notna(), None))
-    out.insert(insert_at + 1, f"{label_prefix} - Čas", ts.dt.strftime("%H:%M").where(ts.notna(), None))
+    out.insert(insert_at, f"{label_prefix} - Datum", timestamps.dt.strftime("%d.%m.%y").where(timestamps.notna(), None))
+    out.insert(insert_at + 1, f"{label_prefix} - Čas", timestamps.dt.strftime("%H:%M").where(timestamps.notna(), None))
     out = out.drop(columns=[source_column])
     return out
 
@@ -179,6 +212,399 @@ def _compute_trade_levels(entry_price: float, side: str, vol: float) -> tuple[fl
     if normalized_side == "LONG":
         return entry_price * (1 - stop_dist), entry_price * (1 + target_dist)
     return entry_price * (1 + stop_dist), entry_price * (1 - target_dist)
+
+
+def _chart_unix_time(value: object) -> int | None:
+    timestamp = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(timestamp):
+        return None
+    return int(timestamp.timestamp())
+
+
+def _build_live_chart_payload(
+    overlay_market_df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    chart_open_legs: list[dict[str, object]],
+    selected_symbol_for_overlay: str,
+    chart_interval: str,
+    refresh_seconds: int,
+    auto_center_last_candle: bool,
+    selected_leg: dict[str, object] | None,
+) -> dict[str, object]:
+    candles: list[dict[str, float | int]] = []
+    for timestamp, row in overlay_market_df.iterrows():
+        unix_time = _chart_unix_time(timestamp)
+        if unix_time is None:
+            continue
+        candles.append(
+            {
+                "time": unix_time,
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+            }
+        )
+
+    markers: list[dict[str, object]] = []
+    if not trades_df.empty and {"timestamp", "akce", "cena"}.issubset(trades_df.columns):
+        marker_rows = trades_df.copy()
+        marker_rows["timestamp"] = pd.to_datetime(marker_rows["timestamp"], utc=True, errors="coerce")
+        marker_rows = marker_rows[marker_rows["timestamp"].notna()].sort_values("timestamp")
+        for _, row in marker_rows.iterrows():
+            unix_time = _chart_unix_time(row["timestamp"])
+            if unix_time is None:
+                continue
+            action = str(row.get("akce", ""))
+            is_entry = "Vstup" in action
+            markers.append(
+                {
+                    "time": unix_time,
+                    "position": "belowBar" if is_entry else "aboveBar",
+                    "color": "#16a34a" if is_entry else "#dc2626",
+                    "shape": "arrowUp" if is_entry else "arrowDown",
+                    "text": action,
+                }
+            )
+
+    overlay_series: list[dict[str, object]] = []
+    price_lines: list[dict[str, object]] = []
+    line_styles = {"dot": 1, "dash": 2}
+    first_candle_time = candles[0]["time"] if candles else None
+    last_candle_time = candles[-1]["time"] if candles else None
+
+    close_vol = pd.to_numeric(overlay_market_df.get("close"), errors="coerce")
+    rolling_vol = close_vol.pct_change().rolling(20).std().dropna()
+    volatility = float(rolling_vol.iloc[-1]) if not rolling_vol.empty else 0.015
+
+    if chart_open_legs:
+        level_specs = [
+            ("entry", "Vstup", "#2563eb", "dot"),
+            ("target", "Target", "#16a34a", "dash"),
+            ("stop", "Stop-loss", "#dc2626", "dash"),
+        ]
+        for leg_index, leg in enumerate(chart_open_legs, start=1):
+            try:
+                entry_price = float(leg["entry_price"])
+                leg_side = str(leg["side"]).upper()
+            except Exception:
+                continue
+            stop_price, target_price = _compute_trade_levels(entry_price, leg_side, volatility)
+            level_values = {"entry": entry_price, "target": target_price, "stop": stop_price}
+            for level_key, level_label, level_color, level_dash in level_specs:
+                suffix = f" #{leg_index}" if len(chart_open_legs) > 1 else ""
+                level_price = float(level_values[level_key])
+                price_lines.append(
+                    {
+                        "price": level_price,
+                        "color": level_color,
+                        "lineWidth": 1,
+                        "lineStyle": line_styles[level_dash],
+                        "axisLabelVisible": True,
+                        "title": f"{level_label}{suffix}",
+                    }
+                )
+                if first_candle_time is not None and last_candle_time is not None:
+                    overlay_series.append(
+                        {
+                            "id": f"{level_key}-{leg_index}",
+                            "label": f"{level_label}{suffix}",
+                            "price": level_price,
+                            "color": level_color,
+                            "lineStyle": line_styles[level_dash],
+                            "data": [
+                                {"time": first_candle_time, "value": level_price},
+                                {"time": last_candle_time, "value": level_price},
+                            ],
+                        }
+                    )
+
+    selected_position = None
+    if selected_leg is not None:
+        try:
+            selected_position = {
+                "entryPrice": float(selected_leg["entry_price"]),
+                "side": str(selected_leg["side"]).upper(),
+                "symbol": selected_symbol_for_overlay,
+            }
+        except Exception:
+            selected_position = None
+
+    health_port = int(os.getenv("SIRTRADE_HEALTH_PORT", str(DEFAULT_HEALTH_PORT)))
+    return {
+        "symbol": selected_symbol_for_overlay,
+        "interval": chart_interval,
+        "candles": candles,
+        "markers": markers,
+        "overlaySeries": overlay_series,
+        "priceLines": price_lines,
+        "selectedPosition": selected_position,
+        "refreshMs": max(1, int(refresh_seconds)) * 1000,
+        "autoCenter": bool(auto_center_last_candle),
+        "visibleBars": min(120, max(30, len(candles) if candles else 30)),
+        "liveEnabled": bool(st.session_state.get("live_refresh_enabled", True)),
+        "apiPort": health_port,
+        "theme": {
+            "bg": "#ffffff",
+            "text": "#111827",
+            "grid": "rgba(148, 163, 184, 0.22)",
+            "up": "#16a34a",
+            "down": "#dc2626",
+            "wickUp": "#15803d",
+            "wickDown": "#b91c1c",
+            "accent": "#0f172a",
+        },
+    }
+
+
+def _build_live_chart_html(payload: dict[str, object], height: int = 980) -> str:
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        chart_height = max(520, height - 210)
+        return f"""
+<div id=\"sirtrade-live-root\" style=\"font-family:Segoe UI, Arial, sans-serif;background:#ffffff;border:1px solid rgba(15,23,42,0.08);border-radius:18px;padding:16px 16px 10px 16px;\">
+    <div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:14px;\">
+        <div>
+            <div id=\"sirtrade-symbol\" style=\"font-size:12px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#64748b;\"></div>
+            <div id=\"sirtrade-price\" style=\"font-size:34px;line-height:1.1;font-weight:700;color:#0f172a;margin-top:6px;\">--</div>
+        </div>
+        <div style=\"display:flex;gap:10px;flex-wrap:wrap;\">
+            <div style=\"min-width:140px;padding:10px 12px;border-radius:14px;background:#f8fafc;border:1px solid rgba(148,163,184,0.18);\">
+                <div style=\"font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:#64748b;font-weight:700;\">Změna</div>
+                <div id=\"sirtrade-delta\" style=\"font-size:20px;font-weight:700;color:#0f172a;margin-top:6px;\">--</div>
+            </div>
+            <div id=\"sirtrade-position-card\" style=\"display:none;min-width:220px;padding:10px 12px;border-radius:14px;background:#f8fafc;border:1px solid rgba(148,163,184,0.18);\">
+                <div id=\"sirtrade-position-label\" style=\"font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:#64748b;font-weight:700;\">Pozice</div>
+                <div id=\"sirtrade-position-value\" style=\"font-size:18px;font-weight:700;color:#0f172a;margin-top:6px;\">--</div>
+            </div>
+        </div>
+    </div>
+    <div id=\"sirtrade-levels\" style=\"display:flex;gap:8px;flex-wrap:wrap;margin:0 0 12px 0;\"></div>
+    <div id=\"sirtrade-live-chart\" style=\"width:100%;height:{chart_height}px;\"></div>
+    <div id=\"sirtrade-status\" style=\"margin-top:8px;font-size:12px;color:#64748b;\">Live chart inicializace…</div>
+</div>
+<script src=\"https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js\"></script>
+<script>
+(() => {{
+    const payload = {payload_json};
+    const chartNode = document.getElementById('sirtrade-live-chart');
+    const priceNode = document.getElementById('sirtrade-price');
+    const deltaNode = document.getElementById('sirtrade-delta');
+    const symbolNode = document.getElementById('sirtrade-symbol');
+    const statusNode = document.getElementById('sirtrade-status');
+    const levelsNode = document.getElementById('sirtrade-levels');
+    const positionCardNode = document.getElementById('sirtrade-position-card');
+    const positionLabelNode = document.getElementById('sirtrade-position-label');
+    const positionValueNode = document.getElementById('sirtrade-position-value');
+
+    if (!window.LightweightCharts) {{
+        statusNode.textContent = 'Lightweight Charts se nepodařilo načíst.';
+        return;
+    }}
+
+    const formatPrice = (value) => Number(value).toLocaleString('cs-CZ', {{ minimumFractionDigits: 4, maximumFractionDigits: 6 }});
+    const formatPct = (value) => `${{value >= 0 ? '+' : ''}}${{Number(value).toLocaleString('cs-CZ', {{ minimumFractionDigits: 3, maximumFractionDigits: 3 }})}}%`;
+    const updateStatus = (text) => {{ statusNode.textContent = text; }};
+
+    symbolNode.textContent = `${{payload.symbol}} • ${{payload.interval}}`;
+
+    const chart = window.LightweightCharts.createChart(chartNode, {{
+        width: chartNode.clientWidth,
+        height: chartNode.clientHeight,
+        layout: {{
+            background: {{ color: payload.theme.bg }},
+            textColor: payload.theme.text,
+            fontFamily: 'Segoe UI, Arial, sans-serif',
+        }},
+        grid: {{
+            vertLines: {{ color: payload.theme.grid }},
+            horzLines: {{ color: payload.theme.grid }},
+        }},
+        rightPriceScale: {{ borderColor: 'rgba(148,163,184,0.22)' }},
+        timeScale: {{ borderColor: 'rgba(148,163,184,0.22)', rightOffset: 6, timeVisible: true, secondsVisible: false }},
+        crosshair: {{ mode: 0 }},
+        handleScroll: true,
+        handleScale: true,
+    }});
+
+    const candleSeries = chart.addCandlestickSeries({{
+        upColor: payload.theme.up,
+        downColor: payload.theme.down,
+        borderUpColor: payload.theme.up,
+        borderDownColor: payload.theme.down,
+        wickUpColor: payload.theme.wickUp,
+        wickDownColor: payload.theme.wickDown,
+        priceLineVisible: true,
+        lastValueVisible: true,
+    }});
+
+    let candles = Array.isArray(payload.candles) ? [...payload.candles] : [];
+    candleSeries.setData(candles);
+
+    const overlaySeriesRecords = [];
+    if (Array.isArray(payload.overlaySeries)) {{
+        payload.overlaySeries.forEach((overlay) => {{
+            const series = chart.addLineSeries({{
+                color: overlay.color,
+                lineWidth: 2,
+                lineStyle: overlay.lineStyle,
+                crosshairMarkerVisible: false,
+                lastValueVisible: false,
+                priceLineVisible: false,
+            }});
+            series.setData(Array.isArray(overlay.data) ? overlay.data : []);
+            overlaySeriesRecords.push({{ ...overlay, series }});
+        }});
+    }}
+
+    if (Array.isArray(payload.markers) && payload.markers.length > 0 && typeof candleSeries.setMarkers === 'function') {{
+        candleSeries.setMarkers(payload.markers);
+    }}
+
+    if (Array.isArray(payload.priceLines)) {{
+        payload.priceLines.forEach((line) => candleSeries.createPriceLine(line));
+    }}
+
+    if (levelsNode && Array.isArray(payload.overlaySeries) && payload.overlaySeries.length > 0) {{
+        levelsNode.innerHTML = payload.overlaySeries.map((overlay) => `
+            <span style="display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;background:#f8fafc;border:1px solid rgba(148,163,184,0.18);font-size:12px;color:#334155;font-weight:600;">
+                <span style="width:10px;height:10px;border-radius:999px;background:${{overlay.color}};"></span>
+                <span>${{overlay.label}}</span>
+                <span>${{formatPrice(overlay.price)}}</span>
+            </span>
+        `).join('');
+    }}
+
+    const renderHeader = () => {{
+        if (!candles.length) {{
+            priceNode.textContent = '--';
+            deltaNode.textContent = '--';
+            return;
+        }}
+
+        const lastBar = candles[candles.length - 1];
+        const prevBar = candles.length > 1 ? candles[candles.length - 2] : null;
+        priceNode.textContent = formatPrice(lastBar.close);
+
+        if (prevBar && Number(prevBar.close) !== 0) {{
+            const deltaPct = ((Number(lastBar.close) - Number(prevBar.close)) / Number(prevBar.close)) * 100;
+            deltaNode.textContent = formatPct(deltaPct);
+            deltaNode.style.color = deltaPct >= 0 ? payload.theme.up : payload.theme.down;
+        }} else {{
+            deltaNode.textContent = '--';
+            deltaNode.style.color = payload.theme.text;
+        }}
+
+        if (payload.selectedPosition && Number.isFinite(Number(payload.selectedPosition.entryPrice))) {{
+            const entryPrice = Number(payload.selectedPosition.entryPrice);
+            const currentPrice = Number(lastBar.close);
+            const isLong = String(payload.selectedPosition.side || '').toUpperCase() === 'LONG';
+            const pnlPct = entryPrice === 0 ? 0 : (isLong ? ((currentPrice - entryPrice) / entryPrice) : ((entryPrice - currentPrice) / entryPrice)) * 100;
+            positionCardNode.style.display = 'block';
+            positionLabelNode.textContent = `${{payload.selectedPosition.symbol}} • ${{payload.selectedPosition.side}}`;
+            positionValueNode.textContent = `${{formatPrice(entryPrice)}} → ${{formatPrice(currentPrice)}} • ${{formatPct(pnlPct)}}`;
+            positionValueNode.style.color = pnlPct >= 0 ? payload.theme.up : payload.theme.down;
+        }}
+    }};
+
+    const applyRealtimeViewport = () => {{
+        if (!payload.autoCenter) {{
+            return;
+        }}
+        chart.timeScale().scrollToRealTime();
+        if (candles.length > payload.visibleBars) {{
+            chart.timeScale().setVisibleLogicalRange({{ from: candles.length - payload.visibleBars, to: candles.length + 4 }});
+        }} else {{
+            chart.timeScale().fitContent();
+        }}
+    }};
+
+    const syncOverlaySeries = () => {{
+        const firstBar = candles.length ? candles[0] : null;
+        const lastBar = candles.length ? candles[candles.length - 1] : null;
+        if (!firstBar || !lastBar) {{
+            return;
+        }}
+        overlaySeriesRecords.forEach((overlay) => {{
+            overlay.series.setData([
+                {{ time: firstBar.time, value: overlay.price }},
+                {{ time: lastBar.time, value: overlay.price }},
+            ]);
+        }});
+    }};
+
+    renderHeader();
+    syncOverlaySeries();
+    applyRealtimeViewport();
+    updateStatus(payload.liveEnabled ? 'Live chart běží bez rerenderu stránky.' : 'Live refresh je vypnutý.');
+
+    const resizeObserver = new ResizeObserver(() => {{
+        chart.applyOptions({{ width: chartNode.clientWidth, height: chartNode.clientHeight }});
+    }});
+    resizeObserver.observe(chartNode);
+
+    const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
+    const host = window.location.hostname || '127.0.0.1';
+    const pollUrl = `${{protocol}}//${{host}}:${{payload.apiPort}}/market-chart?symbol=${{encodeURIComponent(payload.symbol)}}&interval=${{encodeURIComponent(payload.interval)}}&limit=2`;
+
+    let timerId = null;
+    let inflight = false;
+
+    const mergeLastBars = (incomingCandles) => {{
+        if (!Array.isArray(incomingCandles) || incomingCandles.length === 0) {{
+            return;
+        }}
+
+        incomingCandles.forEach((bar) => {{
+            const lastLocalBar = candles.length ? candles[candles.length - 1] : null;
+            if (!lastLocalBar || Number(bar.time) > Number(lastLocalBar.time)) {{
+                candles.push(bar);
+                candleSeries.update(bar);
+                return;
+            }}
+            if (Number(bar.time) === Number(lastLocalBar.time)) {{
+                candles[candles.length - 1] = bar;
+                candleSeries.update(bar);
+            }}
+        }});
+        syncOverlaySeries();
+    }};
+
+    const pollMarket = async () => {{
+        if (!payload.liveEnabled || inflight) {{
+            return;
+        }}
+        inflight = true;
+        try {{
+            const response = await fetch(pollUrl, {{ cache: 'no-store' }});
+            if (!response.ok) {{
+                throw new Error(`HTTP ${{response.status}}`);
+            }}
+            const marketPayload = await response.json();
+            mergeLastBars(marketPayload.candles || []);
+            renderHeader();
+            applyRealtimeViewport();
+            const timestampLabel = marketPayload.updated_at ? new Date(marketPayload.updated_at).toLocaleTimeString('cs-CZ') : 'n/a';
+            updateStatus(`Poslední synchronizace: ${{timestampLabel}}`);
+        }} catch (error) {{
+            updateStatus(`Live feed nedostupný: ${{error.message}}`);
+        }} finally {{
+            inflight = false;
+        }}
+    }};
+
+    if (payload.liveEnabled) {{
+        timerId = window.setInterval(pollMarket, payload.refreshMs);
+    }}
+
+    window.addEventListener('beforeunload', () => {{
+        if (timerId) {{
+            window.clearInterval(timerId);
+        }}
+        resizeObserver.disconnect();
+    }});
+}})();
+</script>
+"""
 
 
 def _load_segment_closed_positions(segment: str, limit: int = CLOSED_POSITIONS_LIMIT) -> pd.DataFrame:
@@ -215,6 +641,46 @@ def _compute_closed_position_metrics(frame: pd.DataFrame) -> tuple[str, str, int
     win_rate_label = f"{(wins / decided) * 100:.1f}%"
     avg_pnl_label = f"{pnl.mean():.3f}%"
     return win_rate_label, avg_pnl_label, wins, losses, len(pnl)
+
+
+def _format_czk(value: float) -> str:
+    return f"{value:,.0f} Kč".replace(",", " ")
+
+
+def _format_czk_delta(value: float) -> str:
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:,.0f} Kč".replace(",", " ")
+
+
+def _compute_paper_wallet_state(
+    open_positions: pd.DataFrame,
+    closed_positions: pd.DataFrame,
+    initial_wallet_czk: float = INITIAL_PAPER_WALLET_CZK,
+    trade_size_czk: float = PAPER_TRADE_SIZE_CZK,
+) -> dict[str, float]:
+    open_slots = 0.0
+    if not open_positions.empty and "position_size" in open_positions.columns:
+        open_slots = float(pd.to_numeric(open_positions["position_size"], errors="coerce").fillna(0.0).abs().sum())
+
+    realized_pnl_czk = 0.0
+    if not closed_positions.empty and {"quantity_slots", "pnl_pct"}.issubset(closed_positions.columns):
+        slot_counts = pd.to_numeric(closed_positions["quantity_slots"], errors="coerce").fillna(0.0).abs()
+        pnl_pct = pd.to_numeric(closed_positions["pnl_pct"], errors="coerce").fillna(0.0)
+        realized_pnl_czk = float(((slot_counts * float(trade_size_czk)) * (pnl_pct / 100.0)).sum())
+
+    locked_capital_czk = open_slots * float(trade_size_czk)
+    equity_czk = float(initial_wallet_czk) + realized_pnl_czk
+    available_cash_czk = equity_czk - locked_capital_czk
+
+    return {
+        "initial_wallet_czk": float(initial_wallet_czk),
+        "trade_size_czk": float(trade_size_czk),
+        "open_slots": open_slots,
+        "locked_capital_czk": locked_capital_czk,
+        "realized_pnl_czk": realized_pnl_czk,
+        "equity_czk": equity_czk,
+        "available_cash_czk": available_cash_czk,
+    }
 
 
 def _infer_segment_name(summary: dict[str, object] | None) -> str:
@@ -329,6 +795,7 @@ def _restore_missing_segments_from_storage(existing_segments: set[str]) -> dict[
         known_models: dict[str, str] = {}
 
         if not segment_open.empty:
+            aggregated_open_positions: dict[str, dict[tuple[str, str], dict[str, object]]] = {}
             for _, open_row in segment_open.iterrows():
                 model_id = str(open_row.get("model_id", ""))
                 model_name = str(open_row.get("model_name", model_id))
@@ -337,14 +804,24 @@ def _restore_missing_segments_from_storage(existing_segments: set[str]) -> dict[
                 qty = float(open_row.get("position_size", 0.0) or 0.0)
                 signed_qty = qty if side == "LONG" else (-qty if side == "SHORT" else 0.0)
                 final_positions[model_id] = final_positions.get(model_id, 0.0) + signed_qty
-                final_open_slots[model_id] = final_open_slots.get(model_id, 0) + int(round(abs(qty)))
-                model_open_positions.setdefault(model_id, []).append(
-                    {
-                        "symbol": str(open_row.get("symbol", symbol)).upper(),
+                slot_count = max(1, int(round(abs(qty))))
+                final_open_slots[model_id] = final_open_slots.get(model_id, 0) + slot_count
+                symbol_value = str(open_row.get("symbol", symbol)).upper()
+                position_key = (symbol_value, side)
+                model_positions = aggregated_open_positions.setdefault(model_id, {})
+                existing_position = model_positions.get(position_key)
+                if existing_position is None:
+                    model_positions[position_key] = {
+                        "symbol": symbol_value,
                         "side": side,
+                        "slots": slot_count,
                         "model_name": model_name,
                     }
-                )
+                else:
+                    existing_position["slots"] = int(existing_position.get("slots", 0)) + slot_count
+
+            for model_id, positions in aggregated_open_positions.items():
+                model_open_positions[model_id] = list(positions.values())
 
         if not segment_closed.empty:
             for _, closed_row in segment_closed.iterrows():
@@ -444,6 +921,214 @@ def _restore_missing_segments_from_storage(existing_segments: set[str]) -> dict[
     return restored
 
 
+def _get_active_latest_summary() -> dict[str, object] | None:
+    history_by_segment = st.session_state.get("history_by_segment", {})
+    active_history = history_by_segment.get(st.session_state.active_segment, [])
+    if not active_history:
+        return None
+    latest = active_history[-1]
+    return latest if isinstance(latest, dict) else None
+
+
+def _render_graph_view_body() -> None:
+    latest = _get_active_latest_summary()
+    if latest is None:
+        st.warning("Pro aktivní segment zatím nejsou dostupná data grafu.")
+        return
+
+    st.subheader("Graf ceny a obchody modelu")
+    if st.session_state.live_refresh_enabled:
+        st.caption(f"Realtime aktivní: aktualizace ceny a grafu každých {st.session_state.live_refresh_seconds}s.")
+    if "chart_interval" not in st.session_state:
+        st.session_state.chart_interval = latest.get("interval", st.session_state.interval)
+
+    chart_intervals = ["1m", "5m", "15m", "1h", "4h", "1d"]
+    interval_col, _ = st.columns([1, 3])
+    st.session_state.chart_interval = interval_col.selectbox(
+        "Časový rámec grafu",
+        chart_intervals,
+        index=chart_intervals.index(st.session_state.chart_interval)
+        if st.session_state.chart_interval in chart_intervals
+        else chart_intervals.index("1h"),
+        help="Mění timeframe interního realtime grafu.",
+        key="chart_interval_selector",
+    )
+
+    market_df = latest["market"].copy()
+    model_markets = latest.get("model_markets", {})
+    model_options = [(row["model_id"], row["name"]) for _, row in latest["results"].iterrows()]
+    default_model = next((i for i, opt in enumerate(model_options) if opt[0] == latest["champion"]["model_id"]), 0)
+    selected_model = st.selectbox(
+        "Model pro vykreslení obchodů",
+        options=model_options,
+        index=default_model,
+        format_func=lambda item: f"{item[0]} — {item[1]}",
+    )
+
+    selected_model_id = selected_model[0]
+    market_df = model_markets.get(selected_model_id, latest["market"]).copy()
+    trades = latest["model_trades"].get(selected_model_id, [])
+    trades_df = pd.DataFrame(trades)
+    model_coin_positions = latest.get("model_open_positions", {}).get(selected_model_id, [])
+    default_model_symbol = str(latest.get("model_selected_symbols", {}).get(selected_model_id, latest["symbol"])).upper()
+    model_coin_symbols = [str(item.get("symbol", default_model_symbol)).upper() for item in model_coin_positions]
+
+    def _extract_slots_from_action(action: str, is_entry: bool) -> int:
+        pattern = r"\(\+(\d+)\)" if is_entry else r"\(-?(\d+)\)"
+        match = re.search(pattern, str(action))
+        if not match:
+            return 1
+        try:
+            return max(1, int(match.group(1)))
+        except Exception:
+            return 1
+
+    open_legs: list[dict] = []
+    if not trades_df.empty and {"timestamp", "akce", "strana", "cena"}.issubset(trades_df.columns):
+        trades_df["timestamp"] = pd.to_datetime(trades_df["timestamp"], errors="coerce")
+        trades_df = trades_df[trades_df["timestamp"].notna()].sort_values("timestamp")
+        for _, event in trades_df.iterrows():
+            action = str(event.get("akce", ""))
+            side = str(event.get("strana", "")).upper()
+            if side not in {"LONG", "SHORT"}:
+                side = "LONG" if "LONG" in action.upper() else ("SHORT" if "SHORT" in action.upper() else "LONG")
+            price = float(event.get("cena", 0.0))
+            ts = event["timestamp"]
+
+            if "Vstup" in action:
+                qty = _extract_slots_from_action(action, is_entry=True)
+                event_symbol = str(event.get("symbol", default_model_symbol)).upper()
+                for _ in range(qty):
+                    open_legs.append(
+                        {
+                            "side": side,
+                            "symbol": event_symbol,
+                            "entry_price": price,
+                            "entry_time": ts,
+                        }
+                    )
+            elif "Výstup" in action:
+                qty = _extract_slots_from_action(action, is_entry=False)
+                event_symbol = str(event.get("symbol", default_model_symbol)).upper()
+                same_side_idx = [
+                    i for i, leg in enumerate(open_legs)
+                    if leg["side"] == side and str(leg.get("symbol", event_symbol)).upper() == event_symbol
+                ]
+                for index in same_side_idx[:qty]:
+                    open_legs[index]["_close"] = True
+                open_legs = [leg for leg in open_legs if not leg.get("_close")]
+
+    if model_coin_symbols:
+        for idx, leg in enumerate(open_legs):
+            leg.setdefault("symbol", model_coin_symbols[idx % len(model_coin_symbols)])
+
+    position_options = []
+    for idx, leg in enumerate(open_legs, start=1):
+        entry_time = pd.to_datetime(leg["entry_time"]).strftime("%Y-%m-%d %H:%M")
+        leg_symbol = str(leg.get("symbol", latest["symbol"])).upper()
+        label = f"{leg_symbol} | {leg['side']} | pozice #{idx} | vstup {entry_time}"
+        position_options.append((idx - 1, label))
+
+    selected_leg = None
+    if position_options:
+        selected_position_option = st.selectbox(
+            "Vybraná otevřená pozice pro overlay",
+            options=position_options,
+            index=0,
+            format_func=lambda item: item[1],
+            help="Vyber konkrétní otevřenou pozici. Overlay target/stop se přepočítá podle ní.",
+        )
+        selected_leg = open_legs[selected_position_option[0]]
+
+    available_symbols = [default_model_symbol]
+    available_symbols.extend([str(symbol).upper() for symbol in latest.get("candidate_symbols", []) if symbol])
+    available_symbols.extend([str(symbol).upper() for symbol in model_coin_symbols if symbol])
+    if selected_leg is not None:
+        available_symbols.append(str(selected_leg.get("symbol", default_model_symbol)).upper())
+    available_symbols = sorted(list(dict.fromkeys(available_symbols)))
+
+    default_symbol = str(selected_leg.get("symbol", default_model_symbol)).upper() if selected_leg else default_model_symbol
+    selected_symbol_for_overlay = st.selectbox(
+        "Coin pro realtime graf",
+        options=available_symbols,
+        index=available_symbols.index(default_symbol) if default_symbol in available_symbols else 0,
+    )
+
+    overlay_market_df = market_df.copy()
+    if latest.get("market_source") in {"binance", "binance_copy"}:
+        try:
+            overlay_market_df = _fetch_binance_market_cached(
+                symbol=selected_symbol_for_overlay,
+                interval=st.session_state.chart_interval,
+                limit=1000,
+            )
+        except Exception:
+            overlay_market_df = market_df.copy()
+
+    for col_name in ["open", "high", "low", "close"]:
+        if col_name in overlay_market_df.columns:
+            overlay_market_df[col_name] = pd.to_numeric(overlay_market_df[col_name], errors="coerce")
+    overlay_market_df = overlay_market_df.dropna(subset=["open", "high", "low", "close"]).sort_index()
+    if overlay_market_df.empty:
+        st.warning("Pro zvolený časový rámec nejsou dostupná data grafu.")
+        return
+
+    if selected_leg is not None:
+        selected_entry = float(selected_leg["entry_price"])
+        selected_side = str(selected_leg["side"]).upper()
+        selected_current = float(overlay_market_df["close"].iloc[-1])
+        if selected_side == "LONG":
+            selected_pnl_pct = ((selected_current - selected_entry) / selected_entry) * 100 if selected_entry != 0 else 0.0
+        else:
+            selected_pnl_pct = ((selected_entry - selected_current) / selected_entry) * 100 if selected_entry != 0 else 0.0
+
+        p_sel1, p_sel2, p_sel3 = st.columns(3)
+        p_sel1.metric("Vybraná pozice", f"{selected_symbol_for_overlay} | {selected_side}")
+        p_sel2.metric("Vstup → Aktuální", f"{selected_entry:.6f}", f"{selected_current:.6f}")
+        p_sel3.metric("Průběžné PnL", f"{selected_pnl_pct:.3f}%")
+
+    final_positions = latest.get("final_positions", {})
+    final_open_slots = latest.get("final_open_slots", {})
+    selected_position = float(final_positions.get(selected_model_id, 0.0))
+    selected_slots = int(final_open_slots.get(selected_model_id, 0))
+    aktivni_pozice = "ANO" if abs(selected_position) > 1e-9 else "NE"
+    smer_pozice = "LONG" if selected_position > 0 else ("SHORT" if selected_position < 0 else "-")
+    pocet_vstupu = int(trades_df["akce"].str.contains("Vstup").sum()) if not trades_df.empty else 0
+    pocet_vystupu = int(trades_df["akce"].str.contains("Výstup").sum()) if not trades_df.empty else 0
+
+    p1, p2, p3, p4, p5 = st.columns(5)
+    p1.metric("Aktivní pozice modelu", aktivni_pozice)
+    p2.metric("Směr", smer_pozice)
+    p3.metric("Počet vstupů", pocet_vstupu)
+    p4.metric("Počet výstupů", pocet_vystupu)
+    p5.metric("Otevřené pozice", f"{selected_slots}/5")
+    st.caption("Každý model může mít současně otevřeno maximálně 5 slotů na aktuálně vybraném coinu z top 20 univerza.")
+
+    st.markdown("**Realtime interní graf: vstupy/výstupy + target/stop**")
+    chart_open_legs = [
+        leg
+        for leg in open_legs
+        if str(leg.get("symbol", default_model_symbol)).upper() == selected_symbol_for_overlay
+    ]
+    st.caption("Cena, delta i poslední svíce se v panelu níže aktualizují přímo v browseru bez blikání celé stránky.")
+
+    chart_payload = _build_live_chart_payload(
+        overlay_market_df=overlay_market_df,
+        trades_df=trades_df,
+        chart_open_legs=chart_open_legs,
+        selected_symbol_for_overlay=selected_symbol_for_overlay,
+        chart_interval=st.session_state.chart_interval,
+        refresh_seconds=st.session_state.live_refresh_seconds,
+        auto_center_last_candle=st.session_state.auto_center_last_candle,
+        selected_leg=selected_leg,
+    )
+    components.html(
+        _build_live_chart_html(chart_payload, height=980),
+        height=980,
+        scrolling=False,
+    )
+
+
 def _coerce_int(value: object, default: int) -> int:
     try:
         return int(value)
@@ -479,7 +1164,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-runtime_state = load_runtime_state()
+runtime_state = _load_runtime_state_cached()
 SEGMENT_DEFAULTS = {
     "Scalp": {"interval": "5m", "sim_days": 3, "namespace": "SC"},
     "Intraday": {"interval": "15m", "sim_days": 7, "namespace": "ID"},
@@ -499,14 +1184,14 @@ if "engines" not in st.session_state:
 if "history_by_segment" not in st.session_state:
     st.session_state.history_by_segment = {segment: [] for segment in SEGMENT_DEFAULTS.keys()}
     normalized_restored: dict[str, dict[str, object]] = {}
-    restored_by_segment = load_segment_runs()
+    restored_by_segment = _load_segment_runs_cached()
     if restored_by_segment:
         for segment, restored in restored_by_segment.items():
             restored_segment = _infer_segment_name(restored)
             if restored_segment in st.session_state.history_by_segment:
                 normalized_restored[restored_segment] = restored
     else:
-        restored = load_last_ui_run()
+        restored = _load_last_ui_run_cached()
         if restored:
             restored_segment = _infer_segment_name(restored)
             if restored_segment in st.session_state.history_by_segment:
@@ -521,6 +1206,7 @@ if "history_by_segment" not in st.session_state:
 
     if normalized_restored:
         save_segment_runs(normalized_restored)
+        _load_segment_runs_cached.clear()
 
 _hydrate_engines_from_history(st.session_state.engines, st.session_state.history_by_segment)
 
@@ -679,7 +1365,7 @@ if reset_btn:
         clear_segment_runs()
         st.session_state.last_exports = {}
 
-    save_runtime_state(
+    _save_runtime_state_if_changed(
         {
             "simulation_running": False,
             "simulation_running_by_segment": st.session_state.simulation_running_by_segment,
@@ -698,6 +1384,8 @@ if reset_btn:
             "paper_trade_cutoff_ts": st.session_state.paper_trade_cutoff_ts,
         }
     )
+    _load_last_ui_run_cached.clear()
+    _load_segment_runs_cached.clear()
     _load_open_positions_cached.clear()
     _load_closed_positions_cached.clear()
     _load_recent_runs_cached.clear()
@@ -717,7 +1405,7 @@ st.radio(
 active_segment_running = bool(st.session_state.simulation_running_by_segment.get(st.session_state.active_segment, False))
 has_running_segments = any(st.session_state.simulation_running_by_segment.values())
 
-save_runtime_state(
+_save_runtime_state_if_changed(
     {
         "simulation_running": has_running_segments,
         "simulation_running_by_segment": st.session_state.simulation_running_by_segment,
@@ -737,7 +1425,34 @@ save_runtime_state(
     }
 )
 
-persisted_segment_runs = load_segment_runs()
+wallet_open_positions = _load_open_positions_cached()
+wallet_closed_positions = _load_closed_positions_cached(limit=CLOSED_POSITIONS_LIMIT)
+wallet_state = _compute_paper_wallet_state(wallet_open_positions, wallet_closed_positions)
+
+status1, status2, status3, status4, status5, status6 = st.columns(6)
+status1.metric("Režim", status_run)
+status2.metric("Zdroj dat", status_source)
+status3.metric("Segment", status_profile)
+status4.metric("Timeframe", status_interval)
+status5.metric(
+    "Peněženka k dispozici",
+    _format_czk(wallet_state["available_cash_czk"]),
+    f"Equity {_format_czk(wallet_state['equity_czk'])}",
+)
+status6.metric(
+    "Blokováno v obchodech",
+    _format_czk(wallet_state["locked_capital_czk"]),
+    f"Realizované PnL {_format_czk_delta(wallet_state['realized_pnl_czk'])}",
+)
+st.caption(
+    "Paper peněženka je sdílená napříč segmenty. "
+    f"Start: {_format_czk(wallet_state['initial_wallet_czk'])} | "
+    f"Na každý obchod/slot: {_format_czk(wallet_state['trade_size_czk'])} | "
+    f"Aktivně blokováno slotů: {int(round(wallet_state['open_slots']))} | "
+    f"Univerzum: {status_symbol}"
+)
+
+persisted_segment_runs = _load_segment_runs_cached()
 if persisted_segment_runs:
     for segment, summary in persisted_segment_runs.items():
         normalized_segment = _infer_segment_name(summary)
@@ -756,10 +1471,6 @@ if persisted_segment_runs:
                 st.session_state.history_by_segment[normalized_segment] = [summary]
                 if normalized_segment == st.session_state.active_segment:
                     st.session_state.last_exports = _report_paths_from_summary(summary)
-
-_load_open_positions_cached.clear()
-_load_closed_positions_cached.clear()
-_load_recent_runs_cached.clear()
 
 latest_runs_by_segment = {
     segment: history[-1]
@@ -787,7 +1498,7 @@ else:
 
     source_label = {"simulation": "Simulace", "binance": "Binance", "binance_copy": "Binance Copy"}.get(latest["market_source"], latest["market_source"])
 
-    refreshable_views = {"Dashboard", "Grafy", "Pozice"}
+    refreshable_views = {"Dashboard", "Pozice"}
     if (
         st.session_state.live_refresh_enabled
         and st.session_state.active_view in refreshable_views
@@ -1106,323 +1817,7 @@ else:
                     st.dataframe(styled_overview, use_container_width=True)
 
     if st.session_state.active_view == "Grafy":
-        st.subheader("Graf ceny a obchody modelu")
-        if st.session_state.live_refresh_enabled:
-            st.caption(f"Realtime aktivní: aktualizace ceny a grafu každých {st.session_state.live_refresh_seconds}s.")
-        if "chart_interval" not in st.session_state:
-            st.session_state.chart_interval = latest.get("interval", st.session_state.interval)
-
-        chart_intervals = ["1m", "5m", "15m", "1h", "4h", "1d"]
-        interval_col, _ = st.columns([1, 3])
-        st.session_state.chart_interval = interval_col.selectbox(
-            "Časový rámec grafu",
-            chart_intervals,
-            index=chart_intervals.index(st.session_state.chart_interval)
-            if st.session_state.chart_interval in chart_intervals
-            else chart_intervals.index("1h"),
-            help="Mění timeframe interního realtime grafu.",
-            key="chart_interval_selector",
-        )
-
-        market_df = latest["market"].copy()
-        model_markets = latest.get("model_markets", {})
-        model_options = [(row["model_id"], row["name"]) for _, row in latest["results"].iterrows()]
-        default_model = next((i for i, opt in enumerate(model_options) if opt[0] == latest["champion"]["model_id"]), 0)
-        selected_model = st.selectbox(
-            "Model pro vykreslení obchodů",
-            options=model_options,
-            index=default_model,
-            format_func=lambda item: f"{item[0]} — {item[1]}",
-        )
-
-        selected_model_id = selected_model[0]
-        market_df = model_markets.get(selected_model_id, latest["market"]).copy()
-        trades = latest["model_trades"].get(selected_model_id, [])
-        trades_df = pd.DataFrame(trades)
-        model_coin_positions = latest.get("model_open_positions", {}).get(selected_model_id, [])
-        default_model_symbol = str(latest.get("model_selected_symbols", {}).get(selected_model_id, latest["symbol"])).upper()
-        model_coin_symbols = [str(item.get("symbol", default_model_symbol)).upper() for item in model_coin_positions]
-
-        def _extract_slots_from_action(action: str, is_entry: bool) -> int:
-            pattern = r"\(\+(\d+)\)" if is_entry else r"\(-?(\d+)\)"
-            match = re.search(pattern, str(action))
-            if not match:
-                return 1
-            try:
-                return max(1, int(match.group(1)))
-            except Exception:
-                return 1
-
-        open_legs: list[dict] = []
-        if not trades_df.empty and {"timestamp", "akce", "strana", "cena"}.issubset(trades_df.columns):
-            trades_df["timestamp"] = pd.to_datetime(trades_df["timestamp"], errors="coerce")
-            trades_df = trades_df[trades_df["timestamp"].notna()].sort_values("timestamp")
-            for _, event in trades_df.iterrows():
-                action = str(event.get("akce", ""))
-                side = str(event.get("strana", "")).upper()
-                if side not in {"LONG", "SHORT"}:
-                    side = "LONG" if "LONG" in action.upper() else ("SHORT" if "SHORT" in action.upper() else "LONG")
-                price = float(event.get("cena", 0.0))
-                ts = event["timestamp"]
-
-                if "Vstup" in action:
-                    qty = _extract_slots_from_action(action, is_entry=True)
-                    event_symbol = str(event.get("symbol", default_model_symbol)).upper()
-                    for _ in range(qty):
-                        open_legs.append(
-                            {
-                                "side": side,
-                                "symbol": event_symbol,
-                                "entry_price": price,
-                                "entry_time": ts,
-                            }
-                        )
-                elif "Výstup" in action:
-                    qty = _extract_slots_from_action(action, is_entry=False)
-                    event_symbol = str(event.get("symbol", default_model_symbol)).upper()
-                    same_side_idx = [
-                        i for i, leg in enumerate(open_legs)
-                        if leg["side"] == side and str(leg.get("symbol", event_symbol)).upper() == event_symbol
-                    ]
-                    for index in same_side_idx[:qty]:
-                        open_legs[index]["_close"] = True
-                    open_legs = [leg for leg in open_legs if not leg.get("_close")]
-
-        if model_coin_symbols:
-            for idx, leg in enumerate(open_legs):
-                leg.setdefault("symbol", model_coin_symbols[idx % len(model_coin_symbols)])
-
-        position_options = []
-        for idx, leg in enumerate(open_legs, start=1):
-            entry_time = pd.to_datetime(leg["entry_time"]).strftime("%Y-%m-%d %H:%M")
-            leg_symbol = str(leg.get("symbol", latest["symbol"])).upper()
-            label = f"{leg_symbol} | {leg['side']} | pozice #{idx} | vstup {entry_time}"
-            position_options.append((idx - 1, label))
-
-        selected_leg = None
-        if position_options:
-            selected_position_option = st.selectbox(
-                "Vybraná otevřená pozice pro overlay",
-                options=position_options,
-                index=0,
-                format_func=lambda item: item[1],
-                help="Vyber konkrétní otevřenou pozici. Overlay target/stop se přepočítá podle ní.",
-            )
-            selected_leg = open_legs[selected_position_option[0]]
-
-        available_symbols = [default_model_symbol]
-        available_symbols.extend([str(symbol).upper() for symbol in latest.get("candidate_symbols", []) if symbol])
-        available_symbols.extend([str(symbol).upper() for symbol in model_coin_symbols if symbol])
-        if selected_leg is not None:
-            available_symbols.append(str(selected_leg.get("symbol", default_model_symbol)).upper())
-        available_symbols = sorted(list(dict.fromkeys(available_symbols)))
-
-        default_symbol = str(selected_leg.get("symbol", default_model_symbol)).upper() if selected_leg else default_model_symbol
-        selected_symbol_for_overlay = st.selectbox(
-            "Coin pro realtime graf",
-            options=available_symbols,
-            index=available_symbols.index(default_symbol) if default_symbol in available_symbols else 0,
-        )
-
-        overlay_market_df = market_df.copy()
-        if latest.get("market_source") in {"binance", "binance_copy"}:
-            try:
-                overlay_market_df = _fetch_binance_market_cached(
-                    symbol=selected_symbol_for_overlay,
-                    interval=st.session_state.chart_interval,
-                    limit=1000,
-                )
-            except Exception:
-                overlay_market_df = market_df.copy()
-
-        for col_name in ["open", "high", "low", "close"]:
-            if col_name in overlay_market_df.columns:
-                overlay_market_df[col_name] = pd.to_numeric(overlay_market_df[col_name], errors="coerce")
-        overlay_market_df = overlay_market_df.dropna(subset=["open", "high", "low", "close"]).sort_index()
-        if overlay_market_df.empty:
-            st.warning("Pro zvolený časový rámec nejsou dostupná data grafu.")
-            st.stop()
-
-        current_coin_price = float(overlay_market_df["close"].iloc[-1])
-        current_coin_change = None
-        if len(overlay_market_df) > 1 and float(overlay_market_df["close"].iloc[-2]) != 0.0:
-            prev_coin_price = float(overlay_market_df["close"].iloc[-2])
-            current_coin_change = ((current_coin_price - prev_coin_price) / prev_coin_price) * 100
-        st.metric(
-            f"Aktuální cena {selected_symbol_for_overlay}",
-            f"{current_coin_price:.6f}",
-            None if current_coin_change is None else f"{current_coin_change:.3f}%",
-        )
-
-        if selected_leg is not None:
-            selected_entry = float(selected_leg["entry_price"])
-            selected_side = str(selected_leg["side"]).upper()
-            selected_current = float(overlay_market_df["close"].iloc[-1])
-            if selected_side == "LONG":
-                selected_pnl_pct = ((selected_current - selected_entry) / selected_entry) * 100 if selected_entry != 0 else 0.0
-            else:
-                selected_pnl_pct = ((selected_entry - selected_current) / selected_entry) * 100 if selected_entry != 0 else 0.0
-
-            p_sel1, p_sel2, p_sel3 = st.columns(3)
-            p_sel1.metric("Vybraná pozice", f"{selected_symbol_for_overlay} | {selected_side}")
-            p_sel2.metric("Vstup → Aktuální", f"{selected_entry:.6f}", f"{selected_current:.6f}")
-            p_sel3.metric("Průběžné PnL", f"{selected_pnl_pct:.3f}%")
-
-        final_positions = latest.get("final_positions", {})
-        final_open_slots = latest.get("final_open_slots", {})
-        selected_position = float(final_positions.get(selected_model_id, 0.0))
-        selected_slots = int(final_open_slots.get(selected_model_id, 0))
-        aktivni_pozice = "ANO" if abs(selected_position) > 1e-9 else "NE"
-        smer_pozice = "LONG" if selected_position > 0 else ("SHORT" if selected_position < 0 else "-")
-        pocet_vstupu = int(trades_df["akce"].str.contains("Vstup").sum()) if not trades_df.empty else 0
-        pocet_vystupu = int(trades_df["akce"].str.contains("Výstup").sum()) if not trades_df.empty else 0
-
-        p1, p2, p3, p4, p5 = st.columns(5)
-        p1.metric("Aktivní pozice modelu", aktivni_pozice)
-        p2.metric("Směr", smer_pozice)
-        p3.metric("Počet vstupů", pocet_vstupu)
-        p4.metric("Počet výstupů", pocet_vystupu)
-        p5.metric("Otevřené pozice", f"{selected_slots}/5")
-        st.caption("Každý model může mít současně otevřeno maximálně 5 slotů na aktuálně vybraném coinu z top 20 univerza.")
-
-        st.markdown("**Realtime interní graf: vstupy/výstupy + target/stop**")
-
-        fig = go.Figure()
-        fig.add_trace(
-            go.Candlestick(
-                x=overlay_market_df.index,
-                open=overlay_market_df["open"],
-                high=overlay_market_df["high"],
-                low=overlay_market_df["low"],
-                close=overlay_market_df["close"],
-                name="Cena",
-                increasing_line_color="#22c55e",
-                decreasing_line_color="#ef4444",
-            )
-        )
-
-        if not trades_df.empty:
-            entries = trades_df[trades_df["akce"].str.contains("Vstup")]
-            exits = trades_df[trades_df["akce"].str.contains("Výstup")]
-
-            if not entries.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=entries["timestamp"],
-                        y=entries["cena"],
-                        mode="markers",
-                        marker=dict(size=10, symbol="triangle-up", color="#16a34a"),
-                        name="Vstup",
-                        text=entries["akce"],
-                        hovertemplate="%{text}<br>Cena: %{y:.4f}<extra></extra>",
-                    )
-                )
-
-            if not exits.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=exits["timestamp"],
-                        y=exits["cena"],
-                        mode="markers",
-                        marker=dict(size=10, symbol="triangle-down", color="#dc2626"),
-                        name="Výstup",
-                        text=exits["akce"],
-                        hovertemplate="%{text}<br>Cena: %{y:.4f}<extra></extra>",
-                    )
-                )
-
-        chart_open_legs = [
-            leg
-            for leg in open_legs
-            if str(leg.get("symbol", default_model_symbol)).upper() == selected_symbol_for_overlay
-        ]
-        if chart_open_legs:
-            chart_x = overlay_market_df.index
-            vol = float(overlay_market_df["close"].pct_change().rolling(20).std().iloc[-1])
-            level_specs = [
-                ("entry", "Vstup", "#2563eb", "dot"),
-                ("target", "Target", "#16a34a", "dash"),
-                ("stop", "Stop-loss", "#dc2626", "dash"),
-            ]
-
-            for leg_index, leg in enumerate(chart_open_legs, start=1):
-                entry_price = float(leg["entry_price"])
-                leg_side = str(leg["side"]).upper()
-                stop_price, target_price = _compute_trade_levels(entry_price, leg_side, vol)
-                level_values = {
-                    "entry": entry_price,
-                    "target": target_price,
-                    "stop": stop_price,
-                }
-
-                for level_key, level_label, level_color, level_dash in level_specs:
-                    level_price = level_values[level_key]
-                    fig.add_trace(
-                        go.Scatter(
-                            x=chart_x,
-                            y=[level_price] * len(chart_x),
-                            mode="lines",
-                            line=dict(color=level_color, width=1.4, dash=level_dash),
-                            name=level_label,
-                            legendgroup=level_key,
-                            showlegend=leg_index == 1,
-                            opacity=0.95,
-                            hovertemplate=(
-                                f"Pozice #{leg_index} | {leg_side}<br>{level_label}: {level_price:.6f}<extra></extra>"
-                            ),
-                        )
-                    )
-
-                    annotation_suffix = f" #{leg_index}" if len(chart_open_legs) > 1 else ""
-                    fig.add_annotation(
-                        x=chart_x[-1],
-                        y=level_price,
-                        xanchor="left",
-                        yanchor="middle",
-                        xshift=8,
-                        text=f"{level_label}{annotation_suffix}",
-                        showarrow=False,
-                        font=dict(color=level_color, size=11),
-                        bgcolor="rgba(255,255,255,0.75)",
-                    )
-
-        fig.update_layout(
-            height=760,
-            xaxis_title="Datum",
-            yaxis_title="Cena",
-            dragmode="zoom",
-            xaxis_rangeslider_visible=True,
-            xaxis_rangeselector=dict(
-                buttons=list(
-                    [
-                        dict(count=7, label="7d", step="day", stepmode="backward"),
-                        dict(count=30, label="30d", step="day", stepmode="backward"),
-                        dict(count=90, label="90d", step="day", stepmode="backward"),
-                        dict(step="all", label="Vše"),
-                    ]
-                )
-            ),
-            legend_title_text="Události",
-        )
-        fig.update_yaxes(fixedrange=False, autorange=True)
-        fig.update_xaxes(fixedrange=False)
-
-        if st.session_state.auto_center_last_candle and len(overlay_market_df.index) > 10:
-            visible_bars = min(120, len(overlay_market_df.index))
-            range_start = overlay_market_df.index[-visible_bars]
-            range_end = overlay_market_df.index[-1]
-            fig.update_xaxes(range=[range_start, range_end])
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            config={
-                "scrollZoom": True,
-                "displaylogo": False,
-                "modeBarButtonsToRemove": ["lasso2d", "select2d"],
-                "modeBarButtonsToAdd": ["zoomIn2d", "zoomOut2d", "autoScale2d", "resetScale2d"],
-            },
-        )
+        _render_graph_view_body()
 
     if st.session_state.active_view == "Analýza":
         st.subheader("Long-tail příležitosti (Top 20)")
@@ -1463,7 +1858,7 @@ else:
                 "symbol": "Symbol",
                 "side": "Směr",
                 "instrument": "Instrument",
-                "quantity_usd": "Objem (USD)",
+                "quantity_czk": "Objem (Kč)",
                 "confidence": "Důvěra",
             }
         )
@@ -1472,7 +1867,7 @@ else:
             "Symbol": st.column_config.TextColumn("Symbol", help="Obchodovaný pár."),
             "Směr": st.column_config.TextColumn("Směr", help="NÁKUP/PRODEJ podle signálu modelu."),
             "Instrument": st.column_config.TextColumn("Instrument", help="Spot nebo perpetual větev pro exekuci."),
-            "Objem (USD)": st.column_config.NumberColumn("Objem (USD)", help="Navržený objem orderu v USD ekvivalentu."),
+            "Objem (Kč)": st.column_config.NumberColumn("Objem (Kč)", help="Fixní paper alokace 1000 Kč za každý otevřený slot obchodu."),
             "Důvěra": st.column_config.NumberColumn("Důvěra", help="Modelová důvěra v signál (0 až 1)."),
         }
         st.dataframe(orders_df, use_container_width=True, column_config=orders_config)

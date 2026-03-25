@@ -43,25 +43,43 @@ def default_model_specs(namespace: str = "", label_prefix: str = "") -> list[Mod
 
 
 def generate_signals(model: ModelSpec, market: pd.DataFrame, seed: int = 0) -> pd.Series:
+    close = market["close"].astype(float)
     returns = market["ret"].fillna(0.0)
     vol = returns.rolling(20).std().fillna(returns.std() if returns.std() > 0 else 0.01)
+    ema_fast = close.ewm(span=8, adjust=False).mean()
+    ema_slow = close.ewm(span=21, adjust=False).mean()
+    trend_gap = ((ema_fast - ema_slow) / (close + 1e-6)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    roc_fast = close.pct_change(6).fillna(0.0)
+    roc_slow = close.pct_change(24).fillna(0.0)
+    rolling_mean = close.rolling(20).mean().bfill()
+    rolling_std = close.rolling(20).std(ddof=0).replace(0.0, np.nan)
+    price_z = ((close - rolling_mean) / (rolling_std + 1e-6)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    delta = close.diff().fillna(0.0)
+    gains = delta.clip(lower=0.0)
+    losses = (-delta).clip(lower=0.0)
+    avg_gain = gains.ewm(alpha=1 / 14, adjust=False).mean()
+    avg_loss = losses.ewm(alpha=1 / 14, adjust=False).mean()
+    rs = avg_gain / (avg_loss + 1e-6)
+    rsi = 100 - (100 / (1 + rs))
 
     if model.kind == "trend_vol":
-        signal = np.sign(returns.rolling(10).mean().fillna(0.0)) * (0.02 / (vol + 1e-6))
+        momentum_stack = 0.65 * roc_fast + 0.35 * roc_slow
+        signal = np.tanh((momentum_stack / (vol + 1e-6)) + (3.5 * trend_gap))
     elif model.kind == "xsec_momentum":
-        signal = np.sign(returns.rolling(5).mean().fillna(0.0)) * 0.8
+        breakout_bias = (close / (close.rolling(20).max().shift(1) + 1e-6) - 1.0).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        signal = np.tanh((1.1 * roc_fast / (vol + 1e-6)) + (0.9 * breakout_bias * 10.0) + (2.5 * trend_gap))
     elif model.kind == "mean_reversion":
-        z = (returns - returns.rolling(20).mean().fillna(0.0)) / (vol + 1e-6)
-        signal = -np.tanh(z)
+        rsi_centered = (rsi - 50.0) / 12.5
+        signal = -np.tanh(0.9 * price_z + 0.6 * rsi_centered)
     elif model.kind == "onchain_sentiment_overlay":
         overlay = market["sentiment"].fillna(0.0) * 0.4 + market["onchain"].fillna(0.0) * 0.6
-        signal = np.tanh(overlay)
+        signal = np.tanh(overlay + (2.0 * trend_gap) + (0.25 * np.sign(roc_fast)))
     elif model.kind == "copy_trader":
         signal = pd.Series(0.0, index=market.index, dtype=float)
     else:
-        trend = np.sign(returns.rolling(15).mean().fillna(0.0))
-        rev = -np.tanh((returns - returns.rolling(20).mean().fillna(0.0)) / (vol + 1e-6))
-        signal = 0.6 * trend + 0.4 * rev
+        trend_component = np.tanh((roc_slow / (vol + 1e-6)) + (3.0 * trend_gap))
+        reversion_component = -np.tanh(price_z)
+        signal = (0.55 * trend_component) + (0.25 * reversion_component) + (0.20 * np.tanh((rsi - 50.0) / 10.0))
 
     smoothed = pd.Series(signal, index=market.index, dtype=float).ewm(span=3, adjust=False).mean()
     return smoothed.clip(-1.0, 1.0)

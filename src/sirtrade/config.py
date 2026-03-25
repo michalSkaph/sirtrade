@@ -1,6 +1,10 @@
 from dataclasses import dataclass, field
 
 
+INITIAL_PAPER_WALLET_CZK = 100_000.0
+PAPER_TRADE_SIZE_CZK = 1_000.0
+
+
 @dataclass
 class RiskPolicy:
     target_vol_annual: float = 0.12

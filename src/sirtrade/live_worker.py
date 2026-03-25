@@ -8,7 +8,7 @@ from typing import Any
 import pandas as pd
 
 from .automation import run_segment_cycle
-from .config import DEFAULT_CONFIG
+from .config import DEFAULT_CONFIG, PAPER_TRADE_SIZE_CZK
 from .engine import TradingEngine
 from .execution import build_dry_run_orders
 from .reporting import export_weekly_report
@@ -88,7 +88,9 @@ def _build_open_position_states(events: list[dict[str, Any]]) -> list[dict[str, 
         action = str(event.get("akce", ""))
         side = _normalize_side(event.get("strana", ""))
         qty = _extract_slot_delta(action, entry="Vstup" in action)
-        event_symbol = str(event.get("symbol", symbol)).upper()
+        event_symbol = str(event.get("symbol", "")).upper()
+        if not event_symbol:
+            continue
         try:
             price = float(event.get("cena", 0.0))
         except Exception:
@@ -170,25 +172,23 @@ def _apply_trade_cutoff(summary: dict[str, Any], cutoff_value: Any) -> dict[str,
 
         if open_slots > 0 and states:
             positions: list[dict[str, Any]] = []
-            slot_cursor = 1
             for state in states:
                 state_side = str(state.get("side", ""))
                 state_symbol = str(state.get("symbol", "")).upper()
+                state_slots = int(state.get("open_slots", 0))
                 if state_side not in {"LONG", "SHORT"} or not state_symbol:
                     continue
-                for _ in range(int(state.get("open_slots", 0))):
-                    positions.append(
-                        {
-                            "slot": slot_cursor,
-                            "symbol": state_symbol,
-                            "side": state_side,
-                            "model_id": model_id,
-                            "model_name": model_name,
-                            "opened_at": state.get("opened_at"),
-                            "entry_price": state.get("entry_price"),
-                        }
-                    )
-                    slot_cursor += 1
+                positions.append(
+                    {
+                        "symbol": state_symbol,
+                        "side": state_side,
+                        "slots": state_slots,
+                        "model_id": model_id,
+                        "model_name": model_name,
+                        "opened_at": state.get("opened_at"),
+                        "entry_price": state.get("entry_price"),
+                    }
+                )
             model_open_positions[model_id] = positions
         else:
             model_open_positions[model_id] = []
@@ -204,7 +204,11 @@ def _apply_trade_cutoff(summary: dict[str, Any], cutoff_value: Any) -> dict[str,
     order_source["model_open_positions"] = order_source["model_id"].map(model_open_positions)
     filtered_summary["proposed_orders"] = [
         order.__dict__
-        for order in build_dry_run_orders(order_source, symbol=str(summary.get("symbol", "BTCUSDT")), nav_usd=1000.0)
+            for order in build_dry_run_orders(
+                order_source,
+                symbol=str(summary.get("symbol", "BTCUSDT")),
+                trade_size_czk=PAPER_TRADE_SIZE_CZK,
+            )
     ]
     return filtered_summary
 

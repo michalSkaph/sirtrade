@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import pandas as pd
 
 
 DEFAULT_DB_PATH = Path("data/sirtrade.db")
+SQLITE_TIMEOUT_SECONDS = 30.0
+SQLITE_BUSY_TIMEOUT_MS = 30_000
+
+_init_db_lock = threading.Lock()
+_initialized_dbs: set[str] = set()
 
 
 def _normalize_side(value: str) -> str:
@@ -139,97 +146,156 @@ def _build_closed_positions_rows(summary: dict) -> list[tuple]:
     return rows
 
 
-def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
+def _db_key(db_path: Path) -> str:
+    return str(Path(db_path).resolve())
+
+
+def _connect_db(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS weekly_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                segment TEXT,
-                week INTEGER NOT NULL,
-                generation INTEGER NOT NULL,
-                market_source TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                interval TEXT,
-                champion_model TEXT NOT NULL,
-                champion_score REAL NOT NULL,
-                champion_sortino REAL NOT NULL,
-                champion_calmar REAL NOT NULL,
-                champion_max_dd REAL NOT NULL,
-                champion_cvar95 REAL NOT NULL,
-                reward_usd REAL NOT NULL
-            )
-            """
-        )
-        try:
-            conn.execute("ALTER TABLE weekly_runs ADD COLUMN segment TEXT")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            conn.execute("ALTER TABLE weekly_runs ADD COLUMN interval TEXT")
-        except sqlite3.OperationalError:
-            pass
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS open_positions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                model_id TEXT NOT NULL,
-                model_name TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                position_size REAL NOT NULL,
-                market_source TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS closed_positions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                closed_at TEXT NOT NULL,
-                opened_at TEXT NOT NULL,
-                model_id TEXT NOT NULL,
-                model_name TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                exit_price REAL NOT NULL,
-                quantity_slots REAL NOT NULL,
-                pnl_pct REAL NOT NULL,
-                pnl_status TEXT NOT NULL,
-                exit_reason TEXT NOT NULL DEFAULT 'NEURČENO',
-                market_source TEXT NOT NULL,
-                week INTEGER NOT NULL,
-                generation INTEGER NOT NULL
-            )
-            """
-        )
-        try:
-            conn.execute("ALTER TABLE closed_positions ADD COLUMN exit_reason TEXT NOT NULL DEFAULT 'NEURČENO'")
-        except sqlite3.OperationalError:
-            pass
-        conn.execute(
-            """
-            UPDATE open_positions
-            SET side = CASE UPPER(TRIM(side))
-                WHEN 'BUY' THEN 'LONG'
-                WHEN 'SELL' THEN 'SHORT'
-                ELSE UPPER(TRIM(side))
-            END
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    conn = sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT_SECONDS)
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    return conn
+
+
+def _normalize_open_position_sides(conn: sqlite3.Connection) -> None:
+    has_legacy_values = conn.execute(
+        """
+        SELECT 1
+        FROM open_positions
+        WHERE UPPER(TRIM(side)) IN ('BUY', 'SELL')
+        LIMIT 1
+        """
+    ).fetchone()
+    if not has_legacy_values:
+        return
+
+    conn.execute(
+        """
+        UPDATE open_positions
+        SET side = CASE UPPER(TRIM(side))
+            WHEN 'BUY' THEN 'LONG'
+            WHEN 'SELL' THEN 'SHORT'
+            ELSE UPPER(TRIM(side))
+        END
+        """
+    )
+
+
+def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
+    key = _db_key(db_path)
+    if key in _initialized_dbs:
+        return
+
+    with _init_db_lock:
+        if key in _initialized_dbs:
+            return
+
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(3):
+            conn = _connect_db(db_path)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS weekly_runs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        segment TEXT,
+                        week INTEGER NOT NULL,
+                        generation INTEGER NOT NULL,
+                        market_source TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        interval TEXT,
+                        champion_model TEXT NOT NULL,
+                        champion_score REAL NOT NULL,
+                        champion_sortino REAL NOT NULL,
+                        champion_calmar REAL NOT NULL,
+                        champion_max_dd REAL NOT NULL,
+                        champion_cvar95 REAL NOT NULL,
+                        reward_usd REAL NOT NULL
+                    )
+                    """
+                )
+                try:
+                    conn.execute("ALTER TABLE weekly_runs ADD COLUMN segment TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    conn.execute("ALTER TABLE weekly_runs ADD COLUMN interval TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS open_positions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        model_id TEXT NOT NULL,
+                        model_name TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        position_size REAL NOT NULL,
+                        market_source TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS closed_positions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        closed_at TEXT NOT NULL,
+                        opened_at TEXT NOT NULL,
+                        model_id TEXT NOT NULL,
+                        model_name TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        entry_price REAL NOT NULL,
+                        exit_price REAL NOT NULL,
+                        quantity_slots REAL NOT NULL,
+                        pnl_pct REAL NOT NULL,
+                        pnl_status TEXT NOT NULL,
+                        exit_reason TEXT NOT NULL DEFAULT 'NEURČENO',
+                        market_source TEXT NOT NULL,
+                        week INTEGER NOT NULL,
+                        generation INTEGER NOT NULL
+                    )
+                    """
+                )
+                try:
+                    conn.execute("ALTER TABLE closed_positions ADD COLUMN exit_reason TEXT NOT NULL DEFAULT 'NEURČENO'")
+                except sqlite3.OperationalError:
+                    pass
+
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_open_positions_updated_model ON open_positions(updated_at DESC, model_id ASC)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_closed_positions_closed_id ON closed_positions(closed_at DESC, id DESC)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_weekly_runs_created_id ON weekly_runs(created_at DESC, id DESC)"
+                )
+                _normalize_open_position_sides(conn)
+                conn.commit()
+                _initialized_dbs.add(key)
+                return
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                conn.rollback()
+                if "locked" not in str(exc).lower() or attempt == 2:
+                    raise
+                time.sleep(0.25 * (attempt + 1))
+            finally:
+                conn.close()
+
+        if last_error is not None:
+            raise last_error
 
 
 def save_week_result(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
     champion = summary["champion"]
-    conn = sqlite3.connect(db_path)
+    conn = _connect_db(db_path)
     try:
         conn.execute(
             """
@@ -261,7 +327,7 @@ def save_week_result(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
 
 
 def load_recent_runs(limit: int = 50, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
-    conn = sqlite3.connect(db_path)
+    conn = _connect_db(db_path)
     try:
         query = "SELECT * FROM weekly_runs ORDER BY id DESC LIMIT ?"
         frame = pd.read_sql_query(query, conn, params=(limit,))
@@ -280,6 +346,14 @@ def save_open_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
     if results_df is None or not isinstance(results_df, pd.DataFrame):
         return
 
+    summary_model_ids: set[str] = set()
+    if "model_id" in results_df.columns:
+        summary_model_ids.update(str(value) for value in results_df["model_id"].dropna().tolist())
+    if isinstance(model_open_positions, dict):
+        summary_model_ids.update(str(model_id) for model_id in model_open_positions.keys())
+    if isinstance(final_positions, dict):
+        summary_model_ids.update(str(model_id) for model_id in final_positions.keys())
+
     model_names = {
         str(row["model_id"]): str(row["name"])
         for _, row in results_df[["model_id", "name"]].iterrows()
@@ -287,6 +361,7 @@ def save_open_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
 
     rows_to_insert = []
     if isinstance(model_open_positions, dict) and model_open_positions:
+        aggregated_positions: dict[tuple[str, str, str], tuple[str, float]] = {}
         for model_id, positions in model_open_positions.items():
             if not isinstance(positions, list):
                 continue
@@ -295,16 +370,28 @@ def save_open_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
                 if side not in {"LONG", "SHORT"}:
                     continue
                 symbol_value = str(position.get("symbol", symbol)).upper()
-                rows_to_insert.append(
-                    (
-                        str(model_id),
-                        model_names.get(str(model_id), str(position.get("model_name", model_id))),
-                        symbol_value,
-                        side,
-                        1.0,
-                        market_source,
-                    )
+                try:
+                    slot_count = max(1.0, float(position.get("slots", 1.0) or 1.0))
+                except Exception:
+                    slot_count = 1.0
+                key = (str(model_id), symbol_value, side)
+                model_name = model_names.get(str(model_id), str(position.get("model_name", model_id)))
+                previous = aggregated_positions.get(key)
+                aggregated_positions[key] = (
+                    model_name,
+                    slot_count if previous is None else previous[1] + slot_count,
                 )
+        rows_to_insert.extend(
+            (
+                model_id,
+                model_name,
+                symbol_value,
+                side,
+                slot_count,
+                market_source,
+            )
+            for (model_id, symbol_value, side), (model_name, slot_count) in aggregated_positions.items()
+        )
     else:
         for model_id, size in final_positions.items():
             size_val = float(size)
@@ -322,9 +409,33 @@ def save_open_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
                 )
             )
 
-    conn = sqlite3.connect(db_path)
+    conn = _connect_db(db_path)
     try:
-        conn.execute("DELETE FROM open_positions")
+        namespace_prefixes = {
+            model_id.split("_", 1)[0]
+            for model_id in summary_model_ids
+            if "_" in model_id and model_id.split("_", 1)[0]
+        }
+        namespace_to_delete = None
+        if len(namespace_prefixes) == 1 and summary_model_ids and all(
+            "_" in model_id and model_id.startswith(f"{next(iter(namespace_prefixes))}_")
+            for model_id in summary_model_ids
+        ):
+            namespace_to_delete = next(iter(namespace_prefixes))
+
+        if namespace_to_delete is not None:
+            conn.execute(
+                "DELETE FROM open_positions WHERE model_id LIKE ?",
+                (f"{namespace_to_delete}_%",),
+            )
+        elif summary_model_ids:
+            placeholders = ", ".join("?" for _ in summary_model_ids)
+            conn.execute(
+                f"DELETE FROM open_positions WHERE model_id IN ({placeholders})",
+                tuple(sorted(summary_model_ids)),
+            )
+        else:
+            conn.execute("DELETE FROM open_positions")
         if rows_to_insert:
             conn.executemany(
                 """
@@ -340,7 +451,7 @@ def save_open_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
 
 
 def load_open_positions(db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
-    conn = sqlite3.connect(db_path)
+    conn = _connect_db(db_path)
     try:
         frame = pd.read_sql_query(
             "SELECT * FROM open_positions ORDER BY updated_at DESC, model_id ASC",
@@ -358,7 +469,7 @@ def save_closed_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> Non
     if not rows_to_insert:
         return
 
-    conn = sqlite3.connect(db_path)
+    conn = _connect_db(db_path)
     try:
         conn.executemany(
             """
@@ -376,7 +487,7 @@ def save_closed_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> Non
 
 
 def load_closed_positions(limit: int = 2000, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
-    conn = sqlite3.connect(db_path)
+    conn = _connect_db(db_path)
     try:
         return pd.read_sql_query(
             "SELECT * FROM closed_positions ORDER BY closed_at DESC, id DESC LIMIT ?",
@@ -388,7 +499,7 @@ def load_closed_positions(limit: int = 2000, db_path: Path = DEFAULT_DB_PATH) ->
 
 
 def clear_trade_history(db_path: Path = DEFAULT_DB_PATH) -> None:
-    conn = sqlite3.connect(db_path)
+    conn = _connect_db(db_path)
     try:
         conn.execute("DELETE FROM weekly_runs")
         conn.execute("DELETE FROM open_positions")

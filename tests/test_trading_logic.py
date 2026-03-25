@@ -15,7 +15,7 @@ from src.sirtrade.engine import ModelResult
 from src.sirtrade.live_worker import _apply_trade_cutoff
 from src.sirtrade.copy_trading import LeadTraderProfile, select_best_lead_trader
 from src.sirtrade.models import ModelSpec
-from src.sirtrade.storage import clear_trade_history, init_db
+from src.sirtrade.storage import clear_trade_history, init_db, load_open_positions, save_open_positions
 
 
 def _build_market_frame() -> pd.DataFrame:
@@ -44,7 +44,125 @@ def _build_market_frame() -> pd.DataFrame:
     )
 
 
+def _build_flat_market_frame() -> pd.DataFrame:
+    index = pd.date_range("2026-01-01", periods=80, freq="5min", tz="UTC")
+    close = np.linspace(100.0, 100.6, len(index))
+    open_ = np.roll(close, 1)
+    open_[0] = close[0]
+    high = np.maximum(open_, close) * 1.0005
+    low = np.minimum(open_, close) * 0.9995
+    ret = pd.Series(close).pct_change().fillna(0.0).to_numpy()
+
+    return pd.DataFrame(
+        {
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "ret": ret,
+            "sentiment": np.full(len(index), 0.5),
+            "onchain": np.full(len(index), 0.4),
+            "regime": np.zeros(len(index)),
+        },
+        index=index,
+    )
+
+
 class TradingLogicTests(unittest.TestCase):
+    def test_init_db_is_idempotent_and_normalizes_legacy_sides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "sirtrade.db"
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE open_positions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        model_id TEXT NOT NULL,
+                        model_name TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        position_size REAL NOT NULL,
+                        market_source TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO open_positions (
+                        model_id, model_name, symbol, side, position_size, market_source
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    ("M1", "Trend", "BTCUSDT", "BUY", 1.0, "binance"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            init_db(db_path=db_path)
+            init_db(db_path=db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                side = conn.execute("SELECT side FROM open_positions WHERE model_id = ?", ("M1",)).fetchone()[0]
+            finally:
+                conn.close()
+
+            self.assertEqual(side, "LONG")
+
+    def test_save_open_positions_keeps_other_segment_namespaces(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "sirtrade.db"
+            init_db(db_path=db_path)
+
+            scalp_summary = {
+                "symbol": "BTCUSDT",
+                "market_source": "binance",
+                "results": pd.DataFrame(
+                    [
+                        {"model_id": "SC_M1", "name": "Scalp Trend"},
+                        {"model_id": "SC_M2", "name": "Scalp MR"},
+                    ]
+                ),
+                "model_open_positions": {
+                    "SC_M1": [
+                        {"symbol": "BTCUSDT", "side": "LONG", "slots": 2, "model_name": "Scalp Trend"}
+                    ]
+                },
+                "final_positions": {"SC_M1": 2.0, "SC_M2": 0.0},
+            }
+            swing_summary = {
+                "symbol": "ETHUSDT",
+                "market_source": "binance",
+                "results": pd.DataFrame(
+                    [
+                        {"model_id": "SW_M1", "name": "Swing Trend"},
+                        {"model_id": "SW_M2", "name": "Swing MR"},
+                    ]
+                ),
+                "model_open_positions": {
+                    "SW_M1": [
+                        {"symbol": "ETHUSDT", "side": "SHORT", "slots": 1, "model_name": "Swing Trend"}
+                    ]
+                },
+                "final_positions": {"SW_M1": -1.0, "SW_M2": 0.0},
+            }
+
+            save_open_positions(scalp_summary, db_path=db_path)
+            save_open_positions(swing_summary, db_path=db_path)
+
+            combined = load_open_positions(db_path=db_path)
+            self.assertEqual(set(combined["model_id"].tolist()), {"SC_M1", "SW_M1"})
+
+            scalp_summary["model_open_positions"] = {"SC_M1": [], "SC_M2": []}
+            scalp_summary["final_positions"] = {"SC_M1": 0.0, "SC_M2": 0.0}
+            save_open_positions(scalp_summary, db_path=db_path)
+
+            remaining = load_open_positions(db_path=db_path)
+            self.assertEqual(set(remaining["model_id"].tolist()), {"SW_M1"})
+
     def test_trade_cutoff_removes_pre_reset_open_positions(self) -> None:
         summary = {
             "symbol": "BTCUSDT",
@@ -170,8 +288,9 @@ class TradingLogicTests(unittest.TestCase):
             final_open_slots={"M1": 3},
         )
 
-        self.assertEqual(len(open_positions["M1"]), 3)
-        self.assertTrue(all(item["symbol"] == "BTCUSDT" for item in open_positions["M1"]))
+        self.assertEqual(len(open_positions["M1"]), 1)
+        self.assertEqual(open_positions["M1"][0]["symbol"], "BTCUSDT")
+        self.assertEqual(open_positions["M1"][0]["slots"], 3)
 
     def test_dry_run_orders_follow_actual_open_positions(self) -> None:
         leaderboard = pd.DataFrame(
@@ -189,12 +308,13 @@ class TradingLogicTests(unittest.TestCase):
             ]
         )
 
-        orders = build_dry_run_orders(leaderboard, symbol="BTCUSDT", nav_usd=1000.0)
+        orders = build_dry_run_orders(leaderboard, symbol="BTCUSDT")
 
         self.assertEqual(len(orders), 1)
         self.assertEqual(orders[0].model_id, "M1")
         self.assertEqual(orders[0].symbol, "BTCUSDT")
         self.assertEqual(orders[0].side, "BUY")
+        self.assertEqual(orders[0].quantity_czk, 1000.0)
 
     def test_dry_run_orders_support_multiple_symbols_per_model(self) -> None:
         leaderboard = pd.DataFrame(
@@ -203,36 +323,106 @@ class TradingLogicTests(unittest.TestCase):
                     "model_id": "MC",
                     "score": 2.5,
                     "model_open_positions": [
-                        {"symbol": "BTCUSDT", "side": "LONG"},
-                        {"symbol": "BTCUSDT", "side": "LONG"},
-                        {"symbol": "ETHUSDT", "side": "LONG"},
+                        {"symbol": "BTCUSDT", "side": "LONG", "slots": 2},
+                        {"symbol": "ETHUSDT", "side": "LONG", "slots": 1},
                     ],
                 }
             ]
         )
 
-        orders = build_dry_run_orders(leaderboard, symbol="BTCUSDT", nav_usd=1000.0)
+        orders = build_dry_run_orders(leaderboard, symbol="BTCUSDT")
 
         self.assertEqual(len(orders), 2)
         self.assertEqual({order.symbol for order in orders}, {"BTCUSDT", "ETHUSDT"})
         self.assertTrue(all(order.side == "BUY" for order in orders))
+        self.assertEqual(next(order.quantity_czk for order in orders if order.symbol == "BTCUSDT"), 2000.0)
+        self.assertEqual(next(order.quantity_czk for order in orders if order.symbol == "ETHUSDT"), 1000.0)
 
     def test_target_exit_is_not_delayed_by_hold_interval(self) -> None:
         engine = TradingEngine()
         market = _build_market_frame()
         model = ModelSpec("M1", "Trend", "trend_vol", 1)
         strong_signal = pd.Series(1.0, index=market.index)
+        forced_confluence = pd.DataFrame(
+            {
+                "long_votes": np.full(len(market.index), 6),
+                "short_votes": np.zeros(len(market.index)),
+                "long_confidence": np.full(len(market.index), 1.0),
+                "short_confidence": np.zeros(len(market.index)),
+            },
+            index=market.index,
+        )
+        atr_pct = pd.Series(0.0018, index=market.index)
 
-        with patch("src.sirtrade.engine.generate_signals", return_value=strong_signal):
+        with patch("src.sirtrade.engine.generate_signals", return_value=strong_signal), patch.object(
+            TradingEngine,
+            "_build_entry_confluence",
+            return_value=(forced_confluence, 4, 2, atr_pct),
+            autospec=True,
+        ), patch.object(
+            TradingEngine,
+            "_trade_profile",
+            return_value=(0.8, 1.2, 0.0015, 0.05),
+            autospec=True,
+        ):
             _, events, _, _ = engine._simulate_model(model, market, symbol="ETHUSDT")
 
         self.assertGreaterEqual(len(events), 2)
         self.assertEqual(events[0]["akce"].split()[0], "Vstup")
         self.assertEqual(events[0].get("symbol"), "ETHUSDT")
-        self.assertEqual(events[1].get("duvod_vystupu"), "TARGET")
+        self.assertIn(events[1].get("duvod_vystupu"), {"TARGET", "STOP"})
         entry_time = pd.Timestamp(events[0]["timestamp"])
         exit_time = pd.Timestamp(events[1]["timestamp"])
         self.assertLessEqual(exit_time, entry_time + pd.Timedelta(hours=1))
+
+    def test_position_is_not_closed_only_because_next_bar_arrives(self) -> None:
+        engine = TradingEngine()
+        market = _build_flat_market_frame()
+        model = ModelSpec("M1", "Trend", "trend_vol", 1)
+        strong_signal = pd.Series(1.0, index=market.index)
+
+        with patch("src.sirtrade.engine.generate_signals", return_value=strong_signal):
+            _, events, final_position, final_open_slots = engine._simulate_model(model, market, symbol="BTCUSDT")
+
+        entry_events = [event for event in events if str(event.get("akce", "")).startswith("Vstup")]
+        exit_events = [event for event in events if str(event.get("akce", "")).startswith("Výstup")]
+        self.assertGreaterEqual(len(entry_events), 1)
+        self.assertEqual(len(exit_events), 0)
+        self.assertGreater(final_open_slots, 0)
+        self.assertGreater(final_position, 0.0)
+
+    def test_model_does_not_reenter_without_signal_reset_after_target_exit(self) -> None:
+        engine = TradingEngine()
+        market = _build_market_frame().copy()
+        market["high"] = market["close"] * 1.03
+        market["low"] = market["close"] * 0.999
+        model = ModelSpec("M1", "Trend", "trend_vol", 1)
+        strong_signal = pd.Series(1.0, index=market.index)
+
+        forced_confluence = pd.DataFrame(
+            {
+                "long_votes": np.full(len(market.index), 6),
+                "short_votes": np.zeros(len(market.index)),
+                "long_confidence": np.full(len(market.index), 1.0),
+                "short_confidence": np.zeros(len(market.index)),
+            },
+            index=market.index,
+        )
+        atr_pct = pd.Series(0.003, index=market.index)
+
+        with patch("src.sirtrade.engine.generate_signals", return_value=strong_signal), patch.object(
+            TradingEngine,
+            "_build_entry_confluence",
+            return_value=(forced_confluence, 4, 2, atr_pct),
+            autospec=True,
+        ):
+            _, events, _, _ = engine._simulate_model(model, market, symbol="BTCUSDT")
+
+        entry_events = [event for event in events if str(event.get("akce", "")).startswith("Vstup")]
+        exit_events = [event for event in events if str(event.get("akce", "")).startswith("Výstup")]
+        self.assertEqual(len(entry_events), 1)
+        self.assertEqual(len(exit_events), 1)
+        self.assertEqual(exit_events[0].get("duvod_vystupu"), "TARGET")
 
     def test_run_week_selects_coin_from_dynamic_top20(self) -> None:
         engine = TradingEngine()
@@ -269,7 +459,28 @@ class TradingLogicTests(unittest.TestCase):
 
         self.assertIn("SOLUSDT", summary.get("candidate_symbols", []))
         self.assertEqual(summary["champion"]["symbol"], "SOLUSDT")
-        self.assertTrue(all(row_symbol == "SOLUSDT" for row_symbol in summary["results"]["symbol"].tolist()))
+        standard_rows = summary["results"][summary["results"]["model_id"] != "MC"]
+        self.assertEqual(len(summary["results"]), 6)
+        self.assertTrue(all(row_symbol == "SOLUSDT" for row_symbol in standard_rows["symbol"].tolist()))
+
+    def test_evolve_generation_keeps_fixed_model_budget_per_segment(self) -> None:
+        engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")
+        leaderboard = pd.DataFrame(
+            [
+                {"model_id": "SC_M1", "score": 2.0},
+                {"model_id": "SC_M2", "score": 1.8},
+                {"model_id": "SC_M3", "score": 1.5},
+                {"model_id": "SC_M4", "score": 1.2},
+                {"model_id": "SC_M5", "score": 1.0},
+                {"model_id": "SC_MC", "score": 0.9},
+            ]
+        )
+
+        engine._evolve_generation(leaderboard)
+
+        self.assertEqual(len(engine.models), 6)
+        self.assertEqual(sum(model.kind == "copy_trader" for model in engine.models), 1)
+        self.assertEqual(sum(model.kind != "copy_trader" for model in engine.models), 5)
 
     def test_select_best_lead_trader_prefers_higher_weighted_score(self) -> None:
         conservative = LeadTraderProfile(
@@ -322,9 +533,10 @@ class TradingLogicTests(unittest.TestCase):
             summary = engine.run_week(days=30, market_source="binance_copy", symbol="BTCUSDT", interval="15m")
 
         self.assertEqual(summary["market_source"], "binance_copy")
-        self.assertEqual(len(summary["results"]), 1)
-        self.assertEqual(summary["results"].iloc[0]["model_id"], "MC")
+        self.assertEqual(len(summary["results"]), 6)
+        self.assertIn("MC", summary["results"]["model_id"].tolist())
         self.assertEqual({item["symbol"] for item in summary["model_open_positions"]["MC"]}, {"BTCUSDT", "ETHUSDT"})
+        self.assertEqual(sum(int(item.get("slots", 0)) for item in summary["model_open_positions"]["MC"]), 5)
         self.assertEqual({order["symbol"] for order in summary["proposed_orders"]}, {"BTCUSDT", "ETHUSDT"})
 
 

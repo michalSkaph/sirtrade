@@ -7,7 +7,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from .config import AppConfig, DEFAULT_CONFIG
+from .config import AppConfig, DEFAULT_CONFIG, PAPER_TRADE_SIZE_CZK
 from .copy_trading import load_top_copy_trader_snapshot
 from .data import get_market_data, scan_binance_long_tail, scan_long_tail_opportunities
 from .execution import build_dry_run_orders
@@ -211,6 +211,7 @@ class TradingEngine:
         slot_size = self.config.risk.max_asset_exposure / 5
         events: list[dict] = []
         open_positions_override: list[dict[str, object]] = []
+        open_positions_by_key: dict[tuple[str, str], dict[str, object]] = {}
         portfolio_pnl: pd.Series | None = None
         total_open_slots = 0
         net_final_position = 0.0
@@ -234,20 +235,28 @@ class TradingEngine:
             portfolio_pnl = pnl_series if portfolio_pnl is None else portfolio_pnl.add(pnl_series, fill_value=0.0)
             price = float(pd.to_numeric(market["close"], errors="coerce").dropna().iloc[-1])
             timestamp = market.index[-1]
-
-            for _ in range(slots):
-                open_positions_override.append(
-                    {
-                        "slot": len(open_positions_override) + 1,
-                        "symbol": symbol,
-                        "side": side,
-                        "model_id": model.model_id,
-                        "model_name": f"{model.name} | {leader_name}",
-                        "leader_id": leader.get("trader_id"),
-                        "leader_name": leader_name,
-                        "entry_price": float(position.get("entry_price", price) or price),
-                    }
-                )
+            position_key = (symbol, side)
+            entry_price = float(position.get("entry_price", price) or price)
+            existing_position = open_positions_by_key.get(position_key)
+            if existing_position is None:
+                open_positions_by_key[position_key] = {
+                    "symbol": symbol,
+                    "side": side,
+                    "slots": int(slots),
+                    "model_id": model.model_id,
+                    "model_name": f"{model.name} | {leader_name}",
+                    "leader_id": leader.get("trader_id"),
+                    "leader_name": leader_name,
+                    "entry_price": entry_price,
+                }
+            else:
+                previous_slots = int(existing_position.get("slots", 0))
+                total_slots = previous_slots + int(slots)
+                previous_entry_price = float(existing_position.get("entry_price", entry_price) or entry_price)
+                existing_position["slots"] = total_slots
+                existing_position["entry_price"] = (
+                    (previous_entry_price * previous_slots) + (entry_price * int(slots))
+                ) / max(total_slots, 1)
 
             events.append(
                 {
@@ -264,6 +273,8 @@ class TradingEngine:
                     "leader_name": leader_name,
                 }
             )
+
+        open_positions_override = list(open_positions_by_key.values())
 
         if portfolio_pnl is None or portfolio_pnl.empty:
             return self._inactive_copy_trader_run(model, primary_symbol)
@@ -312,14 +323,17 @@ class TradingEngine:
         model: ModelSpec,
         market: pd.DataFrame,
         controlled_signal: pd.Series,
-    ) -> tuple[pd.DataFrame, int]:
+    ) -> tuple[pd.DataFrame, int, int, pd.Series]:
         close = market["close"].astype(float)
+        high = market["high"].astype(float)
+        low = market["low"].astype(float)
         returns = market["ret"].fillna(0.0).astype(float)
         sentiment = market.get("sentiment", pd.Series(0.0, index=market.index)).fillna(0.0).astype(float)
         onchain = market.get("onchain", pd.Series(0.0, index=market.index)).fillna(0.0).astype(float)
 
         ema_fast = close.ewm(span=8, adjust=False).mean()
         ema_slow = close.ewm(span=21, adjust=False).mean()
+        ema_anchor = close.ewm(span=55, adjust=False).mean()
         momentum_fast = returns.rolling(3).mean().fillna(0.0)
         momentum_slow = returns.rolling(8).mean().fillna(0.0)
         breakout = close.pct_change(5).fillna(0.0)
@@ -327,9 +341,44 @@ class TradingEngine:
         rolling_std = close.rolling(20).std(ddof=0).replace(0.0, np.nan)
         price_z = ((close - rolling_mean) / (rolling_std + 1e-9)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         overlay_bias = ((0.6 * onchain) + (0.4 * sentiment)).clip(-3.0, 3.0)
+        upper_band = rolling_mean + (1.4 * rolling_std.fillna(0.0))
+        lower_band = rolling_mean - (1.4 * rolling_std.fillna(0.0))
+
+        delta = close.diff().fillna(0.0)
+        gains = delta.clip(lower=0.0)
+        losses = (-delta).clip(lower=0.0)
+        avg_gain = gains.ewm(alpha=1 / 14, adjust=False).mean()
+        avg_loss = losses.ewm(alpha=1 / 14, adjust=False).mean()
+        rs = avg_gain / (avg_loss + 1e-6)
+        rsi = (100 - (100 / (1 + rs))).fillna(50.0)
+
+        macd_fast = close.ewm(span=12, adjust=False).mean()
+        macd_slow = close.ewm(span=26, adjust=False).mean()
+        macd_line = macd_fast - macd_slow
+        macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist = (macd_line - macd_signal).fillna(0.0)
+
+        prev_close = close.shift(1).fillna(close)
+        true_range = pd.concat(
+            [
+                (high - low).abs(),
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr = true_range.rolling(14).mean().fillna(true_range.expanding().mean()).fillna(0.0)
+        atr_pct = (atr / (close.abs() + 1e-6)).clip(lower=0.0015, upper=0.08)
+
+        donchian_high = high.rolling(20).max().shift(1).fillna(high.expanding().max())
+        donchian_low = low.rolling(20).min().shift(1).fillna(low.expanding().min())
+        breakout_up = close >= donchian_high
+        breakout_down = close <= donchian_low
 
         trend_up = (ema_fast > ema_slow) & (close >= ema_fast)
         trend_down = (ema_fast < ema_slow) & (close <= ema_fast)
+        broad_trend_up = close >= ema_anchor
+        broad_trend_down = close <= ema_anchor
         momentum_up = momentum_fast > 0
         momentum_down = momentum_fast < 0
         acceleration_up = momentum_fast >= momentum_slow
@@ -337,48 +386,59 @@ class TradingEngine:
 
         if model.kind == "mean_reversion":
             long_checks = [
-                controlled_signal >= 0.14,
-                price_z <= -1.0,
-                close <= rolling_mean,
+                controlled_signal >= 0.16,
+                price_z <= -1.35,
+                close <= lower_band,
+                rsi <= 36,
                 acceleration_up,
             ]
             short_checks = [
-                controlled_signal <= -0.14,
-                price_z >= 1.0,
-                close >= rolling_mean,
+                controlled_signal <= -0.16,
+                price_z >= 1.35,
+                close >= upper_band,
+                rsi >= 64,
                 acceleration_down,
             ]
-            required_votes = 3
+            required_votes = 4
+            reset_votes = 2
         elif model.kind == "onchain_sentiment_overlay":
             long_checks = [
                 controlled_signal >= 0.18,
-                overlay_bias >= 0.15,
+                overlay_bias >= 0.25,
                 trend_up,
                 momentum_up,
+                macd_hist >= 0,
             ]
             short_checks = [
                 controlled_signal <= -0.18,
-                overlay_bias <= -0.15,
+                overlay_bias <= -0.25,
                 trend_down,
                 momentum_down,
-            ]
-            required_votes = 3
-        elif model.kind == "xsec_momentum":
-            long_checks = [
-                controlled_signal >= 0.20,
-                momentum_up,
-                acceleration_up,
-                breakout > 0,
-                trend_up,
-            ]
-            short_checks = [
-                controlled_signal <= -0.20,
-                momentum_down,
-                acceleration_down,
-                breakout < 0,
-                trend_down,
+                macd_hist <= 0,
             ]
             required_votes = 4
+            reset_votes = 2
+        elif model.kind == "xsec_momentum":
+            long_checks = [
+                controlled_signal >= 0.24,
+                momentum_up,
+                acceleration_up,
+                breakout_up | (breakout > 0),
+                trend_up,
+                broad_trend_up,
+                macd_hist > 0,
+            ]
+            short_checks = [
+                controlled_signal <= -0.24,
+                momentum_down,
+                acceleration_down,
+                breakout_down | (breakout < 0),
+                trend_down,
+                broad_trend_down,
+                macd_hist < 0,
+            ]
+            required_votes = 5
+            reset_votes = 2
         elif model.kind == "meta_ensemble":
             long_checks = [
                 controlled_signal >= 0.20,
@@ -386,6 +446,8 @@ class TradingEngine:
                 momentum_up,
                 acceleration_up,
                 overlay_bias >= -0.10,
+                macd_hist >= 0,
+                rsi.between(50, 72),
             ]
             short_checks = [
                 controlled_signal <= -0.20,
@@ -393,24 +455,32 @@ class TradingEngine:
                 momentum_down,
                 acceleration_down,
                 overlay_bias <= 0.10,
+                macd_hist <= 0,
+                rsi.between(28, 50),
             ]
-            required_votes = 4
+            required_votes = 5
+            reset_votes = 2
         else:
             long_checks = [
-                controlled_signal >= 0.18,
+                controlled_signal >= 0.22,
                 trend_up,
+                broad_trend_up,
                 momentum_up,
                 acceleration_up,
-                breakout > 0,
+                breakout_up | (breakout > 0),
+                macd_hist > 0,
             ]
             short_checks = [
-                controlled_signal <= -0.18,
+                controlled_signal <= -0.22,
                 trend_down,
+                broad_trend_down,
                 momentum_down,
                 acceleration_down,
-                breakout < 0,
+                breakout_down | (breakout < 0),
+                macd_hist < 0,
             ]
-            required_votes = 4
+            required_votes = 5
+            reset_votes = 2
 
         long_votes = sum(check.astype(int) for check in long_checks)
         short_votes = sum(check.astype(int) for check in short_checks)
@@ -423,7 +493,18 @@ class TradingEngine:
             },
             index=market.index,
         )
-        return confluence, required_votes
+        return confluence, required_votes, reset_votes, atr_pct
+
+    def _trade_profile(self, model: ModelSpec) -> tuple[float, float, float, float]:
+        if model.kind == "mean_reversion":
+            return 1.35, 2.75, 0.0025, 0.08
+        if model.kind == "xsec_momentum":
+            return 1.85, 3.90, 0.0030, 0.10
+        if model.kind == "onchain_sentiment_overlay":
+            return 1.70, 3.40, 0.0030, 0.09
+        if model.kind == "meta_ensemble":
+            return 1.95, 4.10, 0.0032, 0.09
+        return 2.10, 4.40, 0.0035, 0.10
 
     def _build_trade_events(self, model: ModelSpec, prices: pd.Series, position: pd.Series) -> tuple[list[dict], int]:
         events: list[dict] = []
@@ -532,17 +613,15 @@ class TradingEngine:
     ) -> tuple[ModelResult, list[dict], float, int]:
         raw = generate_signals(model, market, seed=self.week)
         controlled_signal = apply_risk_controls(raw, market["ret"], self.config.risk)
-        confluence, required_votes = self._build_entry_confluence(model, market, controlled_signal)
+        confluence, required_votes, reset_votes, atr_pct = self._build_entry_confluence(model, market, controlled_signal)
 
         close = market["close"].astype(float)
         high = market["high"].astype(float)
         low = market["low"].astype(float)
-        ret_std = market["ret"].fillna(0.0).rolling(20).std().fillna(0.0)
 
         slot_size = self.config.risk.max_asset_exposure / 5
         warmup_bars = min(48, max(12, int(len(market) * 0.1)))
-        stop_multiplier = 1.15 if model.kind == "mean_reversion" else 1.05
-        target_multiplier = 2.20 if model.kind == "mean_reversion" else 1.90
+        stop_atr_multiplier, target_atr_multiplier, min_stop_floor, signal_reset_floor = self._trade_profile(model)
 
         pos = pd.Series(0.0, index=market.index, dtype=float)
         side = 0
@@ -551,6 +630,7 @@ class TradingEngine:
         stop_price = None
         target_price = None
         events: list[dict] = []
+        entry_armed = True
 
         for step, ts in enumerate(market.index):
             signal_value = float(controlled_signal.loc[ts])
@@ -561,18 +641,25 @@ class TradingEngine:
             close_price = float(close.loc[ts])
             high_price = float(high.loc[ts])
             low_price = float(low.loc[ts])
-            vol_step = float(ret_std.loc[ts])
+            vol_step = float(atr_pct.loc[ts])
             if np.isnan(vol_step) or vol_step <= 0:
-                vol_step = 0.01
+                vol_step = min_stop_floor
 
             if step < warmup_bars:
                 pos.loc[ts] = 0.0
                 continue
 
             if side == 0:
+                if not entry_armed:
+                    setup_reset = max(long_votes, short_votes) <= reset_votes or abs(signal_value) <= signal_reset_floor
+                    if setup_reset:
+                        entry_armed = True
+                    pos.loc[ts] = 0.0
+                    continue
+
                 direction = 0
                 confidence = 0.0
-                if long_votes >= required_votes and signal_value > 0:
+                if long_votes >= required_votes and signal_value > 0 and long_votes > short_votes:
                     direction = 1
                     confidence = long_confidence
                 if short_votes >= required_votes and signal_value < 0 and short_votes > long_votes:
@@ -586,8 +673,8 @@ class TradingEngine:
                     side = direction
                     current_slots = slots
 
-                    stop_dist = max(0.004, stop_multiplier * max(vol_step, 0.004))
-                    target_dist = max(stop_dist * 1.5, target_multiplier * max(vol_step, 0.004))
+                    stop_dist = max(min_stop_floor, stop_atr_multiplier * max(vol_step, min_stop_floor))
+                    target_dist = max(stop_dist * 1.8, target_atr_multiplier * max(vol_step, min_stop_floor))
                     if side > 0:
                         stop_price = close_price * (1.0 - stop_dist)
                         target_price = close_price * (1.0 + target_dist)
@@ -609,6 +696,7 @@ class TradingEngine:
                         }
                     )
 
+                    entry_armed = False
                     pos.loc[ts] = position_size
                 else:
                     pos.loc[ts] = 0.0
@@ -653,6 +741,7 @@ class TradingEngine:
                 current_slots = 0
                 stop_price = None
                 target_price = None
+                entry_armed = False
             else:
                 pos.loc[ts] = position_size
 
@@ -715,13 +804,12 @@ class TradingEngine:
 
             model_open_positions[model_id] = [
                 {
-                    "slot": slot_idx + 1,
                     "symbol": model_symbol,
                     "side": side,
+                    "slots": slots,
                     "model_id": model_id,
                     "model_name": model_name,
                 }
-                for slot_idx in range(slots)
             ]
 
         return model_open_positions
@@ -790,7 +878,7 @@ class TradingEngine:
             }
 
         copy_snapshot = None
-        if effective_source == "binance_copy":
+        if effective_source in {"binance", "binance_copy"}:
             copy_snapshot = load_top_copy_trader_snapshot(
                 allow_shorts=self.config.allow_shorts and self.config.allow_leverage,
                 allow_leverage=self.config.allow_leverage,
@@ -820,10 +908,7 @@ class TradingEngine:
                         latest_prices[position_symbol] = float(pd.to_numeric(market["close"], errors="coerce").dropna().iloc[-1])
 
         selected_runs: list[dict] = []
-        if effective_source == "binance_copy":
-            models_to_run = [model for model in self.models if model.kind == "copy_trader"] or self.models
-        else:
-            models_to_run = [model for model in self.models if model.kind != "copy_trader"] or self.models
+        models_to_run = list(self.models)
 
         for model in models_to_run:
             if model.kind == "copy_trader":
@@ -886,7 +971,11 @@ class TradingEngine:
                 model_open_positions[str(run["result"].model_id)] = list(open_positions_override)
         order_source = results_df.copy()
         order_source["model_open_positions"] = order_source["model_id"].map(model_open_positions)
-        proposed_orders = build_dry_run_orders(order_source, symbol=effective_symbol, nav_usd=1000.0)
+        proposed_orders = build_dry_run_orders(
+            order_source,
+            symbol=effective_symbol,
+            trade_size_czk=PAPER_TRADE_SIZE_CZK,
+        )
 
         if self.week % self.config.generation_horizon_weeks == 0:
             self._evolve_generation(results_df)
@@ -929,19 +1018,18 @@ class TradingEngine:
 
         prefix = f"{self.model_label_prefix.strip()} | " if self.model_label_prefix.strip() else ""
 
-        children = [
+        offspring_pool = [
             ModelSpec(_model_id("M6"), f"{prefix}Potomek A (mutovaný trend)", "trend_vol", self.generation),
             ModelSpec(_model_id("M7"), f"{prefix}Potomek B (mutované momentum)", "xsec_momentum", self.generation),
             ModelSpec(_model_id("M8"), f"{prefix}Potomek C (mutovaný meta model)", "meta_ensemble", self.generation),
-        ]
-
-        anchor = [
             ModelSpec(_model_id("M9"), f"{prefix}Stabilizační kotva MR", "mean_reversion", self.generation),
             ModelSpec(_model_id("M10"), f"{prefix}Stabilizační kotva overlay", "onchain_sentiment_overlay", self.generation),
         ]
+        children_needed = max(0, 5 - len(keep))
+        children = offspring_pool[:children_needed]
 
         copy_anchor = [
             ModelSpec(_model_id("MC"), f"{prefix}Kopie lead tradera Binance", "copy_trader", self.generation),
         ]
 
-        self.models = keep + children + anchor + copy_anchor
+        self.models = keep + children + copy_anchor

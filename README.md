@@ -111,6 +111,7 @@ docker compose logs -f sirtrade-health
 ### 4) Health endpointy
 - `http://<server>:8080/health` — rychlý stav služby (200 = OK, 503 = degraded)
 - `http://<server>:8080/status` — poslední detailní stav automatizačního běhu
+- `http://<server>:8080/market-chart?symbol=BTCUSDT&interval=1m&limit=300` — JSON feed pro live OHLC graf bez refresh blikání UI
 
 ### 5) Úpravy z VS Code
 - Doporučení: Git workflow (lokální změna -> push -> pull/redeploy na VPS).
