@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .config import AppConfig, DEFAULT_CONFIG
+from .copy_trading import load_top_copy_trader_snapshot
 from .data import get_market_data, scan_binance_long_tail, scan_long_tail_opportunities
 from .execution import build_dry_run_orders
 from .models import ModelSpec, default_model_specs, generate_signals
@@ -35,6 +36,8 @@ class ModelResult:
 class TradingEngine:
     def __init__(self, config: AppConfig = DEFAULT_CONFIG, model_namespace: str = "", model_label_prefix: str = ""):
         self.config = config
+        self.model_namespace = str(model_namespace)
+        self.model_label_prefix = str(model_label_prefix)
         self.models: list[ModelSpec] = default_model_specs(namespace=model_namespace, label_prefix=model_label_prefix)
         self.generation = 1
         self.week = 0
@@ -50,7 +53,7 @@ class TradingEngine:
         market_source: str,
         fallback_symbol: str,
     ) -> tuple[pd.DataFrame, list[str]]:
-        if market_source == "binance":
+        if market_source in {"binance", "binance_copy"}:
             long_tail = scan_binance_long_tail(top_n=20)
         else:
             long_tail = scan_long_tail_opportunities(seed=self.week, universe_size=300).head(20)
@@ -72,7 +75,7 @@ class TradingEngine:
         fallback_symbol: str,
     ) -> tuple[pd.DataFrame, list[str], dict[str, pd.DataFrame], dict[str, float]]:
         cache_key = (market_source, int(days), str(interval))
-        cache_ttl_seconds = 15.0 if market_source == "binance" else 5.0
+        cache_ttl_seconds = 15.0 if market_source in {"binance", "binance_copy"} else 5.0
         cached = self._live_snapshot_cache.get(cache_key)
         now = time.time()
         if cached and (now - float(cached.get("timestamp", 0.0))) < cache_ttl_seconds:
@@ -110,6 +113,199 @@ class TradingEngine:
         }
         self._live_snapshot_cache[cache_key] = snapshot
         return long_tail, candidate_symbols, markets_by_symbol, latest_prices
+
+    def _inactive_copy_trader_run(self, model: ModelSpec, symbol: str) -> dict:
+        result = ModelResult(
+            model_id=model.model_id,
+            name=model.name,
+            generation=model.generation,
+            symbol=symbol,
+            sortino=0.0,
+            calmar=0.0,
+            cvar95=1.0,
+            max_dd=1.0,
+            cost=0.0,
+            turnover=0.0,
+            score=-1.0,
+            passed=False,
+        )
+        return {
+            "result": result,
+            "events": [],
+            "final_position": 0.0,
+            "final_open_slots": 0,
+            "market": pd.DataFrame(),
+            "opportunity_score": 0.0,
+            "open_positions_override": [],
+        }
+
+    def _copy_trader_slot_allocations(self, positions: list[dict[str, object]], slot_budget: int = 5) -> list[int]:
+        if not positions or slot_budget <= 0:
+            return []
+
+        capped_positions = positions[:slot_budget]
+        if len(capped_positions) == slot_budget:
+            return [1] * slot_budget
+
+        notionals = [max(0.0, float(position.get("notional_usd", 0.0))) for position in capped_positions]
+        total_notional = sum(notionals)
+        if total_notional <= 0:
+            return [1] + [0] * (len(capped_positions) - 1)
+
+        raw_allocations = [(notional / total_notional) * slot_budget for notional in notionals]
+        base_allocations = [int(value) for value in raw_allocations]
+        remainders = [value - int(value) for value in raw_allocations]
+
+        allocated = sum(base_allocations)
+        while allocated < slot_budget:
+            next_index = max(range(len(remainders)), key=lambda idx: remainders[idx])
+            base_allocations[next_index] += 1
+            remainders[next_index] = 0.0
+            allocated += 1
+
+        while allocated > slot_budget:
+            next_index = max(range(len(base_allocations)), key=lambda idx: base_allocations[idx])
+            if base_allocations[next_index] <= 0:
+                break
+            base_allocations[next_index] -= 1
+            allocated -= 1
+
+        if all(value == 0 for value in base_allocations):
+            base_allocations[0] = 1
+        return base_allocations
+
+    def _build_copy_trader_run(
+        self,
+        model: ModelSpec,
+        snapshot: dict[str, object] | None,
+        markets_by_symbol: dict[str, pd.DataFrame],
+        fallback_symbol: str,
+    ) -> dict:
+        if not isinstance(snapshot, dict):
+            return self._inactive_copy_trader_run(model, fallback_symbol)
+
+        leader = snapshot.get("leader", {})
+        raw_positions = snapshot.get("positions", [])
+        if not isinstance(leader, dict) or not isinstance(raw_positions, list):
+            return self._inactive_copy_trader_run(model, fallback_symbol)
+
+        ranked_positions = []
+        for position in raw_positions:
+            if not isinstance(position, dict):
+                continue
+            symbol = str(position.get("symbol", "")).upper()
+            market = markets_by_symbol.get(symbol)
+            if not symbol or market is None or market.empty:
+                continue
+            ranked_positions.append(position)
+
+        ranked_positions = sorted(
+            ranked_positions,
+            key=lambda item: float(item.get("notional_usd", 0.0)),
+            reverse=True,
+        )
+        if not ranked_positions:
+            return self._inactive_copy_trader_run(model, fallback_symbol)
+
+        allocations = self._copy_trader_slot_allocations(ranked_positions, slot_budget=5)
+        slot_size = self.config.risk.max_asset_exposure / 5
+        events: list[dict] = []
+        open_positions_override: list[dict[str, object]] = []
+        portfolio_pnl: pd.Series | None = None
+        total_open_slots = 0
+        net_final_position = 0.0
+        primary_symbol = str(ranked_positions[0].get("symbol", fallback_symbol)).upper()
+        primary_market = markets_by_symbol.get(primary_symbol, pd.DataFrame())
+        leader_name = str(leader.get("nickname") or leader.get("trader_id") or model.name).strip()
+
+        for position, slots in zip(ranked_positions, allocations):
+            if slots <= 0:
+                continue
+
+            symbol = str(position.get("symbol", "")).upper()
+            side = str(position.get("side", "")).upper()
+            market = markets_by_symbol[symbol]
+            direction = 1.0 if side == "LONG" else -1.0
+            position_size = direction * slots * slot_size
+            total_open_slots += int(slots)
+            net_final_position += position_size
+
+            pnl_series = market["ret"].fillna(0.0).astype(float) * position_size
+            portfolio_pnl = pnl_series if portfolio_pnl is None else portfolio_pnl.add(pnl_series, fill_value=0.0)
+            price = float(pd.to_numeric(market["close"], errors="coerce").dropna().iloc[-1])
+            timestamp = market.index[-1]
+
+            for _ in range(slots):
+                open_positions_override.append(
+                    {
+                        "slot": len(open_positions_override) + 1,
+                        "symbol": symbol,
+                        "side": side,
+                        "model_id": model.model_id,
+                        "model_name": f"{model.name} | {leader_name}",
+                        "leader_id": leader.get("trader_id"),
+                        "leader_name": leader_name,
+                        "entry_price": float(position.get("entry_price", price) or price),
+                    }
+                )
+
+            events.append(
+                {
+                    "timestamp": timestamp,
+                    "symbol": symbol,
+                    "model_id": model.model_id,
+                    "model_name": f"{model.name} | {leader_name}",
+                    "akce": f"Vstup {side} (+{slots})",
+                    "strana": side,
+                    "cena": price,
+                    "pozice": position_size,
+                    "sloty": int(slots),
+                    "leader_id": leader.get("trader_id"),
+                    "leader_name": leader_name,
+                }
+            )
+
+        if portfolio_pnl is None or portfolio_pnl.empty:
+            return self._inactive_copy_trader_run(model, primary_symbol)
+
+        equity = (1 + portfolio_pnl).cumprod()
+        mdd = max_drawdown(equity)
+        srt = sortino_ratio(portfolio_pnl)
+        calmar = calmar_ratio(portfolio_pnl, mdd)
+        cv = cvar95(portfolio_pnl)
+        metrics = {
+            "sortino": srt,
+            "calmar": calmar,
+            "cvar95": cv,
+            "max_dd": mdd,
+            "cost": 0.0,
+            "turnover": 0.0,
+        }
+        score = decision_score(metrics, self.config.weights) + float(leader.get("score", 0.0))
+        passed = pass_thresholds(metrics, self.config.thresholds)
+        result = ModelResult(
+            model_id=model.model_id,
+            name=f"{model.name} | {leader_name}",
+            generation=model.generation,
+            symbol=primary_symbol,
+            sortino=srt,
+            calmar=calmar,
+            cvar95=cv,
+            max_dd=mdd,
+            cost=0.0,
+            turnover=0.0,
+            score=score,
+            passed=passed,
+        )
+        return {
+            "result": result,
+            "events": events,
+            "final_position": float(net_final_position),
+            "final_open_slots": int(total_open_slots),
+            "market": primary_market,
+            "opportunity_score": 0.0,
+            "open_positions_override": open_positions_override,
+        }
 
     def _build_entry_confluence(
         self,
@@ -578,9 +774,10 @@ class TradingEngine:
         self.week += 1
         effective_source = market_source or self.config.market_data_source
         effective_symbol = (symbol or self.config.default_symbol).upper()
+        market_data_source = "binance" if effective_source == "binance_copy" else effective_source
 
         long_tail, candidate_symbols, markets_by_symbol, latest_prices = self._get_live_market_snapshot(
-            market_source=effective_source,
+            market_source=market_data_source,
             days=days,
             interval=interval,
             fallback_symbol=effective_symbol,
@@ -592,8 +789,54 @@ class TradingEngine:
                 for _, row in long_tail[["symbol", "opportunity_score"]].iterrows()
             }
 
+        copy_snapshot = None
+        if effective_source == "binance_copy":
+            copy_snapshot = load_top_copy_trader_snapshot(
+                allow_shorts=self.config.allow_shorts and self.config.allow_leverage,
+                allow_leverage=self.config.allow_leverage,
+            )
+            if isinstance(copy_snapshot, dict):
+                position_symbols = [
+                    str(position.get("symbol", "")).upper()
+                    for position in copy_snapshot.get("positions", [])
+                    if isinstance(position, dict)
+                ]
+                for position_symbol in position_symbols:
+                    if not position_symbol:
+                        continue
+                    if position_symbol not in candidate_symbols:
+                        candidate_symbols.append(position_symbol)
+                    if position_symbol in markets_by_symbol:
+                        continue
+                    market = get_market_data(
+                        source="binance",
+                        days=days,
+                        symbol=position_symbol,
+                        seed=self._market_seed(position_symbol, offset=len(markets_by_symbol)),
+                        interval=interval,
+                    )
+                    markets_by_symbol[position_symbol] = market
+                    if not market.empty and "close" in market.columns:
+                        latest_prices[position_symbol] = float(pd.to_numeric(market["close"], errors="coerce").dropna().iloc[-1])
+
         selected_runs: list[dict] = []
-        for model in self.models:
+        if effective_source == "binance_copy":
+            models_to_run = [model for model in self.models if model.kind == "copy_trader"] or self.models
+        else:
+            models_to_run = [model for model in self.models if model.kind != "copy_trader"] or self.models
+
+        for model in models_to_run:
+            if model.kind == "copy_trader":
+                chosen_run = self._build_copy_trader_run(
+                    model=model,
+                    snapshot=copy_snapshot,
+                    markets_by_symbol=markets_by_symbol,
+                    fallback_symbol=effective_symbol,
+                )
+                self._model_symbol_memory[model.model_id] = str(chosen_run["result"].symbol).upper()
+                selected_runs.append(chosen_run)
+                continue
+
             candidate_runs: list[dict] = []
             shortlist_symbols = self._shortlist_candidate_symbols(model, candidate_symbols, opportunity_scores)
             for candidate_symbol in shortlist_symbols:
@@ -637,6 +880,10 @@ class TradingEngine:
             final_positions=final_positions,
             final_open_slots=final_open_slots,
         )
+        for run in selected_runs:
+            open_positions_override = run.get("open_positions_override", [])
+            if open_positions_override:
+                model_open_positions[str(run["result"].model_id)] = list(open_positions_override)
         order_source = results_df.copy()
         order_source["model_open_positions"] = order_source["model_id"].map(model_open_positions)
         proposed_orders = build_dry_run_orders(order_source, symbol=effective_symbol, nav_usd=1000.0)
@@ -674,17 +921,27 @@ class TradingEngine:
         top = leaderboard.head(2)
         carry_ids = set(top["model_id"].tolist())
 
-        keep = [m for m in self.models if m.model_id in carry_ids]
+        keep = [m for m in self.models if m.model_id in carry_ids and m.kind != "copy_trader"]
+
+        def _model_id(base_id: str) -> str:
+            namespace = self.model_namespace.strip().upper()
+            return f"{namespace}_{base_id}" if namespace else base_id
+
+        prefix = f"{self.model_label_prefix.strip()} | " if self.model_label_prefix.strip() else ""
 
         children = [
-            ModelSpec("M6", "Potomek A (mutovaný trend)", "trend_vol", self.generation),
-            ModelSpec("M7", "Potomek B (mutované momentum)", "xsec_momentum", self.generation),
-            ModelSpec("M8", "Potomek C (mutovaný meta model)", "meta_ensemble", self.generation),
+            ModelSpec(_model_id("M6"), f"{prefix}Potomek A (mutovaný trend)", "trend_vol", self.generation),
+            ModelSpec(_model_id("M7"), f"{prefix}Potomek B (mutované momentum)", "xsec_momentum", self.generation),
+            ModelSpec(_model_id("M8"), f"{prefix}Potomek C (mutovaný meta model)", "meta_ensemble", self.generation),
         ]
 
         anchor = [
-            ModelSpec("M9", "Stabilizační kotva MR", "mean_reversion", self.generation),
-            ModelSpec("M10", "Stabilizační kotva overlay", "onchain_sentiment_overlay", self.generation),
+            ModelSpec(_model_id("M9"), f"{prefix}Stabilizační kotva MR", "mean_reversion", self.generation),
+            ModelSpec(_model_id("M10"), f"{prefix}Stabilizační kotva overlay", "onchain_sentiment_overlay", self.generation),
         ]
 
-        self.models = keep + children + anchor
+        copy_anchor = [
+            ModelSpec(_model_id("MC"), f"{prefix}Kopie lead tradera Binance", "copy_trader", self.generation),
+        ]
+
+        self.models = keep + children + anchor + copy_anchor

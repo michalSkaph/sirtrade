@@ -122,7 +122,7 @@ def fetch_binance_market(symbol: str = "BTCUSDT", interval: str = "1d", limit: i
 def get_market_data(source: str, days: int, symbol: str, seed: int, interval: str = "1d") -> pd.DataFrame:
     steps_per_day = INTERVAL_TO_STEPS_PER_DAY.get(interval, 1)
     limit = max(30, min(days * steps_per_day, 1000))
-    if source == "binance":
+    if source in {"binance", "binance_copy"}:
         try:
             return fetch_binance_market(symbol=symbol, interval=interval, limit=limit)
         except Exception:

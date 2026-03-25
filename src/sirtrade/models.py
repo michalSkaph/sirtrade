@@ -13,6 +13,7 @@ ModelKind = Literal[
     "mean_reversion",
     "onchain_sentiment_overlay",
     "meta_ensemble",
+    "copy_trader",
 ]
 
 
@@ -37,6 +38,7 @@ def default_model_specs(namespace: str = "", label_prefix: str = "") -> list[Mod
         ModelSpec(_model_id("M3"), f"{prefix}Swing návrat k průměru", "mean_reversion", 1),
         ModelSpec(_model_id("M4"), f"{prefix}On-chain + sentimentní vrstva", "onchain_sentiment_overlay", 1),
         ModelSpec(_model_id("M5"), f"{prefix}Meta ansámbl", "meta_ensemble", 1),
+        ModelSpec(_model_id("MC"), f"{prefix}Kopie lead tradera Binance", "copy_trader", 1),
     ]
 
 
@@ -54,6 +56,8 @@ def generate_signals(model: ModelSpec, market: pd.DataFrame, seed: int = 0) -> p
     elif model.kind == "onchain_sentiment_overlay":
         overlay = market["sentiment"].fillna(0.0) * 0.4 + market["onchain"].fillna(0.0) * 0.6
         signal = np.tanh(overlay)
+    elif model.kind == "copy_trader":
+        signal = pd.Series(0.0, index=market.index, dtype=float)
     else:
         trend = np.sign(returns.rolling(15).mean().fillna(0.0))
         rev = -np.tanh((returns - returns.rolling(20).mean().fillna(0.0)) / (vol + 1e-6))

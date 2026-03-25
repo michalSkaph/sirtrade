@@ -6,7 +6,7 @@ Autonomní **paper-trading** aplikace pro krypto (Binance-ready architektura), k
 - evolučně vytváří další generace modelů,
 - denně simuluje research návrhy z vědeckých přístupů,
 - poskytuje bezpečné UI ve Streamlitu,
-- umí běžet na simulovaných datech i na veřejných datech Binance (bez API klíče).
+- umí běžet na simulovaných datech, na veřejných datech Binance a nově i v režimu Binance Copy přes externí leaderboard/pozice feed.
 
 ## Bezpečnostní poznámka
 Tato verze je záměrně spuštěná v **simulaci** (paper mode). Neodesílá reálné obchody.
@@ -54,13 +54,29 @@ Launcher automaticky:
 ## Co umí
 - Spot + perpetuals logika na úrovni simulace (shorty přes perp větev)
 - Páka zakázána (vynuceno konfigurací)
-- Přepínat zdroj dat mezi `simulation` a `binance`
+- Přepínat zdroj dat mezi `simulation`, `binance` a `binance_copy`
 - TradingView realtime widget přímo v UI
 - Týdenní hodnocení modelů, 8týdenní generační cyklus
 - Risk policy: vol targeting, DD limity, kill-switch
 - Long-tail opportunity scanner
 - Persistovat výsledky běhů do SQLite (`data/sirtrade.db`)
 - Automaticky exportovat týdenní reporty do `reports/` (CSV leaderboard + JSON decision matrix)
+
+## Binance Copy režim
+
+Režim `binance_copy` zůstává pouze v paper-tradingu. Neodesílá live ordery na burzu a používá externí JSON feed s leaderboardem a otevřenými pozicemi lead traderů.
+
+Nastav tyto proměnné prostředí:
+
+- `SIRTRADE_COPY_TRADER_LIST_URL` - URL vracející seznam traderů
+- `SIRTRADE_COPY_TRADER_POSITIONS_URL_TEMPLATE` - URL šablona pro pozice s placeholderem `{trader_id}`
+- `SIRTRADE_COPY_TRADER_HEADERS_JSON` - volitelně JSON s HTTP hlavičkami
+
+Poznámky:
+
+- Projekt dál vynucuje paper mode a bez leverage.
+- Pokud feed vrací leveraged nebo short futures pozice, systém je v copy režimu odfiltruje.
+- Vybraný lead trader je určen interním skóre z ROI, PnL, win-rate a drawdownu.
 
 ## Deploy na VPS (Docker)
 

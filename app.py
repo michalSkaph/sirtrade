@@ -167,6 +167,20 @@ def _split_datetime_column(frame: pd.DataFrame, source_column: str, label_prefix
     return out
 
 
+def _compute_trade_levels(entry_price: float, side: str, vol: float) -> tuple[float, float]:
+    normalized_side = str(side).upper()
+    normalized_vol = float(vol)
+    if pd.isna(normalized_vol) or normalized_vol <= 0:
+        normalized_vol = 0.015
+
+    stop_dist = max(0.005, 1.0 * normalized_vol)
+    target_dist = max(0.01, 2.0 * normalized_vol)
+
+    if normalized_side == "LONG":
+        return entry_price * (1 - stop_dist), entry_price * (1 + target_dist)
+    return entry_price * (1 + stop_dist), entry_price * (1 - target_dist)
+
+
 def _load_segment_closed_positions(segment: str, limit: int = CLOSED_POSITIONS_LIMIT) -> pd.DataFrame:
     closed_positions = _load_closed_positions_cached(limit=limit)
     if closed_positions.empty or "model_id" not in closed_positions.columns:
@@ -555,9 +569,18 @@ active_segment_running = bool(st.session_state.simulation_running_by_segment.get
 has_running_segments = any(st.session_state.simulation_running_by_segment.values())
 force_simulation_cycle = False
 status_run = "BĚŽÍ" if active_segment_running else "STOP"
-status_source = "Simulace" if st.session_state.data_source == "simulation" else "Binance"
+status_source = {"simulation": "Simulace", "binance": "Binance", "binance_copy": "Binance Copy"}.get(
+    st.session_state.data_source,
+    st.session_state.data_source,
+)
 status_profile = st.session_state.active_segment
-status_symbol = "Dynamické Top 20" if st.session_state.data_source == "binance" else "Simulační Top 20"
+status_symbol = (
+    "Top lead trader + jeho otevřené pozice"
+    if st.session_state.data_source == "binance_copy"
+    else "Dynamické Top 20"
+    if st.session_state.data_source == "binance"
+    else "Simulační Top 20"
+)
 status_interval = SEGMENT_DEFAULTS.get(st.session_state.active_segment, SEGMENT_DEFAULTS["Swing"])["interval"]
 
 with st.sidebar:
@@ -573,11 +596,11 @@ with st.sidebar:
 
     data_source = st.selectbox(
         "Data",
-        ["simulation", "binance"],
-        index=["simulation", "binance"].index(st.session_state.data_source)
-        if st.session_state.data_source in ["simulation", "binance"]
+        ["simulation", "binance", "binance_copy"],
+        index=["simulation", "binance", "binance_copy"].index(st.session_state.data_source)
+        if st.session_state.data_source in ["simulation", "binance", "binance_copy"]
         else 0,
-        format_func=lambda value: {"simulation": "Simulace", "binance": "Binance"}.get(value, value),
+        format_func=lambda value: {"simulation": "Simulace", "binance": "Binance", "binance_copy": "Binance Copy"}.get(value, value),
     )
     st.session_state.data_source = data_source
 
@@ -585,6 +608,11 @@ with st.sidebar:
         st.caption("Univerzum: dynamické Top 20 coiny z Binance podle aktuální atraktivity a likvidity.")
         st.caption(
             f"Paper-trading běží nad živými Binance daty. Graf se obnovuje po {FIXED_LIVE_REFRESH_SECONDS} s, rozhodovací přepočet po {FIXED_BINANCE_DECISION_SECONDS} s."
+        )
+    elif st.session_state.data_source == "binance_copy":
+        st.caption("Zdroj: externí leaderboard lead traderů Binance a jejich otevřené pozice, mapované do paper režimu bez leverage.")
+        st.caption(
+            f"Režim Binance Copy používá živá Binance data pro ocenění pozic. Graf se obnovuje po {FIXED_LIVE_REFRESH_SECONDS} s, rozhodovací přepočet po {FIXED_BINANCE_DECISION_SECONDS} s."
         )
     else:
         st.caption("Univerzum: dynamické Top 20 simulovaných coinů podle aktuální atraktivity.")
@@ -757,7 +785,7 @@ else:
     live_market_price = None
     live_market_change_pct = None
 
-    source_label = {"simulation": "Simulace", "binance": "Binance"}.get(latest["market_source"], latest["market_source"])
+    source_label = {"simulation": "Simulace", "binance": "Binance", "binance_copy": "Binance Copy"}.get(latest["market_source"], latest["market_source"])
 
     refreshable_views = {"Dashboard", "Grafy", "Pozice"}
     if (
@@ -771,7 +799,7 @@ else:
     if (
         st.session_state.live_refresh_enabled
         and st.session_state.active_view == "Grafy"
-        and latest.get("market_source") == "binance"
+        and latest.get("market_source") in {"binance", "binance_copy"}
     ):
         try:
             live_market = _fetch_binance_market_cached(
@@ -901,15 +929,11 @@ else:
                     last_entry = entry_events.sort_values("timestamp").iloc[-1]
                     entry_price = float(last_entry["cena"])
                     opened_at = str(last_entry["timestamp"])
-                    stop_dist = max(0.005, 1.0 * vol_latest)
-                    target_dist = max(0.01, 2.0 * vol_latest)
                     if position_value > 0:
-                        stop_price = entry_price * (1 - stop_dist)
-                        target_price = entry_price * (1 + target_dist)
+                        stop_price, target_price = _compute_trade_levels(entry_price, "LONG", vol_latest)
                         pnl_pct = ((latest_market_price - entry_price) / entry_price) * 100
                     else:
-                        stop_price = entry_price * (1 + stop_dist)
-                        target_price = entry_price * (1 - target_dist)
+                        stop_price, target_price = _compute_trade_levels(entry_price, "SHORT", vol_latest)
                         pnl_pct = ((entry_price - latest_market_price) / entry_price) * 100
 
             model_position_rows.append(
@@ -981,7 +1005,7 @@ else:
                     "market_source": "Zdroj dat",
                 }
             )
-            open_view["Zdroj dat"] = open_view["Zdroj dat"].replace({"simulation": "Simulace", "binance": "Binance"})
+            open_view["Zdroj dat"] = open_view["Zdroj dat"].replace({"simulation": "Simulace", "binance": "Binance", "binance_copy": "Binance Copy"})
             open_view = _split_datetime_column(open_view, "Naposledy aktualizováno", "Aktualizace")
             if "Směr" in open_view.columns:
                 open_view["Směr"] = (
@@ -1201,7 +1225,7 @@ else:
         )
 
         overlay_market_df = market_df.copy()
-        if latest.get("market_source") == "binance":
+        if latest.get("market_source") in {"binance", "binance_copy"}:
             try:
                 overlay_market_df = _fetch_binance_market_cached(
                     symbol=selected_symbol_for_overlay,
@@ -1294,52 +1318,6 @@ else:
                     )
                 )
 
-            if abs(selected_position) > 1e-9 and not entries.empty:
-                if selected_leg is not None:
-                    entry_price = float(selected_leg["entry_price"])
-                    selected_leg_side = str(selected_leg["side"]).upper()
-                else:
-                    last_entry = entries.sort_values("timestamp").iloc[-1]
-                    entry_price = float(last_entry["cena"])
-                    selected_leg_side = "LONG" if selected_position > 0 else "SHORT"
-
-                vol = float(overlay_market_df["close"].pct_change().rolling(20).std().iloc[-1])
-                if pd.isna(vol) or vol <= 0:
-                    vol = 0.015
-                stop_dist = max(0.005, 1.0 * vol)
-                target_dist = max(0.01, 2.0 * vol)
-
-                if selected_leg_side == "LONG":
-                    stop_price = entry_price * (1 - stop_dist)
-                    target_price = entry_price * (1 + target_dist)
-                else:
-                    stop_price = entry_price * (1 + stop_dist)
-                    target_price = entry_price * (1 - target_dist)
-
-                fig.add_hline(
-                    y=entry_price,
-                    line_width=1,
-                    line_dash="dot",
-                    line_color="#60a5fa",
-                    annotation_text="Vstupní cena",
-                    annotation_position="top left",
-                )
-                fig.add_hline(
-                    y=target_price,
-                    line_width=1,
-                    line_dash="dash",
-                    line_color="#16a34a",
-                    annotation_text="Cílová cena (target)",
-                    annotation_position="top right",
-                )
-                fig.add_hline(
-                    y=stop_price,
-                    line_width=1,
-                    line_dash="dash",
-                    line_color="#dc2626",
-                    annotation_text="Stop úroveň",
-                    annotation_position="bottom right",
-                )
             if not exits.empty:
                 fig.add_trace(
                     go.Scatter(
@@ -1352,6 +1330,61 @@ else:
                         hovertemplate="%{text}<br>Cena: %{y:.4f}<extra></extra>",
                     )
                 )
+
+        chart_open_legs = [
+            leg
+            for leg in open_legs
+            if str(leg.get("symbol", default_model_symbol)).upper() == selected_symbol_for_overlay
+        ]
+        if chart_open_legs:
+            chart_x = overlay_market_df.index
+            vol = float(overlay_market_df["close"].pct_change().rolling(20).std().iloc[-1])
+            level_specs = [
+                ("entry", "Vstup", "#2563eb", "dot"),
+                ("target", "Target", "#16a34a", "dash"),
+                ("stop", "Stop-loss", "#dc2626", "dash"),
+            ]
+
+            for leg_index, leg in enumerate(chart_open_legs, start=1):
+                entry_price = float(leg["entry_price"])
+                leg_side = str(leg["side"]).upper()
+                stop_price, target_price = _compute_trade_levels(entry_price, leg_side, vol)
+                level_values = {
+                    "entry": entry_price,
+                    "target": target_price,
+                    "stop": stop_price,
+                }
+
+                for level_key, level_label, level_color, level_dash in level_specs:
+                    level_price = level_values[level_key]
+                    fig.add_trace(
+                        go.Scatter(
+                            x=chart_x,
+                            y=[level_price] * len(chart_x),
+                            mode="lines",
+                            line=dict(color=level_color, width=1.4, dash=level_dash),
+                            name=level_label,
+                            legendgroup=level_key,
+                            showlegend=leg_index == 1,
+                            opacity=0.95,
+                            hovertemplate=(
+                                f"Pozice #{leg_index} | {leg_side}<br>{level_label}: {level_price:.6f}<extra></extra>"
+                            ),
+                        )
+                    )
+
+                    annotation_suffix = f" #{leg_index}" if len(chart_open_legs) > 1 else ""
+                    fig.add_annotation(
+                        x=chart_x[-1],
+                        y=level_price,
+                        xanchor="left",
+                        yanchor="middle",
+                        xshift=8,
+                        text=f"{level_label}{annotation_suffix}",
+                        showarrow=False,
+                        font=dict(color=level_color, size=11),
+                        bgcolor="rgba(255,255,255,0.75)",
+                    )
 
         fig.update_layout(
             height=760,
@@ -1498,7 +1531,7 @@ else:
             "reward_usd": "Odměna (USD)",
         }
     )
-        persisted_view["Zdroj dat"] = persisted_view["Zdroj dat"].replace({"simulation": "Simulace", "binance": "Binance"})
+        persisted_view["Zdroj dat"] = persisted_view["Zdroj dat"].replace({"simulation": "Simulace", "binance": "Binance", "binance_copy": "Binance Copy"})
         persisted_view = _split_datetime_column(persisted_view, "Vytvořeno", "Vytvořeno")
         persisted_config = {
         "ID": st.column_config.NumberColumn("ID", help="Interní ID uloženého běhu."),

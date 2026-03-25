@@ -25,22 +25,30 @@ def build_dry_run_orders(leaderboard: pd.DataFrame, symbol: str, nav_usd: float 
         if not isinstance(positions, list) or not positions:
             continue
 
-        side = str(positions[0].get("side", "")).upper()
-        if side not in {"LONG", "SHORT"}:
-            continue
+        grouped_positions: dict[tuple[str, str], int] = {}
+        for position in positions:
+            if not isinstance(position, dict):
+                continue
+            side = str(position.get("side", "")).upper()
+            symbol_value = str(position.get("symbol", symbol)).upper()
+            if side not in {"LONG", "SHORT"} or not symbol_value:
+                continue
+            group_key = (symbol_value, side)
+            grouped_positions[group_key] = grouped_positions.get(group_key, 0) + 1
 
-        direction = "BUY" if side == "LONG" else "SELL"
-        instrument = "spot" if direction == "BUY" else "perpetual"
-        qty = max(10.0, nav_usd * 0.02 * len(positions))
         confidence = float(max(0.0, min(1.0, 0.5 + float(row["score"]) / 5)))
-        orders.append(
-            ProposedOrder(
-                model_id=str(row["model_id"]),
-                symbol=str(positions[0].get("symbol", symbol)).upper(),
-                side=direction,
-                instrument=instrument,
-                quantity_usd=qty,
-                confidence=confidence,
+        for (symbol_value, side), slot_count in grouped_positions.items():
+            direction = "BUY" if side == "LONG" else "SELL"
+            instrument = "spot" if direction == "BUY" else "perpetual"
+            qty = max(10.0, nav_usd * 0.02 * slot_count)
+            orders.append(
+                ProposedOrder(
+                    model_id=str(row["model_id"]),
+                    symbol=symbol_value,
+                    side=direction,
+                    instrument=instrument,
+                    quantity_usd=qty,
+                    confidence=confidence,
+                )
             )
-        )
     return orders

@@ -76,12 +76,8 @@ def _filter_events_since(events: Any, cutoff_ts: pd.Timestamp | None) -> list[di
     return filtered
 
 
-def _build_open_position_state(events: list[dict[str, Any]]) -> dict[str, Any]:
-    open_slots = 0
-    current_side: str | None = None
-    symbol = ""
-    opened_at: str | None = None
-    entry_price = 0.0
+def _build_open_position_states(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    states: dict[tuple[str, str], dict[str, Any]] = {}
 
     sorted_events = sorted(
         events,
@@ -102,35 +98,41 @@ def _build_open_position_state(events: list[dict[str, Any]]) -> dict[str, Any]:
         if "Vstup" in action and side in {"LONG", "SHORT"}:
             if qty <= 0:
                 qty = 1
-            if open_slots <= 0 or current_side != side:
-                open_slots = 0
-                current_side = side
-                symbol = event_symbol
-                opened_at = timestamp
-                entry_price = price
-            else:
-                total_cost = (entry_price * open_slots) + (price * qty)
-                entry_price = total_cost / max(open_slots + qty, 1)
-            open_slots += qty
+            state_key = (event_symbol, side)
+            state = states.get(
+                state_key,
+                {
+                    "open_slots": 0,
+                    "side": side,
+                    "symbol": event_symbol,
+                    "opened_at": timestamp,
+                    "entry_price": price,
+                },
+            )
+            total_cost = (float(state["entry_price"]) * int(state["open_slots"])) + (price * qty)
+            total_slots = int(state["open_slots"]) + qty
+            state["open_slots"] = total_slots
+            state["entry_price"] = total_cost / max(total_slots, 1)
+            state["opened_at"] = state.get("opened_at") or timestamp
+            state["symbol"] = event_symbol
+            state["side"] = side
+            states[state_key] = state
             continue
 
-        if "Výstup" in action and open_slots > 0 and current_side == side:
+        if "Výstup" in action and side in {"LONG", "SHORT"}:
+            state_key = (event_symbol, side)
+            state = states.get(state_key)
+            if state is None or int(state.get("open_slots", 0)) <= 0:
+                continue
             if qty <= 0:
-                qty = open_slots
-            open_slots = max(0, open_slots - qty)
-            if open_slots == 0:
-                current_side = None
-                symbol = ""
-                opened_at = None
-                entry_price = 0.0
+                qty = int(state.get("open_slots", 0))
+            state["open_slots"] = max(0, int(state.get("open_slots", 0)) - qty)
+            if int(state["open_slots"]) <= 0:
+                states.pop(state_key, None)
+            else:
+                states[state_key] = state
 
-    return {
-        "open_slots": int(open_slots),
-        "side": current_side,
-        "symbol": symbol,
-        "opened_at": opened_at,
-        "entry_price": float(entry_price),
-    }
+    return [state for state in states.values() if int(state.get("open_slots", 0)) > 0]
 
 
 def _apply_trade_cutoff(summary: dict[str, Any], cutoff_value: Any) -> dict[str, Any]:
@@ -156,26 +158,38 @@ def _apply_trade_cutoff(summary: dict[str, Any], cutoff_value: Any) -> dict[str,
     for _, row in results_df.reset_index(drop=True).iterrows():
         model_id = str(row["model_id"])
         model_name = str(row["name"])
-        state = _build_open_position_state(filtered_trades.get(model_id, []))
-        open_slots = int(state["open_slots"])
-        side = state["side"]
-        side_sign = 1.0 if side == "LONG" else (-1.0 if side == "SHORT" else 0.0)
+        states = _build_open_position_states(filtered_trades.get(model_id, []))
+        open_slots = sum(int(state.get("open_slots", 0)) for state in states)
+        signed_slot_count = sum(
+            (1 if state.get("side") == "LONG" else -1 if state.get("side") == "SHORT" else 0)
+            * int(state.get("open_slots", 0))
+            for state in states
+        )
         final_open_slots[model_id] = open_slots
-        final_positions[model_id] = side_sign * open_slots * slot_size
+        final_positions[model_id] = float(signed_slot_count) * slot_size
 
-        if open_slots > 0 and side in {"LONG", "SHORT"} and state["symbol"]:
-            model_open_positions[model_id] = [
-                {
-                    "slot": slot_idx + 1,
-                    "symbol": str(state["symbol"]),
-                    "side": side,
-                    "model_id": model_id,
-                    "model_name": model_name,
-                    "opened_at": state["opened_at"],
-                    "entry_price": state["entry_price"],
-                }
-                for slot_idx in range(open_slots)
-            ]
+        if open_slots > 0 and states:
+            positions: list[dict[str, Any]] = []
+            slot_cursor = 1
+            for state in states:
+                state_side = str(state.get("side", ""))
+                state_symbol = str(state.get("symbol", "")).upper()
+                if state_side not in {"LONG", "SHORT"} or not state_symbol:
+                    continue
+                for _ in range(int(state.get("open_slots", 0))):
+                    positions.append(
+                        {
+                            "slot": slot_cursor,
+                            "symbol": state_symbol,
+                            "side": state_side,
+                            "model_id": model_id,
+                            "model_name": model_name,
+                            "opened_at": state.get("opened_at"),
+                            "entry_price": state.get("entry_price"),
+                        }
+                    )
+                    slot_cursor += 1
+            model_open_positions[model_id] = positions
         else:
             model_open_positions[model_id] = []
 
@@ -237,7 +251,7 @@ def _choose_segments(
 ) -> list[str]:
     if not runnable_segments:
         return []
-    if data_source != "binance":
+    if data_source not in {"binance", "binance_copy"}:
         return runnable_segments
     if active_segment in runnable_segments:
         return [active_segment]
@@ -268,7 +282,7 @@ def _run_worker_loop() -> None:
         paper_trade_cutoff_ts = runtime_state.get("paper_trade_cutoff_ts")
         cadence_seconds = (
             BINANCE_DECISION_SECONDS
-            if data_source == "binance"
+            if data_source in {"binance", "binance_copy"}
             else max(1, _coerce_int(runtime_state.get("simulation_cycle_seconds"), 10))
         )
 
