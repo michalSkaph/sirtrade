@@ -34,8 +34,6 @@ until curl -fsS "$HEALTH_URL" >/dev/null; do
     sudo docker-compose logs --tail=120 sirtrade-health || true
     echo "--- sirtrade-ui logs (last 120 lines) ---"
     sudo docker-compose logs --tail=120 sirtrade-ui || true
-    echo "--- sirtrade-runner logs (last 120 lines) ---"
-    sudo docker-compose logs --tail=120 sirtrade-runner || true
     exit 1
   fi
   echo "Health check not ready yet (attempt $attempt/$MAX_ATTEMPTS), waiting ${SLEEP_SECONDS}s..."

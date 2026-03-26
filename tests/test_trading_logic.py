@@ -268,9 +268,11 @@ class TradingLogicTests(unittest.TestCase):
 
             conn = sqlite3.connect(db_path)
             try:
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM weekly_runs").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM weekly_runs WHERE hidden = 0").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM weekly_runs WHERE hidden = 1").fetchone()[0], 1)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM open_positions").fetchone()[0], 0)
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM closed_positions").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM closed_positions WHERE hidden = 0").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM closed_positions WHERE hidden = 1").fetchone()[0], 1)
             finally:
                 conn.close()
 
@@ -538,6 +540,32 @@ class TradingLogicTests(unittest.TestCase):
         self.assertEqual({item["symbol"] for item in summary["model_open_positions"]["MC"]}, {"BTCUSDT", "ETHUSDT"})
         self.assertEqual(sum(int(item.get("slots", 0)) for item in summary["model_open_positions"]["MC"]), 5)
         self.assertEqual({order["symbol"] for order in summary["proposed_orders"]}, {"BTCUSDT", "ETHUSDT"})
+
+    def test_live_cycle_does_not_reopen_position_each_worker_tick(self) -> None:
+        engine = TradingEngine()
+        engine.models = [ModelSpec("M1", "Trend", "trend_vol", 1)]
+        market = _build_market_frame()
+        universe = pd.DataFrame([{"symbol": "BTCUSDT", "opportunity_score": 1.0}])
+        strong_signal = pd.Series(1.0, index=market.index)
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
+            "src.sirtrade.engine.generate_signals", return_value=strong_signal
+        ):
+            first_summary = engine.run_week(days=7, market_source="binance", symbol="BTCUSDT", interval="15m")
+            second_summary = engine.run_week(
+                days=7,
+                market_source="binance",
+                symbol="BTCUSDT",
+                interval="15m",
+                previous_summary=first_summary,
+            )
+
+        self.assertTrue(first_summary["trade_events_delta"]["M1"])
+        self.assertEqual(len(second_summary["trade_events_delta"]["M1"]), 0)
+        self.assertEqual(len(second_summary["model_trades"]["M1"]), len(first_summary["model_trades"]["M1"]))
+        self.assertGreater(second_summary["final_open_slots"]["M1"], 0)
 
 
 if __name__ == "__main__":

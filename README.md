@@ -17,21 +17,6 @@ I v režimu Binance jsou ordery pouze **dry-run návrhy** a nejsou posílány na
 - Když je notebook vypnutý, neprobíhá nové vyhodnocení trhu.
 - Po dalším spuštění aplikace systém naváže na uložený stav.
 
-## Automatický běh bez otevřeného UI
-Pro běh bez Streamlit okna použij:
-
-```bash
-C:/Users/Lenovo/AppData/Local/Python/pythoncore-3.14-64/python.exe run_automation.py --source binance --symbol BTCUSDT --days 365
-```
-
-Tento běh provede vyhodnocení, uloží výsledky, otevřené pozice i reporty.
-
-### Naplánování ve Windows
-- V PowerShellu spusť: `./install_scheduler.ps1`
-- Výchozí nastavení vytvoří úlohu každých 15 minut.
-
-Poznámka: pokud je počítač úplně vypnutý, úloha neběží. Pro skutečný 24/7 provoz je potřeba server/VPS, který je stále zapnutý.
-
 ## Instalace
 ```bash
 python -m venv .venv

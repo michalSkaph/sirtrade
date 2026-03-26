@@ -9,7 +9,6 @@ from urllib.parse import parse_qs, urlparse
 import pandas as pd
 
 from .data import fetch_binance_market
-from .status import read_automation_status
 
 
 DEFAULT_HEALTH_PORT = 8080
@@ -89,20 +88,9 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        status = read_automation_status()
 
         if parsed.path == "/health":
-            if status and status.get("ok"):
-                self._send_json(200, {"status": "ok", "updated_at": status.get("updated_at")})
-            else:
-                self._send_json(503, {"status": "degraded", "updated_at": status.get("updated_at") if status else None})
-            return
-
-        if parsed.path == "/status":
-            if status is None:
-                self._send_json(404, {"status": "missing", "detail": "Automation status not found yet."})
-            else:
-                self._send_json(200, status)
+            self._send_json(200, {"status": "ok"})
             return
 
         if parsed.path == "/market-chart":

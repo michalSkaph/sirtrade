@@ -12,7 +12,6 @@ from .config import DEFAULT_CONFIG, PAPER_TRADE_SIZE_CZK
 from .engine import TradingEngine
 from .execution import build_dry_run_orders
 from .reporting import export_weekly_report
-from .status import write_automation_status
 from .storage import init_db, save_closed_positions, save_open_positions, save_week_result
 from .ui_state import load_runtime_state, load_segment_runs, save_last_ui_run, save_segment_runs
 
@@ -314,6 +313,7 @@ def _run_worker_loop() -> None:
                     symbol=symbol,
                     days=int(cfg["sim_days"]),
                     interval=str(cfg["interval"]),
+                    previous_summary=segment_runs.get(segment),
                 )
                 result = _apply_trade_cutoff(result, paper_trade_cutoff_ts)
                 latest_runtime_state = load_runtime_state()
@@ -332,35 +332,9 @@ def _run_worker_loop() -> None:
                 if segment == active_segment:
                     save_last_ui_run(result)
 
-                champion = result.get("champion", {})
-                write_automation_status(
-                    {
-                        "ok": True,
-                        "segment": segment,
-                        "result": {
-                            "week": result.get("week"),
-                            "generation": result.get("generation"),
-                            "market_source": result.get("market_source"),
-                            "symbol": result.get("symbol"),
-                            "champion": {
-                                "model_id": champion.get("model_id"),
-                                "name": champion.get("name"),
-                                "score": champion.get("score"),
-                            },
-                        },
-                    }
-                )
                 worker_state["last_run_by_segment"][segment] = now
             except Exception as exc:
-                write_automation_status(
-                    {
-                        "ok": False,
-                        "segment": segment,
-                        "error": str(exc),
-                        "source": data_source,
-                        "symbol": symbol,
-                    }
-                )
+                print(f"[WORKER][ERROR] segment={segment}: {exc}")
 
         time.sleep(WORKER_SLEEP_SECONDS)
 

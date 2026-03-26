@@ -9,20 +9,6 @@ services:
       - ./reports:/app/reports
     restart: unless-stopped
 
-  sirtrade-runner:
-    build: .
-    container_name: sirtrade-runner
-    command: ["python", "run_automation_loop.py"]
-    environment:
-      - SIRTRADE_SOURCE=binance
-      - SIRTRADE_SYMBOL=BTCUSDT
-      - SIRTRADE_DAYS=365
-      - SIRTRADE_INTERVAL_MINUTES=15
-    volumes:
-      - ./data:/app/data
-      - ./reports:/app/reports
-    restart: unless-stopped
-
   sirtrade-health:
     build: .
     container_name: sirtrade-health

@@ -38,7 +38,7 @@ def _extract_slot_delta(action: str, entry: bool) -> float:
 
 
 def _build_closed_positions_rows(summary: dict) -> list[tuple]:
-    model_trades = summary.get("model_trades", {})
+    model_trades = summary.get("trade_events_delta", summary.get("model_trades", {}))
     results_df = summary.get("results")
     default_symbol = str(summary.get("symbol", "BTCUSDT"))
     market_source = str(summary.get("market_source", "simulation"))
@@ -95,6 +95,51 @@ def _build_closed_positions_rows(summary: dict) -> list[tuple]:
                 avg_entry_price = total_cost / open_qty if open_qty > 0 else price
                 if not opened_at:
                     opened_at = timestamp
+                continue
+
+            direct_opened_at = event.get("opened_at")
+            direct_entry_price = event.get("entry_price")
+            direct_qty = event.get("quantity_slots")
+            if "Výstup" in action and direct_opened_at is not None and direct_entry_price is not None:
+                try:
+                    entry_price = float(direct_entry_price)
+                except Exception:
+                    entry_price = 0.0
+                try:
+                    qty = float(direct_qty if direct_qty is not None else _extract_slot_delta(action, entry=False))
+                except Exception:
+                    qty = 0.0
+                if qty <= 0:
+                    qty = 1.0
+
+                if entry_price <= 0:
+                    pnl_pct = 0.0
+                elif side == "LONG":
+                    pnl_pct = ((price - entry_price) / entry_price) * 100
+                else:
+                    pnl_pct = ((entry_price - price) / entry_price) * 100
+
+                pnl_status = "ZISK" if pnl_pct > 0 else ("ZTRÁTA" if pnl_pct < 0 else "NULA")
+                exit_reason = str(event.get("duvod_vystupu", "NEURČENO"))
+                rows.append(
+                    (
+                        timestamp,
+                        str(direct_opened_at),
+                        str(model_id),
+                        model_names.get(str(model_id), str(model_id)),
+                        symbol,
+                        side,
+                        float(entry_price),
+                        float(price),
+                        float(qty),
+                        float(pnl_pct),
+                        pnl_status,
+                        exit_reason,
+                        market_source,
+                        week,
+                        generation,
+                    )
+                )
                 continue
 
             if "Výstup" in action and open_qty > 0 and current_side == side:
@@ -276,6 +321,14 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_weekly_runs_created_id ON weekly_runs(created_at DESC, id DESC)"
                 )
+                try:
+                    conn.execute("ALTER TABLE closed_positions ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    conn.execute("ALTER TABLE weekly_runs ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+                except sqlite3.OperationalError:
+                    pass
                 _normalize_open_position_sides(conn)
                 conn.commit()
                 _initialized_dbs.add(key)
@@ -329,7 +382,7 @@ def save_week_result(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
 def load_recent_runs(limit: int = 50, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
     conn = _connect_db(db_path)
     try:
-        query = "SELECT * FROM weekly_runs ORDER BY id DESC LIMIT ?"
+        query = "SELECT * FROM weekly_runs WHERE hidden = 0 ORDER BY id DESC LIMIT ?"
         frame = pd.read_sql_query(query, conn, params=(limit,))
         return frame
     finally:
@@ -490,7 +543,7 @@ def load_closed_positions(limit: int = 2000, db_path: Path = DEFAULT_DB_PATH) ->
     conn = _connect_db(db_path)
     try:
         return pd.read_sql_query(
-            "SELECT * FROM closed_positions ORDER BY closed_at DESC, id DESC LIMIT ?",
+            "SELECT * FROM closed_positions WHERE hidden = 0 ORDER BY closed_at DESC, id DESC LIMIT ?",
             conn,
             params=(int(limit),),
         )
@@ -501,9 +554,9 @@ def load_closed_positions(limit: int = 2000, db_path: Path = DEFAULT_DB_PATH) ->
 def clear_trade_history(db_path: Path = DEFAULT_DB_PATH) -> None:
     conn = _connect_db(db_path)
     try:
-        conn.execute("DELETE FROM weekly_runs")
+        conn.execute("UPDATE weekly_runs SET hidden = 1 WHERE hidden = 0")
         conn.execute("DELETE FROM open_positions")
-        conn.execute("DELETE FROM closed_positions")
+        conn.execute("UPDATE closed_positions SET hidden = 1 WHERE hidden = 0")
         conn.commit()
     finally:
         conn.close()

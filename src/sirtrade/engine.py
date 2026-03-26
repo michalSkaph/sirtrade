@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import time
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -814,6 +815,270 @@ class TradingEngine:
 
         return model_open_positions
 
+    def _previous_live_state(self, previous_summary: dict[str, Any] | None, model_id: str) -> dict[str, Any]:
+        if not isinstance(previous_summary, dict):
+            return {}
+        live_state = previous_summary.get("live_model_state", {})
+        if isinstance(live_state, dict):
+            state = live_state.get(model_id)
+            if isinstance(state, dict):
+                return dict(state)
+
+        model_positions = previous_summary.get("model_open_positions", {})
+        if not isinstance(model_positions, dict):
+            return {}
+        positions = model_positions.get(model_id, [])
+        if not isinstance(positions, list) or not positions:
+            return {}
+
+        first_position = next((item for item in positions if isinstance(item, dict)), None)
+        if not isinstance(first_position, dict):
+            return {}
+
+        return {
+            "entry_armed": False,
+            "symbol": str(first_position.get("symbol", "")).upper(),
+            "side": str(first_position.get("side", "")).upper(),
+            "open_slots": int(len([item for item in positions if isinstance(item, dict)])),
+            "entry_price": float(first_position.get("entry_price", 0.0) or 0.0),
+            "opened_at": first_position.get("opened_at"),
+            "stop_price": float(first_position.get("stop_price", 0.0) or 0.0),
+            "target_price": float(first_position.get("target_price", 0.0) or 0.0),
+        }
+
+    def _build_incremental_live_state(
+        self,
+        selected_runs: list[dict[str, Any]],
+        previous_summary: dict[str, Any] | None,
+        markets_by_symbol: dict[str, pd.DataFrame],
+        effective_symbol: str,
+    ) -> tuple[
+        dict[str, list[dict[str, Any]]],
+        dict[str, list[dict[str, Any]]],
+        dict[str, float],
+        dict[str, int],
+        dict[str, list[dict[str, Any]]],
+        dict[str, dict[str, Any]],
+    ]:
+        previous_trades = previous_summary.get("model_trades", {}) if isinstance(previous_summary, dict) else {}
+        model_map = {model.model_id: model for model in self.models}
+        slot_size = self.config.risk.max_asset_exposure / 5
+
+        cumulative_trades: dict[str, list[dict[str, Any]]] = {}
+        trade_events_delta: dict[str, list[dict[str, Any]]] = {}
+        final_positions: dict[str, float] = {}
+        final_open_slots: dict[str, int] = {}
+        model_open_positions: dict[str, list[dict[str, Any]]] = {}
+        live_model_state: dict[str, dict[str, Any]] = {}
+
+        for run in selected_runs:
+            result = run["result"]
+            model_id = str(result.model_id)
+            model = model_map.get(model_id)
+            previous_state = self._previous_live_state(previous_summary, model_id)
+            model_trade_history = list(previous_trades.get(model_id, [])) if isinstance(previous_trades, dict) else []
+            delta_events: list[dict[str, Any]] = []
+
+            open_positions_override = run.get("open_positions_override", [])
+            if open_positions_override:
+                cumulative_trades[model_id] = model_trade_history + list(run.get("events", []))
+                trade_events_delta[model_id] = list(run.get("events", []))
+                final_positions[model_id] = float(run.get("final_position", 0.0))
+                final_open_slots[model_id] = int(run.get("final_open_slots", 0))
+                model_open_positions[model_id] = list(open_positions_override)
+                live_model_state[model_id] = {
+                    "entry_armed": False,
+                    "symbol": str(result.symbol).upper(),
+                    "side": "",
+                    "open_slots": int(run.get("final_open_slots", 0)),
+                    "entry_price": 0.0,
+                    "opened_at": None,
+                    "stop_price": 0.0,
+                    "target_price": 0.0,
+                }
+                continue
+
+            if model is None:
+                cumulative_trades[model_id] = model_trade_history
+                trade_events_delta[model_id] = []
+                final_positions[model_id] = 0.0
+                final_open_slots[model_id] = 0
+                model_open_positions[model_id] = []
+                live_model_state[model_id] = {"entry_armed": True}
+                continue
+
+            active_symbol = str(previous_state.get("symbol") or result.symbol or effective_symbol).upper()
+            market = markets_by_symbol.get(active_symbol, run.get("market"))
+            if market is None or market.empty:
+                cumulative_trades[model_id] = model_trade_history
+                trade_events_delta[model_id] = []
+                final_positions[model_id] = 0.0
+                final_open_slots[model_id] = 0
+                model_open_positions[model_id] = []
+                live_model_state[model_id] = {"entry_armed": True}
+                continue
+
+            raw = generate_signals(model, market, seed=0)
+            controlled_signal = apply_risk_controls(raw, market["ret"], self.config.risk)
+            confluence, required_votes, reset_votes, atr_pct = self._build_entry_confluence(model, market, controlled_signal)
+            _, _, min_stop_floor, signal_reset_floor = self._trade_profile(model)
+
+            ts = market.index[-1]
+            signal_value = float(controlled_signal.loc[ts])
+            long_votes = int(confluence.loc[ts, "long_votes"])
+            short_votes = int(confluence.loc[ts, "short_votes"])
+            long_confidence = float(confluence.loc[ts, "long_confidence"])
+            short_confidence = float(confluence.loc[ts, "short_confidence"])
+            close_price = float(pd.to_numeric(market["close"], errors="coerce").iloc[-1])
+            high_price = float(pd.to_numeric(market["high"], errors="coerce").iloc[-1])
+            low_price = float(pd.to_numeric(market["low"], errors="coerce").iloc[-1])
+            vol_step = float(atr_pct.loc[ts])
+            if np.isnan(vol_step) or vol_step <= 0:
+                vol_step = min_stop_floor
+
+            entry_armed = bool(previous_state.get("entry_armed", True))
+            prev_open_slots = int(previous_state.get("open_slots", 0) or 0)
+            prev_side = str(previous_state.get("side", "")).upper()
+            prev_entry_price = float(previous_state.get("entry_price", 0.0) or 0.0)
+            prev_stop_price = float(previous_state.get("stop_price", 0.0) or 0.0)
+            prev_target_price = float(previous_state.get("target_price", 0.0) or 0.0)
+            prev_opened_at = previous_state.get("opened_at")
+
+            current_side = prev_side if prev_open_slots > 0 else ""
+            current_open_slots = prev_open_slots
+            current_entry_price = prev_entry_price
+            current_stop_price = prev_stop_price
+            current_target_price = prev_target_price
+            current_opened_at = prev_opened_at
+            current_symbol = active_symbol if prev_open_slots > 0 else str(result.symbol).upper()
+
+            if current_open_slots > 0 and current_side in {"LONG", "SHORT"}:
+                hit_exit = False
+                exit_reason = None
+                if current_side == "LONG":
+                    if current_stop_price > 0 and low_price <= current_stop_price:
+                        hit_exit = True
+                        exit_reason = "STOP"
+                    if current_target_price > 0 and high_price >= current_target_price and exit_reason is None:
+                        hit_exit = True
+                        exit_reason = "TARGET"
+                else:
+                    if current_stop_price > 0 and high_price >= current_stop_price:
+                        hit_exit = True
+                        exit_reason = "STOP"
+                    if current_target_price > 0 and low_price <= current_target_price and exit_reason is None:
+                        hit_exit = True
+                        exit_reason = "TARGET"
+
+                if hit_exit:
+                    delta_events.append(
+                        {
+                            "timestamp": ts,
+                            "symbol": current_symbol,
+                            "model_id": model_id,
+                            "model_name": result.name,
+                            "akce": f"Výstup {current_side} (-{current_open_slots})",
+                            "strana": current_side,
+                            "cena": close_price,
+                            "pozice": 0.0,
+                            "sloty": 0,
+                            "duvod_vystupu": exit_reason or "NEURČENO",
+                            "opened_at": current_opened_at,
+                            "entry_price": current_entry_price,
+                            "quantity_slots": current_open_slots,
+                        }
+                    )
+                    current_side = ""
+                    current_open_slots = 0
+                    current_entry_price = 0.0
+                    current_stop_price = 0.0
+                    current_target_price = 0.0
+                    current_opened_at = None
+                    current_symbol = str(result.symbol).upper()
+                    entry_armed = False
+            else:
+                if not entry_armed:
+                    setup_reset = max(long_votes, short_votes) <= reset_votes or abs(signal_value) <= signal_reset_floor
+                    if setup_reset:
+                        entry_armed = True
+
+                direction = 0
+                confidence = 0.0
+                if entry_armed and long_votes >= required_votes and signal_value > 0 and long_votes > short_votes:
+                    direction = 1
+                    confidence = long_confidence
+                if entry_armed and short_votes >= required_votes and signal_value < 0 and short_votes > long_votes:
+                    direction = -1
+                    confidence = short_confidence
+
+                if direction != 0:
+                    conviction = max(abs(signal_value), confidence)
+                    current_open_slots = int(np.clip(np.ceil(conviction * 5), 1, 5))
+                    current_side = "LONG" if direction > 0 else "SHORT"
+                    current_entry_price = close_price
+                    current_opened_at = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+                    current_symbol = str(result.symbol).upper()
+                    stop_dist = max(min_stop_floor, self._trade_profile(model)[0] * max(vol_step, min_stop_floor))
+                    target_dist = max(stop_dist * 1.8, self._trade_profile(model)[1] * max(vol_step, min_stop_floor))
+                    if current_side == "LONG":
+                        current_stop_price = close_price * (1.0 - stop_dist)
+                        current_target_price = close_price * (1.0 + target_dist)
+                    else:
+                        current_stop_price = close_price * (1.0 + stop_dist)
+                        current_target_price = close_price * (1.0 - target_dist)
+
+                    delta_events.append(
+                        {
+                            "timestamp": ts,
+                            "symbol": current_symbol,
+                            "model_id": model_id,
+                            "model_name": result.name,
+                            "akce": f"Vstup {current_side} (+{current_open_slots})",
+                            "strana": current_side,
+                            "cena": close_price,
+                            "pozice": float(direction * current_open_slots * slot_size),
+                            "sloty": current_open_slots,
+                        }
+                    )
+                    entry_armed = False
+
+            cumulative_trades[model_id] = model_trade_history + delta_events
+            trade_events_delta[model_id] = delta_events
+            final_open_slots[model_id] = int(current_open_slots)
+            side_sign = 1.0 if current_side == "LONG" else (-1.0 if current_side == "SHORT" else 0.0)
+            final_positions[model_id] = float(side_sign * current_open_slots * slot_size)
+            live_model_state[model_id] = {
+                "entry_armed": entry_armed,
+                "symbol": current_symbol,
+                "side": current_side,
+                "open_slots": int(current_open_slots),
+                "entry_price": float(current_entry_price),
+                "opened_at": current_opened_at,
+                "stop_price": float(current_stop_price),
+                "target_price": float(current_target_price),
+            }
+
+            if current_open_slots > 0 and current_side in {"LONG", "SHORT"} and current_symbol:
+                model_open_positions[model_id] = [
+                    {
+                        "slot": slot_idx + 1,
+                        "slots": 1,
+                        "symbol": current_symbol,
+                        "side": current_side,
+                        "model_id": model_id,
+                        "model_name": result.name,
+                        "entry_price": float(current_entry_price),
+                        "opened_at": current_opened_at,
+                        "stop_price": float(current_stop_price),
+                        "target_price": float(current_target_price),
+                    }
+                    for slot_idx in range(current_open_slots)
+                ]
+            else:
+                model_open_positions[model_id] = []
+
+        return cumulative_trades, trade_events_delta, final_positions, final_open_slots, model_open_positions, live_model_state
+
     def _select_candidate_run(self, candidate_runs: list[dict]) -> dict:
         actionable = [item for item in candidate_runs if int(item.get("final_open_slots", 0)) > 0]
         pool = actionable or candidate_runs
@@ -858,6 +1123,7 @@ class TradingEngine:
         market_source: str | None = None,
         symbol: str | None = None,
         interval: str = "1d",
+        previous_summary: dict[str, Any] | None = None,
     ) -> dict:
         self.week += 1
         effective_source = market_source or self.config.market_data_source
@@ -878,6 +1144,33 @@ class TradingEngine:
             }
 
         copy_snapshot = None
+        if isinstance(previous_summary, dict):
+            previous_positions = previous_summary.get("model_open_positions", {})
+            if isinstance(previous_positions, dict):
+                previous_symbols = [
+                    str(position.get("symbol", "")).upper()
+                    for positions in previous_positions.values()
+                    if isinstance(positions, list)
+                    for position in positions
+                    if isinstance(position, dict)
+                ]
+                for previous_symbol in previous_symbols:
+                    if not previous_symbol:
+                        continue
+                    if previous_symbol not in candidate_symbols:
+                        candidate_symbols.append(previous_symbol)
+                    if previous_symbol not in markets_by_symbol:
+                        market = get_market_data(
+                            source=market_data_source,
+                            days=days,
+                            symbol=previous_symbol,
+                            seed=self._market_seed(previous_symbol, offset=len(markets_by_symbol)),
+                            interval=interval,
+                        )
+                        markets_by_symbol[previous_symbol] = market
+                        if not market.empty and "close" in market.columns:
+                            latest_prices[previous_symbol] = float(pd.to_numeric(market["close"], errors="coerce").dropna().iloc[-1])
+
         if effective_source in {"binance", "binance_copy"}:
             copy_snapshot = load_top_copy_trader_snapshot(
                 allow_shorts=self.config.allow_shorts and self.config.allow_leverage,
@@ -943,6 +1236,7 @@ class TradingEngine:
 
         results = [run["result"] for run in selected_runs]
         model_trades = {run["result"].model_id: run["events"] for run in selected_runs}
+        trade_events_delta = {run["result"].model_id: list(run["events"]) for run in selected_runs}
         final_positions = {run["result"].model_id: run["final_position"] for run in selected_runs}
         final_open_slots = {run["result"].model_id: run["final_open_slots"] for run in selected_runs}
         model_markets = {run["result"].model_id: run["market"] for run in selected_runs}
@@ -959,12 +1253,29 @@ class TradingEngine:
         champion_symbol = str(champion.get("symbol", effective_symbol)).upper()
         champion_market = model_markets.get(champion_model_id, markets_by_symbol.get(champion_symbol))
 
+        live_model_state: dict[str, dict[str, Any]] = {}
+        if effective_source in {"binance", "binance_copy"}:
+            (
+                model_trades,
+                trade_events_delta,
+                final_positions,
+                final_open_slots,
+                model_open_positions,
+                live_model_state,
+            ) = self._build_incremental_live_state(
+                selected_runs=selected_runs,
+                previous_summary=previous_summary,
+                markets_by_symbol=markets_by_symbol,
+                effective_symbol=effective_symbol,
+            )
+        else:
+            model_open_positions = self._build_model_open_positions(
+                results_df=results_df,
+                final_positions=final_positions,
+                final_open_slots=final_open_slots,
+            )
+
         research: list[StudyInsight] = daily_deep_research(seed=10_000 + self.week)
-        model_open_positions = self._build_model_open_positions(
-            results_df=results_df,
-            final_positions=final_positions,
-            final_open_slots=final_open_slots,
-        )
         for run in selected_runs:
             open_positions_override = run.get("open_positions_override", [])
             if open_positions_override:
@@ -993,9 +1304,11 @@ class TradingEngine:
             "model_markets": model_markets,
             "model_trades": model_trades,
             "champion_trades": model_trades.get(champion_model_id, []),
+            "trade_events_delta": trade_events_delta,
             "final_positions": final_positions,
             "final_open_slots": final_open_slots,
             "model_open_positions": model_open_positions,
+            "live_model_state": live_model_state,
             "model_selected_symbols": model_selected_symbols,
             "candidate_symbols": candidate_symbols,
             "latest_prices": latest_prices,

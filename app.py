@@ -183,6 +183,8 @@ def _reset_summary_trade_state(summary: dict[str, object] | None) -> dict[str, o
     reset_summary["final_positions"] = {model_id: 0.0 for model_id in model_ids}
     reset_summary["final_open_slots"] = {model_id: 0 for model_id in model_ids}
     reset_summary["model_open_positions"] = {model_id: [] for model_id in model_ids}
+    reset_summary["trade_events_delta"] = {model_id: [] for model_id in model_ids}
+    reset_summary["live_model_state"] = {model_id: {"entry_armed": True} for model_id in model_ids}
     reset_summary["proposed_orders"] = []
     return reset_summary
 
