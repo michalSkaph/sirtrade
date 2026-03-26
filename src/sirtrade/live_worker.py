@@ -12,6 +12,7 @@ from .automation import run_segment_cycle
 from .config import DEFAULT_CONFIG, PAPER_TRADE_SIZE_CZK
 from .engine import TradingEngine
 from .execution import build_dry_run_orders
+from .market_stream import get_stream_diagnostics
 from .reporting import export_weekly_report
 from .storage import init_db, save_closed_positions, save_open_positions, save_week_result
 from .ui_state import (
@@ -52,6 +53,7 @@ def _write_worker_status(**fields: Any) -> None:
     payload = {
         "worker_enabled": True,
         "heartbeat_at": pd.Timestamp.utcnow(),
+        "market_stream": get_stream_diagnostics(),
         **fields,
     }
     save_worker_status(payload)

@@ -74,6 +74,7 @@ def _build_worker_health_payload() -> tuple[bool, dict[str, object]]:
     status = load_worker_status()
     heartbeat = pd.to_datetime(status.get("heartbeat_at"), utc=True, errors="coerce")
     stale_after = int(os.getenv("SIRTRADE_WORKER_STALE_SECONDS", str(DEFAULT_WORKER_STALE_SECONDS)))
+    stream_status = status.get("market_stream") if isinstance(status.get("market_stream"), dict) else get_stream_diagnostics()
 
     if pd.isna(heartbeat):
         return False, {
@@ -82,6 +83,7 @@ def _build_worker_health_payload() -> tuple[bool, dict[str, object]]:
                 "fresh": False,
                 "detail": "No worker heartbeat found",
             }
+            , "market_stream": stream_status
         }
 
     age_seconds = max(0.0, (pd.Timestamp.now(tz="UTC") - heartbeat).total_seconds())
@@ -92,7 +94,8 @@ def _build_worker_health_payload() -> tuple[bool, dict[str, object]]:
             "fresh": fresh,
             "heartbeat_age_seconds": round(age_seconds, 1),
             "stale_after_seconds": stale_after,
-        }
+        },
+        "market_stream": stream_status,
     }
     return fresh, payload
 
@@ -103,7 +106,7 @@ def _build_status_payload() -> dict[str, object]:
     return {
         "runtime_state": runtime_state,
         "worker": worker_status,
-        "market_stream": get_stream_diagnostics(),
+        "market_stream": worker_status.get("market_stream", get_stream_diagnostics()),
         "updated_at": pd.Timestamp.utcnow(),
     }
 
@@ -134,7 +137,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             worker_fresh, worker_payload = _build_worker_health_payload()
             code = 200 if worker_fresh else 503
-            self._send_json(code, {"status": "ok" if worker_fresh else "degraded", **worker_payload, "market_stream": get_stream_diagnostics()})
+            self._send_json(code, {"status": "ok" if worker_fresh else "degraded", **worker_payload})
             return
 
         if parsed.path == "/status":
