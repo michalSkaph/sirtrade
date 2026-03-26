@@ -18,7 +18,7 @@ from src.sirtrade.config import DEFAULT_CONFIG, INITIAL_PAPER_WALLET_CZK, PAPER_
 from src.sirtrade.data import fetch_binance_market
 from src.sirtrade.engine import TradingEngine
 from src.sirtrade.health_server import DEFAULT_HEALTH_PORT, ensure_health_server_started
-from src.sirtrade.live_worker import ensure_live_worker_started
+from src.sirtrade.live_worker import ensure_live_worker_started, should_start_embedded_worker
 from src.sirtrade.reporting import export_weekly_report
 from src.sirtrade.storage import (
     clear_trade_history,
@@ -44,7 +44,8 @@ from src.sirtrade.ui_state import (
 
 st.set_page_config(page_title="SirTrade", page_icon="S", layout="wide")
 init_db()
-ensure_live_worker_started()
+if should_start_embedded_worker():
+    ensure_live_worker_started()
 ensure_health_server_started()
 
 

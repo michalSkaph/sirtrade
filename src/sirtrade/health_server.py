@@ -9,9 +9,11 @@ from urllib.parse import parse_qs, urlparse
 import pandas as pd
 
 from .data import fetch_binance_market
+from .ui_state import load_worker_status
 
 
 DEFAULT_HEALTH_PORT = 8080
+DEFAULT_WORKER_STALE_SECONDS = 90
 
 _server_lock = threading.Lock()
 _server_started = False
@@ -66,6 +68,33 @@ def _build_market_chart_payload(symbol: str, interval: str, limit: int) -> dict[
     }
 
 
+def _build_worker_health_payload() -> tuple[bool, dict[str, object]]:
+    status = load_worker_status()
+    heartbeat = pd.to_datetime(status.get("heartbeat_at"), utc=True, errors="coerce")
+    stale_after = int(os.getenv("SIRTRADE_WORKER_STALE_SECONDS", str(DEFAULT_WORKER_STALE_SECONDS)))
+
+    if pd.isna(heartbeat):
+        return False, {
+            "worker": {
+                "status": "missing",
+                "fresh": False,
+                "detail": "No worker heartbeat found",
+            }
+        }
+
+    age_seconds = max(0.0, (pd.Timestamp.now(tz="UTC") - heartbeat).total_seconds())
+    fresh = age_seconds <= stale_after
+    payload = {
+        "worker": {
+            **status,
+            "fresh": fresh,
+            "heartbeat_age_seconds": round(age_seconds, 1),
+            "stale_after_seconds": stale_after,
+        }
+    }
+    return fresh, payload
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     def end_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -90,7 +119,9 @@ class HealthHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == "/health":
-            self._send_json(200, {"status": "ok"})
+            worker_fresh, worker_payload = _build_worker_health_payload()
+            code = 200 if worker_fresh else 503
+            self._send_json(code, {"status": "ok" if worker_fresh else "degraded", **worker_payload})
             return
 
         if parsed.path == "/market-chart":

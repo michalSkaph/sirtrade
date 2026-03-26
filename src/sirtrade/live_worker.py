@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -13,7 +14,13 @@ from .engine import TradingEngine
 from .execution import build_dry_run_orders
 from .reporting import export_weekly_report
 from .storage import init_db, save_closed_positions, save_open_positions, save_week_result
-from .ui_state import load_runtime_state, load_segment_runs, save_last_ui_run, save_segment_runs
+from .ui_state import (
+    load_runtime_state,
+    load_segment_runs,
+    save_last_ui_run,
+    save_segment_runs,
+    save_worker_status,
+)
 
 
 SEGMENT_DEFAULTS = {
@@ -24,9 +31,30 @@ SEGMENT_DEFAULTS = {
 
 BINANCE_DECISION_SECONDS = 30
 WORKER_SLEEP_SECONDS = 1.0
+WORKER_HEARTBEAT_SECONDS = 10.0
 
 _worker_lock = threading.Lock()
 _worker_started = False
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def should_start_embedded_worker() -> bool:
+    return _env_flag("SIRTRADE_ENABLE_EMBEDDED_WORKER", True)
+
+
+def _write_worker_status(**fields: Any) -> None:
+    payload = {
+        "worker_enabled": True,
+        "heartbeat_at": pd.Timestamp.utcnow(),
+        **fields,
+    }
+    save_worker_status(payload)
 
 
 def _extract_slot_delta(action: str, entry: bool) -> int:
@@ -268,8 +296,16 @@ def _run_worker_loop() -> None:
     init_db()
     engines = _build_engines()
     worker_state: dict[str, Any] = {"last_run_by_segment": {}, "segment_cursor": 0, "reset_token": None}
+    last_heartbeat_write = 0.0
+
+    _write_worker_status(status="starting", message="Worker booting")
 
     while True:
+        now = time.time()
+        if (now - last_heartbeat_write) >= WORKER_HEARTBEAT_SECONDS:
+            _write_worker_status(status="idle", message="Worker heartbeat")
+            last_heartbeat_write = now
+
         runtime_state = load_runtime_state()
         segment_runs = load_segment_runs()
         _hydrate_engines_from_saved_runs(engines, segment_runs)
@@ -295,7 +331,6 @@ def _run_worker_loop() -> None:
             if bool(simulation_running_by_segment.get(segment, False))
         ]
 
-        now = time.time()
         selected_segments = _choose_segments(runnable_segments, active_segment, worker_state, data_source)
         updated_segment_runs = dict(segment_runs)
 
@@ -306,6 +341,14 @@ def _run_worker_loop() -> None:
 
             cfg = SEGMENT_DEFAULTS[segment]
             try:
+                _write_worker_status(
+                    status="running",
+                    active_segment=segment,
+                    market_source=data_source,
+                    symbol=symbol,
+                    interval=str(cfg["interval"]),
+                    message=f"Running segment {segment}",
+                )
                 result = run_segment_cycle(
                     engine=engines[segment],
                     segment=segment,
@@ -333,10 +376,34 @@ def _run_worker_loop() -> None:
                     save_last_ui_run(result)
 
                 worker_state["last_run_by_segment"][segment] = now
+                _write_worker_status(
+                    status="ok",
+                    active_segment=segment,
+                    market_source=data_source,
+                    symbol=symbol,
+                    interval=str(cfg["interval"]),
+                    last_success_at=pd.Timestamp.utcnow(),
+                    last_completed_week=result.get("week"),
+                    message=f"Completed segment {segment}",
+                )
+                last_heartbeat_write = time.time()
             except Exception as exc:
+                _write_worker_status(
+                    status="error",
+                    active_segment=segment,
+                    market_source=data_source,
+                    symbol=symbol,
+                    interval=str(cfg["interval"]),
+                    last_error_at=pd.Timestamp.utcnow(),
+                    message=str(exc),
+                )
                 print(f"[WORKER][ERROR] segment={segment}: {exc}")
 
         time.sleep(WORKER_SLEEP_SECONDS)
+
+
+def serve_live_worker() -> None:
+    _run_worker_loop()
 
 
 def ensure_live_worker_started() -> None:

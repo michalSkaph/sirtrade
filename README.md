@@ -80,22 +80,23 @@ docker compose up -d --build
 
 Tím se spustí:
 - `sirtrade-ui` na portu `8501`
-- `sirtrade-runner` (automatizační worker každých 15 minut)
-- `sirtrade-health` na portu `8080` (`/health`, `/status`)
+- `sirtrade-worker` jako samostatný 24/7 worker pro live vyhodnocení trhu
+- `sirtrade-health` na portu `8080` (`/health`, `/market-chart`)
 
-### 2) Změna intervalu workeru
-Uprav v `docker-compose.yml` proměnnou `SIRTRADE_INTERVAL_MINUTES`.
+### 2) Jak běží live worker
+- UI už v Dockeru worker nespouští samo.
+- Live logika běží pouze v kontejneru `sirtrade-worker`.
+- Worker pro Binance režimy polluje trh každých 30 sekund a vstupy vyhodnocuje jen na nově uzavřené svíčce.
 
 ### 3) Kontrola logů
 ```bash
-docker compose logs -f sirtrade-runner
+docker compose logs -f sirtrade-worker
 docker compose logs -f sirtrade-ui
 docker compose logs -f sirtrade-health
 ```
 
 ### 4) Health endpointy
-- `http://<server>:8080/health` — rychlý stav služby (200 = OK, 503 = degraded)
-- `http://<server>:8080/status` — poslední detailní stav automatizačního běhu
+- `http://<server>:8080/health` — stav health serveru + čerstvost heartbeat workeru (200 = OK, 503 = degraded)
 - `http://<server>:8080/market-chart?symbol=BTCUSDT&interval=1m&limit=300` — JSON feed pro live OHLC graf bez refresh blikání UI
 
 ### 5) Úpravy z VS Code

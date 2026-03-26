@@ -14,6 +14,7 @@ import pandas as pd
 UI_STATE_FILE = Path("data/ui_last_run.json")
 UI_RUNTIME_FILE = Path("data/ui_runtime_state.json")
 UI_SEGMENT_STATE_FILE = Path("data/ui_segment_runs.json")
+WORKER_STATUS_FILE = Path("data/worker_status.json")
 
 
 def _write_json_atomic(file_path: Path, payload: Any) -> None:
@@ -250,5 +251,19 @@ def load_runtime_state(file_path: Path = UI_RUNTIME_FILE) -> dict[str, Any]:
 
 
 def clear_runtime_state(file_path: Path = UI_RUNTIME_FILE) -> None:
+    if file_path.exists():
+        file_path.unlink()
+
+
+def save_worker_status(status: dict[str, Any], file_path: Path = WORKER_STATUS_FILE) -> None:
+    _write_json_atomic(file_path, _sanitize_json(status))
+
+
+def load_worker_status(file_path: Path = WORKER_STATUS_FILE) -> dict[str, Any]:
+    data = _load_json_resilient(file_path, {})
+    return data if isinstance(data, dict) else {}
+
+
+def clear_worker_status(file_path: Path = WORKER_STATUS_FILE) -> None:
     if file_path.exists():
         file_path.unlink()

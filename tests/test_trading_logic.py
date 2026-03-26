@@ -14,8 +14,11 @@ from src.sirtrade.execution import build_dry_run_orders
 from src.sirtrade.engine import ModelResult
 from src.sirtrade.live_worker import _apply_trade_cutoff
 from src.sirtrade.copy_trading import LeadTraderProfile, select_best_lead_trader
+from src.sirtrade.health_server import _build_worker_health_payload
+from src.sirtrade.live_worker import _apply_trade_cutoff, should_start_embedded_worker
 from src.sirtrade.models import ModelSpec
 from src.sirtrade.storage import clear_trade_history, init_db, load_open_positions, save_open_positions
+from src.sirtrade.ui_state import load_worker_status, save_worker_status
 
 
 def _build_market_frame() -> pd.DataFrame:
@@ -69,6 +72,34 @@ def _build_flat_market_frame() -> pd.DataFrame:
 
 
 class TradingLogicTests(unittest.TestCase):
+    def test_embedded_worker_can_be_disabled_by_env(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertTrue(should_start_embedded_worker())
+
+        with patch.dict("os.environ", {"SIRTRADE_ENABLE_EMBEDDED_WORKER": "0"}, clear=True):
+            self.assertFalse(should_start_embedded_worker())
+
+    def test_worker_health_payload_reports_fresh_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "worker_status.json"
+            save_worker_status(
+                {
+                    "status": "ok",
+                    "heartbeat_at": pd.Timestamp.now(tz="UTC"),
+                    "message": "healthy",
+                },
+                file_path=status_path,
+            )
+
+            saved = load_worker_status(file_path=status_path)
+            self.assertEqual(saved.get("status"), "ok")
+
+            with patch("src.sirtrade.health_server.load_worker_status", return_value=saved):
+                is_fresh, payload = _build_worker_health_payload()
+
+            self.assertTrue(is_fresh)
+            self.assertTrue(bool(payload["worker"]["fresh"]))
+            self.assertEqual(payload["worker"]["status"], "ok")
     def test_live_cycle_blocks_duplicate_symbol_side_exposure_across_models(self) -> None:
         engine = TradingEngine()
         engine.models = [
