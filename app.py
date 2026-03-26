@@ -202,6 +202,19 @@ def _split_datetime_column(frame: pd.DataFrame, source_column: str, label_prefix
     return out
 
 
+def _format_datetime_column(frame: pd.DataFrame, source_column: str, label: str) -> pd.DataFrame:
+    """Replace a datetime column with a single 'dd.mm.yy · HH:MM' string."""
+    if source_column not in frame.columns:
+        return frame
+    out = frame.copy()
+    timestamps = pd.to_datetime(out[source_column], errors="coerce")
+    formatted = timestamps.dt.strftime("%d.%m.%y  ·  %H:%M").where(timestamps.notna(), "–")
+    insert_at = out.columns.get_loc(source_column)
+    out.insert(insert_at, label, formatted)
+    out = out.drop(columns=[source_column])
+    return out
+
+
 def _compute_trade_levels(entry_price: float, side: str, vol: float) -> tuple[float, float]:
     normalized_side = str(side).upper()
     normalized_vol = float(vol)
@@ -1769,10 +1782,15 @@ else:
                     filtered["pnl_status"] = filtered["pnl_status"].astype(str).str.upper()
                     filtered["side"] = filtered["side"].astype(str).str.upper().replace({"BUY": "LONG", "SELL": "SHORT"})
 
+                    # Compute financial PnL column before renaming
+                    slots = pd.to_numeric(filtered["quantity_slots"], errors="coerce").fillna(0.0).abs()
+                    pnl_pct_vals = pd.to_numeric(filtered["pnl_pct"], errors="coerce").fillna(0.0)
+                    filtered["pnl_czk"] = (slots * float(PAPER_TRADE_SIZE_CZK) * (pnl_pct_vals / 100.0)).round(1)
+
                     overview = filtered.rename(
                         columns={
-                            "closed_at": "Uzavřeno",
                             "opened_at": "Otevřeno",
+                            "closed_at": "Uzavřeno",
                             "model_id": "ID modelu",
                             "model_name": "Model",
                             "symbol": "Symbol",
@@ -1781,6 +1799,7 @@ else:
                             "exit_price": "Výstupní cena",
                             "quantity_slots": "Sloty",
                             "pnl_pct": "PnL %",
+                            "pnl_czk": "PnL CZK",
                             "pnl_status": "Výsledek",
                             "market_source": "Zdroj dat",
                             "week": "Týden",
@@ -1790,8 +1809,21 @@ else:
                     if "exit_reason" in overview.columns:
                         overview = overview.drop(columns=["exit_reason"])
                     overview["Zdroj dat"] = overview["Zdroj dat"].replace({"simulation": "Simulace", "binance": "Binance"})
-                    overview = _split_datetime_column(overview, "Uzavřeno", "Uzavřeno")
-                    overview = _split_datetime_column(overview, "Otevřeno", "Otevřeno")
+
+                    # Format datetimes: combine date+time, opened first
+                    overview = _format_datetime_column(overview, "Otevřeno", "Otevřeno")
+                    overview = _format_datetime_column(overview, "Uzavřeno", "Uzavřeno")
+
+                    # Ensure column order: Otevřeno → Uzavřeno → rest
+                    desired_order = [
+                        "Otevřeno", "Uzavřeno", "Model", "Symbol", "Směr",
+                        "Vstupní cena", "Výstupní cena", "Sloty",
+                        "PnL %", "PnL CZK", "Výsledek",
+                        "Zdroj dat", "Týden", "Generace", "ID modelu",
+                    ]
+                    ordered_cols = [c for c in desired_order if c in overview.columns]
+                    remaining_cols = [c for c in overview.columns if c not in ordered_cols]
+                    overview = overview[ordered_cols + remaining_cols]
 
                     win_rate_label, avg_pnl_label, _, _, _ = _compute_closed_position_metrics(filtered)
                     m1, m2, m3 = st.columns(3)
@@ -1809,13 +1841,25 @@ else:
                     def _style_pnl(value):
                         if pd.isna(value):
                             return ""
-                        if float(value) > 0:
+                        try:
+                            v = float(value)
+                        except (TypeError, ValueError):
+                            return ""
+                        if v > 0:
                             return "background-color: #14532d; color: #dcfce7;"
-                        if float(value) < 0:
+                        if v < 0:
                             return "background-color: #7f1d1d; color: #fee2e2;"
                         return ""
 
-                    styled_overview = overview.style.map(_style_result, subset=["Výsledek"]).map(_style_pnl, subset=["PnL %"])
+                    def _style_datetime(value):
+                        return "color: #9ca3af;"
+
+                    styled_overview = (
+                        overview.style
+                        .map(_style_result, subset=["Výsledek"])
+                        .map(_style_pnl, subset=["PnL %", "PnL CZK"])
+                        .map(_style_datetime, subset=[c for c in ["Otevřeno", "Uzavřeno"] if c in overview.columns])
+                    )
                     st.dataframe(styled_overview, use_container_width=True)
 
     if st.session_state.active_view == "Grafy":
