@@ -542,68 +542,95 @@ class TradingLogicTests(unittest.TestCase):
         self.assertEqual({order["symbol"] for order in summary["proposed_orders"]}, {"BTCUSDT", "ETHUSDT"})
 
     def test_live_cycle_does_not_reopen_position_each_worker_tick(self) -> None:
+        """Entry fires only when bar changes; same bar = no new entry."""
         engine = TradingEngine()
         engine.models = [ModelSpec("M1", "Trend", "trend_vol", 1)]
-        market = _build_market_frame()
-        universe = pd.DataFrame([{"symbol": "BTCUSDT", "opportunity_score": 1.0}])
-        strong_signal = pd.Series(1.0, index=market.index)
+        market_a = _build_market_frame()
+        # market_b has one extra bar at the end → different last-bar timestamp
+        extra_idx = market_a.index[-1] + pd.Timedelta(hours=1)
+        extra_row = market_a.iloc[[-1]].copy()
+        extra_row.index = pd.DatetimeIndex([extra_idx])
+        market_b = pd.concat([market_a, extra_row])
 
+        universe = pd.DataFrame([{"symbol": "BTCUSDT", "opportunity_score": 1.0}])
+
+        # Cycle 1: first ever run → seeds last_bar_ts, no entry (no prior bar to compare)
         with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
-            "src.sirtrade.engine.get_market_data", return_value=market
-        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
-            "src.sirtrade.engine.generate_signals", return_value=strong_signal
-        ):
-            first_summary = engine.run_week(days=7, market_source="binance", symbol="BTCUSDT", interval="15m")
-            second_summary = engine.run_week(
-                days=7,
-                market_source="binance",
-                symbol="BTCUSDT",
-                interval="15m",
-                previous_summary=first_summary,
+            "src.sirtrade.engine.get_market_data", return_value=market_a
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None):
+            first = engine.run_week(days=7, market_source="binance", symbol="BTCUSDT", interval="15m")
+
+        self.assertEqual(len(first["trade_events_delta"]["M1"]), 0, "First cycle must not enter (no prior bar)")
+        self.assertTrue(first["live_model_state"]["M1"].get("last_bar_ts"), "last_bar_ts must be seeded")
+
+        # Clear market-data cache so cycle 2 sees market_b
+        engine._live_snapshot_cache.clear()
+
+        # Cycle 2: new bar (market_b) → entry should fire
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market_b
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None):
+            second = engine.run_week(
+                days=7, market_source="binance", symbol="BTCUSDT", interval="15m",
+                previous_summary=first,
             )
 
-        self.assertTrue(first_summary["trade_events_delta"]["M1"])
-        self.assertEqual(len(second_summary["trade_events_delta"]["M1"]), 0)
-        self.assertEqual(len(second_summary["model_trades"]["M1"]), len(first_summary["model_trades"]["M1"]))
-        self.assertGreater(second_summary["final_open_slots"]["M1"], 0)
+        self.assertTrue(second["trade_events_delta"]["M1"], "New bar must trigger entry")
+        self.assertGreater(second["final_open_slots"]["M1"], 0)
+
+        # Cycle 3: same bar (market_b again) → no new entry
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market_b
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None):
+            third = engine.run_week(
+                days=7, market_source="binance", symbol="BTCUSDT", interval="15m",
+                previous_summary=second,
+            )
+
+        self.assertEqual(len(third["trade_events_delta"]["M1"]), 0, "Same bar must not trigger entry")
+        self.assertGreater(third["final_open_slots"]["M1"], 0, "Position must remain open")
 
     def test_same_bar_does_not_trigger_new_entry(self) -> None:
-        """No new entry should fire when the last bar timestamp has not changed."""
+        """Even with entry_armed=True and strong signal, same bar = no entry."""
         engine = TradingEngine()
         engine.models = [ModelSpec("M1", "Trend", "trend_vol", 1)]
         market = _build_market_frame()
         universe = pd.DataFrame([{"symbol": "BTCUSDT", "opportunity_score": 1.0}])
         strong_signal = pd.Series(1.0, index=market.index)
 
+        # Build a fake previous_summary with last_bar_ts matching current market's last bar
+        last_ts = market.index[-1]
+        ts_key = last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts)
+        prev = {
+            "model_trades": {"M1": []},
+            "live_model_state": {
+                "M1": {
+                    "entry_armed": True,
+                    "last_bar_ts": ts_key,
+                    "symbol": "BTCUSDT",
+                    "side": "",
+                    "open_slots": 0,
+                    "entry_price": 0.0,
+                    "opened_at": None,
+                    "stop_price": 0.0,
+                    "target_price": 0.0,
+                }
+            },
+            "model_open_positions": {"M1": []},
+        }
+
         with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
             "src.sirtrade.engine.get_market_data", return_value=market
         ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
             "src.sirtrade.engine.generate_signals", return_value=strong_signal
         ):
-            first = engine.run_week(days=7, market_source="binance", symbol="BTCUSDT", interval="5m")
-
-        # Simulate position was closed (hit stop) — entry_armed is now False.
-        # Feed the SAME market data again (same bar) with entry_armed=True to test
-        # that same-bar detection prevents a fresh entry.
-        prev = dict(first)
-        for mid in prev.get("live_model_state", {}):
-            prev["live_model_state"][mid]["entry_armed"] = True
-            prev["live_model_state"][mid]["open_slots"] = 0
-            prev["live_model_state"][mid]["side"] = ""
-
-        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
-            "src.sirtrade.engine.get_market_data", return_value=market
-        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
-            "src.sirtrade.engine.generate_signals", return_value=strong_signal
-        ):
-            second = engine.run_week(
+            result = engine.run_week(
                 days=7, market_source="binance", symbol="BTCUSDT", interval="5m",
                 previous_summary=prev,
             )
 
-        # Same bar ⇒ no entry events should fire, even though entry_armed=True and signal is strong
-        self.assertEqual(len(second["trade_events_delta"]["M1"]), 0)
-        self.assertEqual(second["final_open_slots"]["M1"], 0)
+        self.assertEqual(len(result["trade_events_delta"]["M1"]), 0)
+        self.assertEqual(result["final_open_slots"]["M1"], 0)
 
 
 if __name__ == "__main__":

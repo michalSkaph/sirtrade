@@ -920,8 +920,8 @@ class TradingEngine:
 
             ts = market.index[-1]
             ts_key = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
-            prev_last_bar_ts = str(previous_state.get("last_bar_ts", ""))
-            bar_is_new = ts_key != prev_last_bar_ts
+            prev_last_bar_ts = str(previous_state.get("last_bar_ts") or "")
+            bar_is_new = bool(prev_last_bar_ts) and ts_key != prev_last_bar_ts
 
             close_price = float(pd.to_numeric(market["close"], errors="coerce").iloc[-1])
             high_price = float(pd.to_numeric(market["high"], errors="coerce").iloc[-1])

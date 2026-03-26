@@ -203,15 +203,16 @@ def _split_datetime_column(frame: pd.DataFrame, source_column: str, label_prefix
 
 
 def _format_datetime_column(frame: pd.DataFrame, source_column: str, label: str) -> pd.DataFrame:
-    """Replace a datetime column with a single 'dd.mm.yy · HH:MM' string."""
+    """Replace a datetime column with a single 'dd.mm.yy · HH:MM' string in Europe/Prague tz."""
     if source_column not in frame.columns:
         return frame
     out = frame.copy()
-    timestamps = pd.to_datetime(out[source_column], errors="coerce")
-    formatted = timestamps.dt.strftime("%d.%m.%y  ·  %H:%M").where(timestamps.notna(), "–")
-    insert_at = out.columns.get_loc(source_column)
-    out.insert(insert_at, label, formatted)
-    out = out.drop(columns=[source_column])
+    timestamps = pd.to_datetime(out[source_column], errors="coerce", utc=True)
+    local_ts = timestamps.dt.tz_convert("Europe/Prague")
+    formatted = local_ts.dt.strftime("%d.%m.%y  ·  %H:%M").where(local_ts.notna(), "–")
+    out[source_column] = formatted
+    if source_column != label:
+        out = out.rename(columns={source_column: label})
     return out
 
 
