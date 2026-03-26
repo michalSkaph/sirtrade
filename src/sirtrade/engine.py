@@ -918,23 +918,14 @@ class TradingEngine:
                 live_model_state[model_id] = {"entry_armed": True}
                 continue
 
-            raw = generate_signals(model, market, seed=0)
-            controlled_signal = apply_risk_controls(raw, market["ret"], self.config.risk)
-            confluence, required_votes, reset_votes, atr_pct = self._build_entry_confluence(model, market, controlled_signal)
-            _, _, min_stop_floor, signal_reset_floor = self._trade_profile(model)
-
             ts = market.index[-1]
-            signal_value = float(controlled_signal.loc[ts])
-            long_votes = int(confluence.loc[ts, "long_votes"])
-            short_votes = int(confluence.loc[ts, "short_votes"])
-            long_confidence = float(confluence.loc[ts, "long_confidence"])
-            short_confidence = float(confluence.loc[ts, "short_confidence"])
+            ts_key = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+            prev_last_bar_ts = str(previous_state.get("last_bar_ts", ""))
+            bar_is_new = ts_key != prev_last_bar_ts
+
             close_price = float(pd.to_numeric(market["close"], errors="coerce").iloc[-1])
             high_price = float(pd.to_numeric(market["high"], errors="coerce").iloc[-1])
             low_price = float(pd.to_numeric(market["low"], errors="coerce").iloc[-1])
-            vol_step = float(atr_pct.loc[ts])
-            if np.isnan(vol_step) or vol_step <= 0:
-                vol_step = min_stop_floor
 
             entry_armed = bool(previous_state.get("entry_armed", True))
             prev_open_slots = int(previous_state.get("open_slots", 0) or 0)
@@ -952,6 +943,7 @@ class TradingEngine:
             current_opened_at = prev_opened_at
             current_symbol = active_symbol if prev_open_slots > 0 else str(result.symbol).upper()
 
+            # --- EXIT logic: always evaluate (stop/target can be hit intra-bar) ---
             if current_open_slots > 0 and current_side in {"LONG", "SHORT"}:
                 hit_exit = False
                 exit_reason = None
@@ -996,7 +988,23 @@ class TradingEngine:
                     current_opened_at = None
                     current_symbol = str(result.symbol).upper()
                     entry_armed = False
-            else:
+
+            # --- ENTRY logic: only on NEW bars (closed candle boundary) ---
+            elif bar_is_new:
+                raw = generate_signals(model, market, seed=0)
+                controlled_signal = apply_risk_controls(raw, market["ret"], self.config.risk)
+                confluence, required_votes, reset_votes, atr_pct = self._build_entry_confluence(model, market, controlled_signal)
+                _, _, min_stop_floor, signal_reset_floor = self._trade_profile(model)
+
+                signal_value = float(controlled_signal.loc[ts])
+                long_votes = int(confluence.loc[ts, "long_votes"])
+                short_votes = int(confluence.loc[ts, "short_votes"])
+                long_confidence = float(confluence.loc[ts, "long_confidence"])
+                short_confidence = float(confluence.loc[ts, "short_confidence"])
+                vol_step = float(atr_pct.loc[ts])
+                if np.isnan(vol_step) or vol_step <= 0:
+                    vol_step = min_stop_floor
+
                 if not entry_armed:
                     setup_reset = max(long_votes, short_votes) <= reset_votes or abs(signal_value) <= signal_reset_floor
                     if setup_reset:
@@ -1049,6 +1057,7 @@ class TradingEngine:
             final_positions[model_id] = float(side_sign * current_open_slots * slot_size)
             live_model_state[model_id] = {
                 "entry_armed": entry_armed,
+                "last_bar_ts": ts_key,
                 "symbol": current_symbol,
                 "side": current_side,
                 "open_slots": int(current_open_slots),

@@ -567,6 +567,44 @@ class TradingLogicTests(unittest.TestCase):
         self.assertEqual(len(second_summary["model_trades"]["M1"]), len(first_summary["model_trades"]["M1"]))
         self.assertGreater(second_summary["final_open_slots"]["M1"], 0)
 
+    def test_same_bar_does_not_trigger_new_entry(self) -> None:
+        """No new entry should fire when the last bar timestamp has not changed."""
+        engine = TradingEngine()
+        engine.models = [ModelSpec("M1", "Trend", "trend_vol", 1)]
+        market = _build_market_frame()
+        universe = pd.DataFrame([{"symbol": "BTCUSDT", "opportunity_score": 1.0}])
+        strong_signal = pd.Series(1.0, index=market.index)
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
+            "src.sirtrade.engine.generate_signals", return_value=strong_signal
+        ):
+            first = engine.run_week(days=7, market_source="binance", symbol="BTCUSDT", interval="5m")
+
+        # Simulate position was closed (hit stop) — entry_armed is now False.
+        # Feed the SAME market data again (same bar) with entry_armed=True to test
+        # that same-bar detection prevents a fresh entry.
+        prev = dict(first)
+        for mid in prev.get("live_model_state", {}):
+            prev["live_model_state"][mid]["entry_armed"] = True
+            prev["live_model_state"][mid]["open_slots"] = 0
+            prev["live_model_state"][mid]["side"] = ""
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
+            "src.sirtrade.engine.generate_signals", return_value=strong_signal
+        ):
+            second = engine.run_week(
+                days=7, market_source="binance", symbol="BTCUSDT", interval="5m",
+                previous_summary=prev,
+            )
+
+        # Same bar ⇒ no entry events should fire, even though entry_armed=True and signal is strong
+        self.assertEqual(len(second["trade_events_delta"]["M1"]), 0)
+        self.assertEqual(second["final_open_slots"]["M1"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
