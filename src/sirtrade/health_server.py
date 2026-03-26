@@ -9,6 +9,8 @@ from urllib.parse import parse_qs, urlparse
 import pandas as pd
 
 from .data import fetch_binance_market
+from .market_stream import get_stream_diagnostics
+from .ui_state import load_runtime_state
 from .ui_state import load_worker_status
 
 
@@ -95,6 +97,17 @@ def _build_worker_health_payload() -> tuple[bool, dict[str, object]]:
     return fresh, payload
 
 
+def _build_status_payload() -> dict[str, object]:
+    runtime_state = load_runtime_state()
+    worker_status = load_worker_status()
+    return {
+        "runtime_state": runtime_state,
+        "worker": worker_status,
+        "market_stream": get_stream_diagnostics(),
+        "updated_at": pd.Timestamp.utcnow(),
+    }
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     def end_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -121,7 +134,11 @@ class HealthHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             worker_fresh, worker_payload = _build_worker_health_payload()
             code = 200 if worker_fresh else 503
-            self._send_json(code, {"status": "ok" if worker_fresh else "degraded", **worker_payload})
+            self._send_json(code, {"status": "ok" if worker_fresh else "degraded", **worker_payload, "market_stream": get_stream_diagnostics()})
+            return
+
+        if parsed.path == "/status":
+            self._send_json(200, _build_status_payload())
             return
 
         if parsed.path == "/market-chart":

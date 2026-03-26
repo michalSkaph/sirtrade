@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import urllib.error
+import urllib.request
 import re
 import subprocess
 import time
@@ -132,6 +134,28 @@ def _load_recent_runs_cached(limit: int) -> pd.DataFrame:
 @st.cache_data(ttl=1, show_spinner=False)
 def _fetch_binance_market_cached(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     return fetch_binance_market(symbol=symbol, interval=interval, limit=limit)
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def _fetch_platform_status_cached(health_port: int) -> dict[str, object]:
+    base_url = f"http://127.0.0.1:{health_port}"
+    payload: dict[str, object] = {"health": None, "status": None, "error": None}
+
+    for key, path in (("health", "/health"), ("status", "/status")):
+        try:
+            with urllib.request.urlopen(f"{base_url}{path}", timeout=2) as response:
+                payload[key] = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="ignore")
+            try:
+                payload[key] = json.loads(body) if body else {"status": "http_error", "code": exc.code}
+            except json.JSONDecodeError:
+                payload[key] = {"status": "http_error", "code": exc.code, "detail": body}
+        except Exception as exc:
+            payload["error"] = str(exc)
+            break
+
+    return payload
 
 
 def _save_runtime_state_if_changed(state: dict[str, object]) -> None:
@@ -1297,9 +1321,39 @@ status_symbol = (
     else "Simulační Top 20"
 )
 status_interval = SEGMENT_DEFAULTS.get(st.session_state.active_segment, SEGMENT_DEFAULTS["Swing"])["interval"]
+health_port = int(os.getenv("SIRTRADE_HEALTH_PORT", str(DEFAULT_HEALTH_PORT)))
+platform_status = _fetch_platform_status_cached(health_port)
+health_payload = platform_status.get("health") if isinstance(platform_status, dict) else None
+status_payload = platform_status.get("status") if isinstance(platform_status, dict) else None
+
+if isinstance(health_payload, dict):
+    worker_payload = health_payload.get("worker", {}) if isinstance(health_payload.get("worker"), dict) else {}
+    if health_payload.get("status") != "ok":
+        st.error(
+            "Worker je degradovaný nebo bez heartbeat. "
+            f"Stáří heartbeat: {worker_payload.get('heartbeat_age_seconds', 'N/A')} s. "
+            f"Detail: {worker_payload.get('message') or worker_payload.get('detail') or 'neznámý'}"
+        )
+    elif worker_payload.get("fresh") is False:
+        st.warning("Worker heartbeat není čerstvý. Live vyhodnocení může být opožděné.")
+elif platform_status.get("error"):
+    st.error(f"Health endpoint není dostupný: {platform_status['error']}")
 
 with st.sidebar:
     st.header("Nastavení")
+    if isinstance(health_payload, dict):
+        worker_payload = health_payload.get("worker", {}) if isinstance(health_payload.get("worker"), dict) else {}
+        market_stream = health_payload.get("market_stream", {}) if isinstance(health_payload.get("market_stream"), dict) else {}
+        st.markdown("---")
+        st.subheader("Runtime stav")
+        st.write(f"Worker: {worker_payload.get('status', 'N/A')}")
+        st.write(f"Heartbeat age: {worker_payload.get('heartbeat_age_seconds', 'N/A')} s")
+        st.write(f"Streamy: {market_stream.get('stream_count', 0)}")
+        if isinstance(status_payload, dict):
+            worker_status = status_payload.get("worker", {}) if isinstance(status_payload.get("worker"), dict) else {}
+            if worker_status.get("active_segment"):
+                st.write(f"Aktivní segment workeru: {worker_status['active_segment']}")
+
     if st.session_state.active_segment not in ["Scalp", "Intraday", "Swing"]:
         st.session_state.active_segment = "Swing"
     st.session_state.active_segment = st.selectbox(

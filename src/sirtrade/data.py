@@ -7,6 +7,8 @@ from urllib.request import urlopen
 import numpy as np
 import pandas as pd
 
+from .market_stream import merge_rest_market_with_stream
+
 
 BINANCE_BASE_URL = "https://api.binance.com"
 
@@ -116,7 +118,7 @@ def fetch_binance_market(symbol: str = "BTCUSDT", interval: str = "1d", limit: i
         },
         index=pd.to_datetime(frame[0], unit="ms", utc=True),
     )
-    return out
+    return merge_rest_market_with_stream(out, symbol=symbol, interval=interval)
 
 
 def get_market_data(source: str, days: int, symbol: str, seed: int, interval: str = "1d") -> pd.DataFrame:

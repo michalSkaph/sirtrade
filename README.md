@@ -97,7 +97,13 @@ docker compose logs -f sirtrade-health
 
 ### 4) Health endpointy
 - `http://<server>:8080/health` — stav health serveru + čerstvost heartbeat workeru (200 = OK, 503 = degraded)
+- `http://<server>:8080/status` — detail runtime stavu workeru, runtime_state a diagnostika Binance streamů
 - `http://<server>:8080/market-chart?symbol=BTCUSDT&interval=1m&limit=300` — JSON feed pro live OHLC graf bez refresh blikání UI
+
+### 5) Live data vrstva
+- Historie OHLC se dál bere přes Binance REST klines.
+- Poslední aktivní kline se průběžně doplňuje přes Binance websocket streamy, pokud jsou dostupné.
+- Při výpadku websocketu systém automaticky fallbackne na REST bez zastavení workeru.
 
 ### 5) Úpravy z VS Code
 - Doporučení: Git workflow (lokální změna -> push -> pull/redeploy na VPS).

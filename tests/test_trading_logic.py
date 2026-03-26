@@ -9,13 +9,14 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
+from src.sirtrade.data import simulate_market
 from src.sirtrade.engine import TradingEngine
-from src.sirtrade.execution import build_dry_run_orders
 from src.sirtrade.engine import ModelResult
-from src.sirtrade.live_worker import _apply_trade_cutoff
+from src.sirtrade.execution import build_dry_run_orders
 from src.sirtrade.copy_trading import LeadTraderProfile, select_best_lead_trader
 from src.sirtrade.health_server import _build_worker_health_payload
 from src.sirtrade.live_worker import _apply_trade_cutoff, should_start_embedded_worker
+from src.sirtrade.market_stream import apply_stream_kline_to_market
 from src.sirtrade.models import ModelSpec
 from src.sirtrade.storage import clear_trade_history, init_db, load_open_positions, save_open_positions
 from src.sirtrade.ui_state import load_worker_status, save_worker_status
@@ -72,6 +73,25 @@ def _build_flat_market_frame() -> pd.DataFrame:
 
 
 class TradingLogicTests(unittest.TestCase):
+    def test_apply_stream_kline_to_market_appends_new_bar(self) -> None:
+        market = simulate_market(days=2, seed=7, interval="1h").tail(5)
+        last_ts = market.index[-1]
+        next_ts = last_ts + pd.Timedelta(hours=1)
+        merged = apply_stream_kline_to_market(
+            market,
+            {
+                "open_time": int(next_ts.timestamp() * 1000),
+                "open": 123.0,
+                "high": 125.0,
+                "low": 122.0,
+                "close": 124.0,
+            },
+        )
+
+        self.assertEqual(len(merged), len(market) + 1)
+        self.assertAlmostEqual(float(merged.loc[next_ts, "close"]), 124.0)
+        self.assertIn("ret", merged.columns)
+
     def test_embedded_worker_can_be_disabled_by_env(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             self.assertTrue(should_start_embedded_worker())
