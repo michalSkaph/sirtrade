@@ -148,6 +148,7 @@ SIMULATION_WEEKS_PER_CYCLE = 1
 FIXED_LIVE_REFRESH_SECONDS = 2
 FIXED_SIMULATION_CYCLE_SECONDS = 10
 FIXED_BINANCE_DECISION_SECONDS = 30
+PRAGUE_TIMEZONE = "Europe/Prague"
 
 
 def _report_paths_from_summary(summary: dict[str, object] | None) -> dict[str, str]:
@@ -189,12 +190,24 @@ def _reset_summary_trade_state(summary: dict[str, object] | None) -> dict[str, o
     return reset_summary
 
 
+def _to_prague_timestamps(values: object) -> pd.Series:
+    timestamps = pd.to_datetime(values, errors="coerce", utc=True)
+    return timestamps.dt.tz_convert(PRAGUE_TIMEZONE)
+
+
+def _format_prague_timestamp(value: object, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    timestamp = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(timestamp):
+        return "–"
+    return timestamp.tz_convert(PRAGUE_TIMEZONE).strftime(fmt)
+
+
 def _split_datetime_column(frame: pd.DataFrame, source_column: str, label_prefix: str) -> pd.DataFrame:
     if source_column not in frame.columns:
         return frame
 
     out = frame.copy()
-    timestamps = pd.to_datetime(out[source_column], errors="coerce")
+    timestamps = _to_prague_timestamps(out[source_column])
     insert_at = out.columns.get_loc(source_column)
     out.insert(insert_at, f"{label_prefix} - Datum", timestamps.dt.strftime("%d.%m.%y").where(timestamps.notna(), None))
     out.insert(insert_at + 1, f"{label_prefix} - Čas", timestamps.dt.strftime("%H:%M").where(timestamps.notna(), None))
@@ -207,8 +220,7 @@ def _format_datetime_column(frame: pd.DataFrame, source_column: str, label: str)
     if source_column not in frame.columns:
         return frame
     out = frame.copy()
-    timestamps = pd.to_datetime(out[source_column], errors="coerce", utc=True)
-    local_ts = timestamps.dt.tz_convert("Europe/Prague")
+    local_ts = _to_prague_timestamps(out[source_column])
     formatted = local_ts.dt.strftime("%d.%m.%y  ·  %H:%M").where(local_ts.notna(), "–")
     out[source_column] = formatted
     if source_column != label:
@@ -634,10 +646,10 @@ def _load_segment_closed_positions(segment: str, limit: int = CLOSED_POSITIONS_L
         return segment_closed
 
     if "closed_at" in segment_closed.columns:
-        segment_closed["closed_at"] = pd.to_datetime(segment_closed["closed_at"], errors="coerce")
+        segment_closed["closed_at"] = pd.to_datetime(segment_closed["closed_at"], errors="coerce", utc=True)
         segment_closed = segment_closed[segment_closed["closed_at"].notna()].copy()
     if "opened_at" in segment_closed.columns:
-        segment_closed["opened_at"] = pd.to_datetime(segment_closed["opened_at"], errors="coerce")
+        segment_closed["opened_at"] = pd.to_datetime(segment_closed["opened_at"], errors="coerce", utc=True)
     if "pnl_pct" in segment_closed.columns:
         segment_closed["pnl_pct"] = pd.to_numeric(segment_closed["pnl_pct"], errors="coerce")
     return segment_closed
@@ -1001,7 +1013,7 @@ def _render_graph_view_body() -> None:
 
     open_legs: list[dict] = []
     if not trades_df.empty and {"timestamp", "akce", "strana", "cena"}.issubset(trades_df.columns):
-        trades_df["timestamp"] = pd.to_datetime(trades_df["timestamp"], errors="coerce")
+        trades_df["timestamp"] = pd.to_datetime(trades_df["timestamp"], errors="coerce", utc=True)
         trades_df = trades_df[trades_df["timestamp"].notna()].sort_values("timestamp")
         for _, event in trades_df.iterrows():
             action = str(event.get("akce", ""))
@@ -1040,7 +1052,7 @@ def _render_graph_view_body() -> None:
 
     position_options = []
     for idx, leg in enumerate(open_legs, start=1):
-        entry_time = pd.to_datetime(leg["entry_time"]).strftime("%Y-%m-%d %H:%M")
+        entry_time = _format_prague_timestamp(leg["entry_time"])
         leg_symbol = str(leg.get("symbol", latest["symbol"])).upper()
         label = f"{leg_symbol} | {leg['side']} | pozice #{idx} | vstup {entry_time}"
         position_options.append((idx - 1, label))
