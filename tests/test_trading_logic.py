@@ -69,6 +69,66 @@ def _build_flat_market_frame() -> pd.DataFrame:
 
 
 class TradingLogicTests(unittest.TestCase):
+    def test_live_cycle_blocks_duplicate_symbol_side_exposure_across_models(self) -> None:
+        engine = TradingEngine()
+        engine.models = [
+            ModelSpec("M1", "Trend", "trend_vol", 1),
+            ModelSpec("M2", "Momentum", "xsec_momentum", 1),
+        ]
+        market_a = _build_market_frame()
+        extra_idx = market_a.index[-1] + pd.Timedelta(hours=1)
+        extra_row = market_a.iloc[[-1]].copy()
+        extra_row.index = pd.DatetimeIndex([extra_idx])
+        market_b = pd.concat([market_a, extra_row])
+        universe = pd.DataFrame([{"symbol": "BTCUSDT", "opportunity_score": 1.0}])
+
+        def _mock_confluence(model, market, controlled_signal):
+            index = market.index
+            confluence = pd.DataFrame(
+                {
+                    "long_votes": [6] * len(index),
+                    "short_votes": [0] * len(index),
+                    "long_confidence": [0.8] * len(index),
+                    "short_confidence": [0.0] * len(index),
+                },
+                index=index,
+            )
+            atr_pct = pd.Series(0.01, index=index)
+            return confluence, 5, 2, atr_pct
+
+        strong_signal_a = pd.Series(1.0, index=market_a.index)
+        strong_signal_b = pd.Series(1.0, index=market_b.index)
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market_a
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
+            "src.sirtrade.engine.generate_signals", return_value=strong_signal_a
+        ), patch.object(TradingEngine, "_build_entry_confluence", side_effect=_mock_confluence):
+            first = engine.run_week(days=7, market_source="binance", symbol="BTCUSDT", interval="15m")
+
+        self.assertEqual(first["final_open_slots"]["M1"], 0)
+        self.assertEqual(first["final_open_slots"]["M2"], 0)
+
+        engine._live_snapshot_cache.clear()
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market_b
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
+            "src.sirtrade.engine.generate_signals", return_value=strong_signal_b
+        ), patch.object(TradingEngine, "_build_entry_confluence", side_effect=_mock_confluence):
+            second = engine.run_week(
+                days=7,
+                market_source="binance",
+                symbol="BTCUSDT",
+                interval="15m",
+                previous_summary=first,
+            )
+
+        self.assertTrue(second["trade_events_delta"]["M1"])
+        self.assertEqual(second["final_open_slots"]["M1"], 4)
+        self.assertEqual(second["trade_events_delta"]["M2"], [])
+        self.assertEqual(second["final_open_slots"]["M2"], 0)
+
     def test_init_db_is_idempotent_and_normalizes_legacy_sides(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "sirtrade.db"

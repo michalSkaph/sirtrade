@@ -870,6 +870,19 @@ class TradingEngine:
         final_open_slots: dict[str, int] = {}
         model_open_positions: dict[str, list[dict[str, Any]]] = {}
         live_model_state: dict[str, dict[str, Any]] = {}
+        active_exposures: set[tuple[str, str]] = set()
+
+        if isinstance(previous_summary, dict):
+            previous_live_state = previous_summary.get("live_model_state", {})
+            if isinstance(previous_live_state, dict):
+                for state in previous_live_state.values():
+                    if not isinstance(state, dict):
+                        continue
+                    side = str(state.get("side", "")).upper()
+                    symbol = str(state.get("symbol", "")).upper()
+                    open_slots = int(state.get("open_slots", 0) or 0)
+                    if side in {"LONG", "SHORT"} and symbol and open_slots > 0:
+                        active_exposures.add((symbol, side))
 
         for run in selected_runs:
             result = run["result"]
@@ -896,6 +909,14 @@ class TradingEngine:
                     "stop_price": 0.0,
                     "target_price": 0.0,
                 }
+                for position in open_positions_override:
+                    if not isinstance(position, dict):
+                        continue
+                    side = str(position.get("side", "")).upper()
+                    symbol = str(position.get("symbol", result.symbol)).upper()
+                    slots = int(position.get("slots", 0) or 0)
+                    if side in {"LONG", "SHORT"} and symbol and slots > 0:
+                        active_exposures.add((symbol, side))
                 continue
 
             if model is None:
@@ -963,6 +984,7 @@ class TradingEngine:
                         exit_reason = "TARGET"
 
                 if hit_exit:
+                    active_exposures.discard((current_symbol, current_side))
                     delta_events.append(
                         {
                             "timestamp": ts,
@@ -1020,6 +1042,13 @@ class TradingEngine:
                     confidence = short_confidence
 
                 if direction != 0:
+                    proposed_side = "LONG" if direction > 0 else "SHORT"
+                    proposed_symbol = str(result.symbol).upper()
+                    exposure_key = (proposed_symbol, proposed_side)
+                    if exposure_key in active_exposures:
+                        direction = 0
+
+                if direction != 0:
                     conviction = max(abs(signal_value), confidence)
                     current_open_slots = int(np.clip(np.ceil(conviction * 5), 1, 5))
                     current_side = "LONG" if direction > 0 else "SHORT"
@@ -1048,6 +1077,7 @@ class TradingEngine:
                             "sloty": current_open_slots,
                         }
                     )
+                    active_exposures.add((current_symbol, current_side))
                     entry_armed = False
 
             cumulative_trades[model_id] = model_trade_history + delta_events

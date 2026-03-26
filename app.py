@@ -1642,6 +1642,7 @@ else:
             model_id = str(row["model_id"])
             model_name = str(row["name"])
             model_symbol = str(row.get("symbol") or latest.get("model_selected_symbols", {}).get(model_id, latest["symbol"])).upper()
+            model_live_state = latest.get("live_model_state", {}).get(model_id, {})
             position_value = float(latest.get("final_positions", {}).get(model_id, 0.0))
             open_slots = int(latest.get("final_open_slots", {}).get(model_id, 0))
             side = "LONG" if position_value > 0 else ("SHORT" if position_value < 0 else "-")
@@ -1668,11 +1669,31 @@ else:
                     last_entry = entry_events.sort_values("timestamp").iloc[-1]
                     entry_price = float(last_entry["cena"])
                     opened_at = str(last_entry["timestamp"])
+
+            live_entry_price = float(model_live_state.get("entry_price", 0.0) or 0.0)
+            live_opened_at = model_live_state.get("opened_at")
+            live_stop_price = float(model_live_state.get("stop_price", 0.0) or 0.0)
+            live_target_price = float(model_live_state.get("target_price", 0.0) or 0.0)
+            if is_open:
+                if live_entry_price > 0:
+                    entry_price = live_entry_price
+                if live_opened_at:
+                    opened_at = str(live_opened_at)
+                if live_stop_price > 0:
+                    stop_price = live_stop_price
+                if live_target_price > 0:
+                    target_price = live_target_price
+
+                if (stop_price is None or target_price is None) and entry_price is not None:
                     if position_value > 0:
                         stop_price, target_price = _compute_trade_levels(entry_price, "LONG", vol_latest)
-                        pnl_pct = ((latest_market_price - entry_price) / entry_price) * 100
                     else:
                         stop_price, target_price = _compute_trade_levels(entry_price, "SHORT", vol_latest)
+
+                if entry_price is not None and entry_price > 0:
+                    if position_value > 0:
+                        pnl_pct = ((latest_market_price - entry_price) / entry_price) * 100
+                    else:
                         pnl_pct = ((entry_price - latest_market_price) / entry_price) * 100
 
             model_position_rows.append(
