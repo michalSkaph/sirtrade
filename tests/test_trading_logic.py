@@ -18,7 +18,7 @@ from src.sirtrade.health_server import _build_worker_health_payload
 from src.sirtrade.live_worker import _apply_trade_cutoff, should_start_embedded_worker
 from src.sirtrade.market_stream import apply_stream_kline_to_market
 from src.sirtrade.models import ModelSpec
-from src.sirtrade.storage import clear_trade_history, init_db, load_open_positions, save_open_positions
+from src.sirtrade.storage import _build_closed_positions_rows, clear_trade_history, init_db, load_open_positions, save_open_positions
 from src.sirtrade.ui_state import load_worker_status, save_worker_status
 
 
@@ -73,6 +73,81 @@ def _build_flat_market_frame() -> pd.DataFrame:
 
 
 class TradingLogicTests(unittest.TestCase):
+    def test_closed_positions_do_not_mix_symbols_for_same_model(self) -> None:
+        summary = {
+            "symbol": "BTCUSDT",
+            "market_source": "binance",
+            "week": 1,
+            "generation": 1,
+            "results": pd.DataFrame([
+                {"model_id": "M1", "name": "Trend"},
+            ]),
+            "trade_events_delta": {
+                "M1": [
+                    {
+                        "timestamp": "2026-03-26T20:30:00Z",
+                        "symbol": "USDCUSDT",
+                        "model_id": "M1",
+                        "akce": "Vstup LONG (+5)",
+                        "strana": "LONG",
+                        "cena": 1.0005,
+                        "pozice": 0.25,
+                        "sloty": 5,
+                    },
+                    {
+                        "timestamp": "2026-03-26T21:30:00Z",
+                        "symbol": "BTCUSDT",
+                        "model_id": "M1",
+                        "akce": "Výstup LONG (-5)",
+                        "strana": "LONG",
+                        "cena": 69185.05,
+                        "pozice": 0.0,
+                        "sloty": 0,
+                    },
+                ]
+            },
+        }
+
+        rows = _build_closed_positions_rows(summary)
+        self.assertEqual(rows, [])
+
+    def test_closed_positions_use_direct_entry_metadata_for_live_exits(self) -> None:
+        summary = {
+            "symbol": "BTCUSDT",
+            "market_source": "binance",
+            "week": 1,
+            "generation": 1,
+            "results": pd.DataFrame([
+                {"model_id": "M1", "name": "Trend"},
+            ]),
+            "trade_events_delta": {
+                "M1": [
+                    {
+                        "timestamp": "2026-03-26T21:30:00Z",
+                        "symbol": "SOLUSDT",
+                        "model_id": "M1",
+                        "akce": "Výstup LONG (-5)",
+                        "strana": "LONG",
+                        "cena": 87.10,
+                        "pozice": 0.0,
+                        "sloty": 0,
+                        "opened_at": "2026-03-26T20:20:00Z",
+                        "entry_price": 86.66,
+                        "quantity_slots": 5,
+                        "duvod_vystupu": "TARGET",
+                    },
+                ]
+            },
+        }
+
+        rows = _build_closed_positions_rows(summary)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row[2], "M1")
+        self.assertEqual(row[4], "SOLUSDT")
+        self.assertAlmostEqual(row[6], 86.66)
+        self.assertAlmostEqual(row[7], 87.10)
+
     def test_apply_stream_kline_to_market_appends_new_bar(self) -> None:
         market = simulate_market(days=2, seed=7, interval="1h").tail(5)
         last_ts = market.index[-1]

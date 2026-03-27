@@ -64,10 +64,7 @@ def _build_closed_positions_rows(summary: dict) -> list[tuple]:
         if "timestamp" in events_df.columns:
             events_df = events_df.sort_values("timestamp")
 
-        open_qty = 0.0
-        avg_entry_price = 0.0
-        opened_at: str | None = None
-        current_side: str | None = None
+        open_states: dict[tuple[str, str], dict[str, float | str | None]] = {}
 
         for _, event in events_df.iterrows():
             action = str(event.get("akce", ""))
@@ -83,18 +80,22 @@ def _build_closed_positions_rows(summary: dict) -> list[tuple]:
                 qty = _extract_slot_delta(action, entry=True)
                 if qty <= 0:
                     qty = 1.0
-                if open_qty > 0 and current_side is not None and current_side != side:
-                    continue
-                if open_qty <= 0:
-                    open_qty = 0.0
-                    avg_entry_price = 0.0
-                    opened_at = timestamp
-                    current_side = side
-                total_cost = (avg_entry_price * open_qty) + (price * qty)
-                open_qty += qty
-                avg_entry_price = total_cost / open_qty if open_qty > 0 else price
-                if not opened_at:
-                    opened_at = timestamp
+                state_key = (symbol, side)
+                state = open_states.get(
+                    state_key,
+                    {
+                        "open_qty": 0.0,
+                        "avg_entry_price": 0.0,
+                        "opened_at": timestamp,
+                    },
+                )
+                existing_qty = float(state.get("open_qty", 0.0) or 0.0)
+                existing_avg = float(state.get("avg_entry_price", 0.0) or 0.0)
+                total_cost = (existing_avg * existing_qty) + (price * qty)
+                state["open_qty"] = existing_qty + qty
+                state["avg_entry_price"] = total_cost / float(state["open_qty"]) if float(state["open_qty"]) > 0 else price
+                state["opened_at"] = state.get("opened_at") or timestamp
+                open_states[state_key] = state
                 continue
 
             direct_opened_at = event.get("opened_at")
@@ -140,9 +141,25 @@ def _build_closed_positions_rows(summary: dict) -> list[tuple]:
                         generation,
                     )
                 )
+                state_key = (symbol, side)
+                state = open_states.get(state_key)
+                if state is not None:
+                    existing_qty = float(state.get("open_qty", 0.0) or 0.0)
+                    remaining_qty = max(0.0, existing_qty - qty)
+                    if remaining_qty <= 1e-9:
+                        open_states.pop(state_key, None)
+                    else:
+                        state["open_qty"] = remaining_qty
+                        open_states[state_key] = state
                 continue
 
-            if "Výstup" in action and open_qty > 0 and current_side == side:
+            state_key = (symbol, side)
+            state = open_states.get(state_key)
+            open_qty = float(state.get("open_qty", 0.0) or 0.0) if state else 0.0
+            avg_entry_price = float(state.get("avg_entry_price", 0.0) or 0.0) if state else 0.0
+            opened_at = str(state.get("opened_at") or timestamp) if state else timestamp
+
+            if "Výstup" in action and open_qty > 0:
                 qty = _extract_slot_delta(action, entry=False)
                 if qty <= 0:
                     qty = open_qty
@@ -179,13 +196,15 @@ def _build_closed_positions_rows(summary: dict) -> list[tuple]:
 
                 open_qty -= qty
                 if open_qty <= 1e-9:
-                    open_qty = 0.0
-                    avg_entry_price = 0.0
-                    opened_at = None
-                    current_side = None
+                    open_states.pop(state_key, None)
+                else:
+                    state["open_qty"] = open_qty
+                    state["avg_entry_price"] = avg_entry_price
+                    state["opened_at"] = opened_at
+                    open_states[state_key] = state
                 continue
 
-            if "Výstup" in action and open_qty > 0 and current_side != side:
+            if "Výstup" in action and open_qty <= 0:
                 continue
 
     return rows
