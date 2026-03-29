@@ -302,10 +302,11 @@ def _build_live_chart_payload(
     markers: list[dict[str, object]] = []
     if not trades_df.empty and {"timestamp", "akce", "cena"}.issubset(trades_df.columns):
         marker_rows = trades_df.copy()
-        marker_rows["timestamp"] = pd.to_datetime(marker_rows["timestamp"], utc=True, errors="coerce")
-        marker_rows = marker_rows[marker_rows["timestamp"].notna()].sort_values("timestamp")
+        marker_time_column = "market_timestamp" if "market_timestamp" in marker_rows.columns else "timestamp"
+        marker_rows[marker_time_column] = pd.to_datetime(marker_rows[marker_time_column], utc=True, errors="coerce")
+        marker_rows = marker_rows[marker_rows[marker_time_column].notna()].sort_values(marker_time_column)
         for _, row in marker_rows.iterrows():
-            unix_time = _chart_unix_time(row["timestamp"])
+            unix_time = _chart_unix_time(row[marker_time_column])
             if unix_time is None:
                 continue
             action = str(row.get("akce", ""))
@@ -635,7 +636,6 @@ def _build_live_chart_html(payload: dict[str, object], height: int = 980) -> str
             const marketPayload = await response.json();
             mergeLastBars(marketPayload.candles || []);
             renderHeader();
-            applyRealtimeViewport();
             const timestampLabel = marketPayload.updated_at ? new Date(marketPayload.updated_at).toLocaleTimeString('cs-CZ') : 'n/a';
             updateStatus(`Poslední synchronizace: ${{timestampLabel}}`);
         }} catch (error) {{
@@ -1046,7 +1046,7 @@ def _render_graph_view_body() -> None:
             if side not in {"LONG", "SHORT"}:
                 side = "LONG" if "LONG" in action.upper() else ("SHORT" if "SHORT" in action.upper() else "LONG")
             price = float(event.get("cena", 0.0))
-            ts = event["timestamp"]
+            ts = pd.to_datetime(event.get("executed_at", event.get("timestamp")), errors="coerce", utc=True)
 
             if "Vstup" in action:
                 qty = _extract_slots_from_action(action, is_entry=True)
@@ -1165,10 +1165,22 @@ def _render_graph_view_body() -> None:
     ]
     st.caption("Cena, delta i poslední svíce se v panelu níže aktualizují přímo v browseru bez blikání celé stránky.")
 
+    chart_trades_df = pd.DataFrame()
+    if selected_leg is not None and not trades_df.empty and {"timestamp", "akce", "cena"}.issubset(trades_df.columns):
+        entry_time = selected_leg.get("entry_time")
+        entry_price = float(selected_leg.get("entry_price", 0.0))
+        if entry_time is not None:
+            mask_entry = (
+                trades_df["akce"].str.contains("Vstup", na=False)
+                & (trades_df["timestamp"] == entry_time)
+                & ((trades_df["cena"].astype(float) - entry_price).abs() < 1e-9)
+            )
+            chart_trades_df = trades_df[mask_entry].head(1)
+
     chart_payload = _build_live_chart_payload(
         overlay_market_df=overlay_market_df,
-        trades_df=trades_df,
-        chart_open_legs=chart_open_legs,
+        trades_df=chart_trades_df,
+        chart_open_legs=[selected_leg] if selected_leg else [],
         selected_symbol_for_overlay=selected_symbol_for_overlay,
         chart_interval=st.session_state.chart_interval,
         refresh_seconds=st.session_state.live_refresh_seconds,
@@ -1219,7 +1231,7 @@ st.markdown(
 
 runtime_state = _load_runtime_state_cached()
 SEGMENT_DEFAULTS = {
-    "Scalp": {"interval": "5m", "sim_days": 3, "namespace": "SC"},
+    "Scalp": {"interval": "1m", "sim_days": 1, "namespace": "SC"},
     "Intraday": {"interval": "15m", "sim_days": 7, "namespace": "ID"},
     "Swing": {"interval": "4h", "sim_days": 30, "namespace": "SW"},
 }
@@ -1687,11 +1699,12 @@ else:
         st.dataframe(leaderboard, use_container_width=True, column_config=leaderboard_config)
 
     if st.session_state.active_view == "Pozice":
-        st.subheader("Detail pozic modelů")
+        st.subheader("Otevřené pozice")
         st.caption("Modely vybírají coin z dynamického top 20 univerza a na něm otevírají paper pozice podle aktuálních Binance dat.")
         model_position_rows = []
         model_markets = latest.get("model_markets", {})
         latest_prices = latest.get("latest_prices", {})
+        slot_size_frac = DEFAULT_CONFIG.risk.max_asset_exposure / 5
 
         for _, row in latest["results"].iterrows():
             model_id = str(row["model_id"])
@@ -1700,79 +1713,110 @@ else:
             model_live_state = latest.get("live_model_state", {}).get(model_id, {})
             position_value = float(latest.get("final_positions", {}).get(model_id, 0.0))
             open_slots = int(latest.get("final_open_slots", {}).get(model_id, 0))
-            side = "LONG" if position_value > 0 else ("SHORT" if position_value < 0 else "-")
             is_open = abs(position_value) > 1e-9
-            model_market = model_markets.get(model_id, latest["market"])
-            latest_market_price = latest_prices.get(model_symbol)
-            if latest_market_price is None:
-                close_series = pd.to_numeric(model_market["close"], errors="coerce").dropna() if not model_market.empty else pd.Series(dtype=float)
-                latest_market_price = float(close_series.iloc[-1]) if not close_series.empty else 0.0
-            vol_latest = float(model_market["close"].pct_change().rolling(20).std().iloc[-1]) if not model_market.empty else 0.0
-            if pd.isna(vol_latest) or vol_latest <= 0:
-                vol_latest = 0.015
 
-            entry_price = None
-            opened_at = None
-            target_price = None
-            stop_price = None
-            pnl_pct = None
+            open_pos_list = latest.get("model_open_positions", {}).get(model_id, [])
+
+            if not open_pos_list or not is_open:
+                # Model without open positions – single inactive row
+                model_position_rows.append(
+                    {
+                        "ID modelu": model_id,
+                        "Model": model_name,
+                        "Symbol": "-",
+                        "Pozice otevřená": "NE",
+                        "Směr": "-",
+                        "Sloty": "0/5",
+                        "Investováno (CZK)": "-",
+                        "Vstupní cena": "-",
+                        "Aktuální cena": "-",
+                        "Target": "-",
+                        "Stop": "-",
+                        "Nerealizované PnL %": "-",
+                        "Otevřeno od": None,
+                    }
+                )
+                continue
 
             trades_model = pd.DataFrame(latest.get("model_trades", {}).get(model_id, []))
-            if is_open and not trades_model.empty:
-                entry_events = trades_model[trades_model["akce"].str.contains("Vstup")]
-                if not entry_events.empty:
-                    last_entry = entry_events.sort_values("timestamp").iloc[-1]
-                    entry_price = float(last_entry["cena"])
-                    opened_at = str(last_entry["timestamp"])
 
-            live_entry_price = float(model_live_state.get("entry_price", 0.0) or 0.0)
-            live_opened_at = model_live_state.get("opened_at")
-            live_stop_price = float(model_live_state.get("stop_price", 0.0) or 0.0)
-            live_target_price = float(model_live_state.get("target_price", 0.0) or 0.0)
-            if is_open:
-                if live_entry_price > 0:
-                    entry_price = live_entry_price
-                if live_opened_at:
-                    opened_at = str(live_opened_at)
-                if live_stop_price > 0:
-                    stop_price = live_stop_price
-                if live_target_price > 0:
-                    target_price = live_target_price
+            for pos_item in open_pos_list:
+                pos_symbol = str(pos_item.get("symbol", model_symbol)).upper()
+                pos_side = str(pos_item.get("side", "")).upper()
+                pos_slots = int(pos_item.get("slots", 0) or 0)
+                if pos_side not in {"LONG", "SHORT"} or pos_slots <= 0:
+                    continue
+
+                invested_czk = round(pos_slots * slot_size_frac * INITIAL_PAPER_WALLET_CZK, 0)
+
+                model_market = model_markets.get(model_id, latest["market"])
+                pos_latest_price = latest_prices.get(pos_symbol)
+                if pos_latest_price is None:
+                    close_series = pd.to_numeric(model_market["close"], errors="coerce").dropna() if not model_market.empty else pd.Series(dtype=float)
+                    pos_latest_price = float(close_series.iloc[-1]) if not close_series.empty else 0.0
+                vol_latest = float(model_market["close"].pct_change().rolling(20).std().iloc[-1]) if not model_market.empty else 0.0
+                if pd.isna(vol_latest) or vol_latest <= 0:
+                    vol_latest = 0.015
+
+                entry_price = float(pos_item.get("entry_price", 0.0) or 0.0) or None
+                opened_at = pos_item.get("opened_at")
+                target_price = float(pos_item.get("target_price", 0.0) or 0.0) or None
+                stop_price = float(pos_item.get("stop_price", 0.0) or 0.0) or None
+                pnl_pct = None
+
+                # Fallback to trade history for entry price
+                if entry_price is None and not trades_model.empty:
+                    entry_events = trades_model[trades_model["akce"].str.contains("Vstup")]
+                    if not entry_events.empty:
+                        last_entry = entry_events.sort_values("timestamp").iloc[-1]
+                        entry_price = float(last_entry["cena"])
+                        if opened_at is None:
+                            opened_at = str(last_entry.get("executed_at", last_entry["timestamp"]))
+
+                # Override from live model state (single-position models only)
+                if len(open_pos_list) == 1:
+                    live_entry = float(model_live_state.get("entry_price", 0.0) or 0.0)
+                    live_opened = model_live_state.get("opened_at")
+                    live_stop = float(model_live_state.get("stop_price", 0.0) or 0.0)
+                    live_target = float(model_live_state.get("target_price", 0.0) or 0.0)
+                    if live_entry > 0:
+                        entry_price = live_entry
+                    if live_opened:
+                        opened_at = str(live_opened)
+                    if live_stop > 0:
+                        stop_price = live_stop
+                    if live_target > 0:
+                        target_price = live_target
 
                 if (stop_price is None or target_price is None) and entry_price is not None:
-                    if position_value > 0:
-                        stop_price, target_price = _compute_trade_levels(entry_price, "LONG", vol_latest)
-                    else:
-                        stop_price, target_price = _compute_trade_levels(entry_price, "SHORT", vol_latest)
+                    stop_price, target_price = _compute_trade_levels(entry_price, pos_side, vol_latest)
 
                 if entry_price is not None and entry_price > 0:
-                    if position_value > 0:
-                        pnl_pct = ((latest_market_price - entry_price) / entry_price) * 100
+                    if pos_side == "LONG":
+                        pnl_pct = ((pos_latest_price - entry_price) / entry_price) * 100
                     else:
-                        pnl_pct = ((entry_price - latest_market_price) / entry_price) * 100
+                        pnl_pct = ((entry_price - pos_latest_price) / entry_price) * 100
 
-            model_position_rows.append(
-                {
-                    "ID modelu": model_id,
-                    "Model": model_name,
-                    "Symbol": ", ".join(
-                        [
-                            str(item.get("symbol", model_symbol))
-                            for item in latest.get("model_open_positions", {}).get(model_id, [])
-                        ]
-                    )
-                    or model_symbol,
-                    "Pozice otevřená": "ANO" if is_open else "NE",
-                    "Směr": side,
-                    "Sloty": f"{open_slots}/5",
-                    "Vstupní cena": round(entry_price, 6) if entry_price is not None else None,
-                    "Aktuální cena": round(latest_market_price, 6),
-                    "Target": round(target_price, 6) if target_price is not None else None,
-                    "Stop": round(stop_price, 6) if stop_price is not None else None,
-                    "Nerealizované PnL %": round(pnl_pct, 3) if pnl_pct is not None else None,
-                    "Otevřeno od": opened_at,
-                }
-            )
+                if opened_at is not None:
+                    opened_at = str(opened_at)
+
+                model_position_rows.append(
+                    {
+                        "ID modelu": model_id,
+                        "Model": model_name,
+                        "Symbol": pos_symbol,
+                        "Pozice otevřená": "ANO",
+                        "Směr": pos_side,
+                        "Sloty": f"{pos_slots}/5",
+                        "Investováno (CZK)": f"{invested_czk:,.0f}",
+                        "Vstupní cena": round(entry_price, 6) if entry_price is not None else "-",
+                        "Aktuální cena": round(pos_latest_price, 6),
+                        "Target": round(target_price, 6) if target_price is not None else "-",
+                        "Stop": round(stop_price, 6) if stop_price is not None else "-",
+                        "Nerealizované PnL %": round(pnl_pct, 3) if pnl_pct is not None else "-",
+                        "Otevřeno od": opened_at,
+                    }
+                )
 
         model_positions_df = pd.DataFrame(model_position_rows)
         model_positions_df = _split_datetime_column(model_positions_df, "Otevřeno od", "Otevřeno")
@@ -1785,7 +1829,9 @@ else:
             return "background-color: #374151; color: #e5e7eb;"
 
         def _style_pnl(value):
-            if value is None or (isinstance(value, float) and pd.isna(value)):
+            if value is None or value == "" or value == "-":
+                return ""
+            if not isinstance(value, (int, float)) or (isinstance(value, float) and pd.isna(value)):
                 return ""
             if value > 0:
                 return "background-color: #14532d; color: #dcfce7;"
@@ -1793,55 +1839,18 @@ else:
                 return "background-color: #7f1d1d; color: #fee2e2;"
             return ""
 
+        def _style_inactive_row(row):
+            if row.get("Pozice otevřená") == "ANO":
+                return [""] * len(row)
+            return ["color: #9ca3af;"] * len(row)
+
         styled_positions = (
             model_positions_df.style
             .map(_style_side, subset=["Směr"])
             .map(_style_pnl, subset=["Nerealizované PnL %"])
+            .apply(_style_inactive_row, axis=1)
         )
         st.dataframe(styled_positions, use_container_width=True)
-
-        st.subheader("Otevřené pozice (držené i po vypnutí aplikace)")
-        open_positions = _load_open_positions_cached()
-        namespace = f"{SEGMENT_DEFAULTS[st.session_state.active_segment]['namespace']}_"
-        if not open_positions.empty and "model_id" in open_positions.columns:
-            open_positions = open_positions[open_positions["model_id"].astype(str).str.startswith(namespace)].copy()
-        if open_positions.empty:
-            st.info(f"Pro segment {st.session_state.active_segment} momentálně nejsou evidované žádné otevřené paper pozice.")
-        else:
-            open_view = open_positions.rename(
-                columns={
-                    "id": "ID",
-                    "updated_at": "Naposledy aktualizováno",
-                    "model_id": "ID modelu",
-                    "model_name": "Název modelu",
-                    "symbol": "Symbol",
-                    "side": "Směr",
-                    "position_size": "Velikost pozice",
-                    "market_source": "Zdroj dat",
-                }
-            )
-            open_view["Zdroj dat"] = open_view["Zdroj dat"].replace({"simulation": "Simulace", "binance": "Binance", "binance_copy": "Binance Copy"})
-            open_view = _split_datetime_column(open_view, "Naposledy aktualizováno", "Aktualizace")
-            if "Směr" in open_view.columns:
-                open_view["Směr"] = (
-                    open_view["Směr"]
-                    .astype(str)
-                    .str.upper()
-                    .replace({
-                        "BUY": "LONG",
-                        "SELL": "SHORT",
-                    })
-                )
-
-            def _style_side_open(value):
-                if value == "LONG":
-                    return "background-color: #14532d; color: #dcfce7; font-weight: 600;"
-                if value == "SHORT":
-                    return "background-color: #7f1d1d; color: #fee2e2; font-weight: 600;"
-                return "background-color: #374151; color: #e5e7eb;"
-
-            styled_open_view = open_view.style.map(_style_side_open, subset=["Směr"])
-            st.dataframe(styled_open_view, use_container_width=True)
 
     if st.session_state.active_view == "Uzavřené pozice":
         st.subheader("Přehled uzavřených pozic")

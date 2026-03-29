@@ -15,6 +15,10 @@ services:
     build: .
     container_name: sirtrade-worker
     command: ["python", "run_live_worker.py"]
+    environment:
+      - SIRTRADE_BINANCE_DECISION_SECONDS_SCALP=5
+      - SIRTRADE_BINANCE_DECISION_SECONDS_INTRADAY=10
+      - SIRTRADE_BINANCE_DECISION_SECONDS_SWING=30
     volumes:
       - ./data:/app/data
       - ./reports:/app/reports

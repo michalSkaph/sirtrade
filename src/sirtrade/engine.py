@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .config import AppConfig, DEFAULT_CONFIG, PAPER_TRADE_SIZE_CZK
+from .config import AppConfig, DEFAULT_CONFIG, INITIAL_PAPER_WALLET_CZK, PAPER_TRADE_SIZE_CZK
 from .copy_trading import load_top_copy_trader_snapshot
 from .data import get_market_data, scan_binance_long_tail, scan_long_tail_opportunities
 from .execution import build_dry_run_orders
@@ -16,6 +16,17 @@ from .models import ModelSpec, default_model_specs, generate_signals
 from .research import StudyInsight, daily_deep_research
 from .risk import annualized_vol, apply_risk_controls, cvar95, max_drawdown
 from .scoring import calmar_ratio, decision_score, pass_thresholds, sortino_ratio
+
+
+BLOCKED_TRADING_SYMBOLS = {"USDCUSDT"}
+MAX_POSITIONS_PER_MODEL = 5
+STANDARD_MODEL_BLUEPRINTS: list[tuple[str, str, str]] = [
+    ("M1", "Trend + cílení volatility", "trend_vol"),
+    ("M2", "Průřezové momentum + carry", "xsec_momentum"),
+    ("M3", "Swing návrat k průměru", "mean_reversion"),
+    ("M4", "On-chain + sentimentní vrstva", "onchain_sentiment_overlay"),
+    ("M5", "Meta ansámbl", "meta_ensemble"),
+]
 
 
 @dataclass
@@ -32,6 +43,10 @@ class ModelResult:
     turnover: float
     score: float
     passed: bool
+
+
+def _current_execution_timestamp() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
 
 
 class TradingEngine:
@@ -55,13 +70,17 @@ class TradingEngine:
         fallback_symbol: str,
     ) -> tuple[pd.DataFrame, list[str]]:
         if market_source in {"binance", "binance_copy"}:
-            long_tail = scan_binance_long_tail(top_n=20)
+            long_tail = scan_binance_long_tail(top_n=50)
         else:
-            long_tail = scan_long_tail_opportunities(seed=self.week, universe_size=300).head(20)
+            long_tail = scan_long_tail_opportunities(seed=self.week, universe_size=300).head(50)
 
         candidate_symbols: list[str] = []
         if isinstance(long_tail, pd.DataFrame) and "symbol" in long_tail.columns:
             candidate_symbols = [str(value).upper() for value in long_tail["symbol"].dropna().tolist()]
+
+        candidate_symbols = [symbol for symbol in candidate_symbols if symbol not in BLOCKED_TRADING_SYMBOLS]
+        if isinstance(long_tail, pd.DataFrame) and "symbol" in long_tail.columns:
+            long_tail = long_tail[~long_tail["symbol"].astype(str).str.upper().isin(BLOCKED_TRADING_SYMBOLS)].reset_index(drop=True)
 
         candidate_symbols = list(dict.fromkeys([symbol for symbol in candidate_symbols if symbol]))
         if not candidate_symbols:
@@ -195,6 +214,8 @@ class TradingEngine:
             if not isinstance(position, dict):
                 continue
             symbol = str(position.get("symbol", "")).upper()
+            if symbol in BLOCKED_TRADING_SYMBOLS:
+                continue
             market = markets_by_symbol.get(symbol)
             if not symbol or market is None or market.empty:
                 continue
@@ -332,31 +353,48 @@ class TradingEngine:
         sentiment = market.get("sentiment", pd.Series(0.0, index=market.index)).fillna(0.0).astype(float)
         onchain = market.get("onchain", pd.Series(0.0, index=market.index)).fillna(0.0).astype(float)
 
-        ema_fast = close.ewm(span=8, adjust=False).mean()
-        ema_slow = close.ewm(span=21, adjust=False).mean()
-        ema_anchor = close.ewm(span=55, adjust=False).mean()
-        momentum_fast = returns.rolling(3).mean().fillna(0.0)
-        momentum_slow = returns.rolling(8).mean().fillna(0.0)
-        breakout = close.pct_change(5).fillna(0.0)
-        rolling_mean = close.rolling(20).mean().bfill()
-        rolling_std = close.rolling(20).std(ddof=0).replace(0.0, np.nan)
+        # Scalp segment uses faster indicator periods for quick entries/exits
+        is_scalp = self.model_namespace == "SC"
+        ema_fast_span = 3 if is_scalp else 8
+        ema_slow_span = 8 if is_scalp else 21
+        ema_anchor_span = 21 if is_scalp else 55
+        mom_fast_win = 2 if is_scalp else 3
+        mom_slow_win = 4 if is_scalp else 8
+        breakout_period = 3 if is_scalp else 5
+        bb_period = 10 if is_scalp else 20
+        rsi_alpha = 1 / 7 if is_scalp else 1 / 14
+        macd_fast_span = 5 if is_scalp else 12
+        macd_slow_span = 13 if is_scalp else 26
+        macd_signal_span = 4 if is_scalp else 9
+        atr_period = 7 if is_scalp else 14
+        donchian_period = 10 if is_scalp else 20
+        bb_width = 1.2 if is_scalp else 1.4
+
+        ema_fast = close.ewm(span=ema_fast_span, adjust=False).mean()
+        ema_slow = close.ewm(span=ema_slow_span, adjust=False).mean()
+        ema_anchor = close.ewm(span=ema_anchor_span, adjust=False).mean()
+        momentum_fast = returns.rolling(mom_fast_win).mean().fillna(0.0)
+        momentum_slow = returns.rolling(mom_slow_win).mean().fillna(0.0)
+        breakout = close.pct_change(breakout_period).fillna(0.0)
+        rolling_mean = close.rolling(bb_period).mean().bfill()
+        rolling_std = close.rolling(bb_period).std(ddof=0).replace(0.0, np.nan)
         price_z = ((close - rolling_mean) / (rolling_std + 1e-9)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         overlay_bias = ((0.6 * onchain) + (0.4 * sentiment)).clip(-3.0, 3.0)
-        upper_band = rolling_mean + (1.4 * rolling_std.fillna(0.0))
-        lower_band = rolling_mean - (1.4 * rolling_std.fillna(0.0))
+        upper_band = rolling_mean + (bb_width * rolling_std.fillna(0.0))
+        lower_band = rolling_mean - (bb_width * rolling_std.fillna(0.0))
 
         delta = close.diff().fillna(0.0)
         gains = delta.clip(lower=0.0)
         losses = (-delta).clip(lower=0.0)
-        avg_gain = gains.ewm(alpha=1 / 14, adjust=False).mean()
-        avg_loss = losses.ewm(alpha=1 / 14, adjust=False).mean()
+        avg_gain = gains.ewm(alpha=rsi_alpha, adjust=False).mean()
+        avg_loss = losses.ewm(alpha=rsi_alpha, adjust=False).mean()
         rs = avg_gain / (avg_loss + 1e-6)
         rsi = (100 - (100 / (1 + rs))).fillna(50.0)
 
-        macd_fast = close.ewm(span=12, adjust=False).mean()
-        macd_slow = close.ewm(span=26, adjust=False).mean()
+        macd_fast = close.ewm(span=macd_fast_span, adjust=False).mean()
+        macd_slow = close.ewm(span=macd_slow_span, adjust=False).mean()
         macd_line = macd_fast - macd_slow
-        macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+        macd_signal = macd_line.ewm(span=macd_signal_span, adjust=False).mean()
         macd_hist = (macd_line - macd_signal).fillna(0.0)
 
         prev_close = close.shift(1).fillna(close)
@@ -368,11 +406,11 @@ class TradingEngine:
             ],
             axis=1,
         ).max(axis=1)
-        atr = true_range.rolling(14).mean().fillna(true_range.expanding().mean()).fillna(0.0)
+        atr = true_range.rolling(atr_period).mean().fillna(true_range.expanding().mean()).fillna(0.0)
         atr_pct = (atr / (close.abs() + 1e-6)).clip(lower=0.0015, upper=0.08)
 
-        donchian_high = high.rolling(20).max().shift(1).fillna(high.expanding().max())
-        donchian_low = low.rolling(20).min().shift(1).fillna(low.expanding().min())
+        donchian_high = high.rolling(donchian_period).max().shift(1).fillna(high.expanding().max())
+        donchian_low = low.rolling(donchian_period).min().shift(1).fillna(low.expanding().min())
         breakout_up = close >= donchian_high
         breakout_down = close <= donchian_low
 
@@ -386,42 +424,49 @@ class TradingEngine:
         acceleration_down = momentum_fast <= momentum_slow
 
         if model.kind == "mean_reversion":
+            sig_thresh = 0.08 if is_scalp else 0.16
+            z_thresh = 0.90 if is_scalp else 1.35
+            rsi_lo = 40 if is_scalp else 36
+            rsi_hi = 60 if is_scalp else 64
             long_checks = [
-                controlled_signal >= 0.16,
-                price_z <= -1.35,
+                controlled_signal >= sig_thresh,
+                price_z <= -z_thresh,
                 close <= lower_band,
-                rsi <= 36,
+                rsi <= rsi_lo,
                 acceleration_up,
             ]
             short_checks = [
-                controlled_signal <= -0.16,
-                price_z >= 1.35,
+                controlled_signal <= -sig_thresh,
+                price_z >= z_thresh,
                 close >= upper_band,
-                rsi >= 64,
+                rsi >= rsi_hi,
                 acceleration_down,
             ]
-            required_votes = 4
-            reset_votes = 2
+            required_votes = 3 if is_scalp else 4
+            reset_votes = 1 if is_scalp else 2
         elif model.kind == "onchain_sentiment_overlay":
+            sig_thresh = 0.10 if is_scalp else 0.18
+            bias_thresh = 0.15 if is_scalp else 0.25
             long_checks = [
-                controlled_signal >= 0.18,
-                overlay_bias >= 0.25,
+                controlled_signal >= sig_thresh,
+                overlay_bias >= bias_thresh,
                 trend_up,
                 momentum_up,
                 macd_hist >= 0,
             ]
             short_checks = [
-                controlled_signal <= -0.18,
-                overlay_bias <= -0.25,
+                controlled_signal <= -sig_thresh,
+                overlay_bias <= -bias_thresh,
                 trend_down,
                 momentum_down,
                 macd_hist <= 0,
             ]
-            required_votes = 4
-            reset_votes = 2
+            required_votes = 3 if is_scalp else 4
+            reset_votes = 1 if is_scalp else 2
         elif model.kind == "xsec_momentum":
+            sig_thresh = 0.12 if is_scalp else 0.24
             long_checks = [
-                controlled_signal >= 0.24,
+                controlled_signal >= sig_thresh,
                 momentum_up,
                 acceleration_up,
                 breakout_up | (breakout > 0),
@@ -430,7 +475,7 @@ class TradingEngine:
                 macd_hist > 0,
             ]
             short_checks = [
-                controlled_signal <= -0.24,
+                controlled_signal <= -sig_thresh,
                 momentum_down,
                 acceleration_down,
                 breakout_down | (breakout < 0),
@@ -438,32 +483,34 @@ class TradingEngine:
                 broad_trend_down,
                 macd_hist < 0,
             ]
-            required_votes = 5
-            reset_votes = 2
+            required_votes = 4 if is_scalp else 5
+            reset_votes = 1 if is_scalp else 2
         elif model.kind == "meta_ensemble":
+            sig_thresh = 0.10 if is_scalp else 0.20
             long_checks = [
-                controlled_signal >= 0.20,
+                controlled_signal >= sig_thresh,
                 trend_up,
                 momentum_up,
                 acceleration_up,
                 overlay_bias >= -0.10,
                 macd_hist >= 0,
-                rsi.between(50, 72),
+                rsi.between(50, 72) if not is_scalp else rsi.between(45, 75),
             ]
             short_checks = [
-                controlled_signal <= -0.20,
+                controlled_signal <= -sig_thresh,
                 trend_down,
                 momentum_down,
                 acceleration_down,
                 overlay_bias <= 0.10,
                 macd_hist <= 0,
-                rsi.between(28, 50),
+                rsi.between(28, 50) if not is_scalp else rsi.between(25, 55),
             ]
-            required_votes = 5
-            reset_votes = 2
+            required_votes = 4 if is_scalp else 5
+            reset_votes = 1 if is_scalp else 2
         else:
+            sig_thresh = 0.12 if is_scalp else 0.22
             long_checks = [
-                controlled_signal >= 0.22,
+                controlled_signal >= sig_thresh,
                 trend_up,
                 broad_trend_up,
                 momentum_up,
@@ -472,7 +519,7 @@ class TradingEngine:
                 macd_hist > 0,
             ]
             short_checks = [
-                controlled_signal <= -0.22,
+                controlled_signal <= -sig_thresh,
                 trend_down,
                 broad_trend_down,
                 momentum_down,
@@ -497,6 +544,17 @@ class TradingEngine:
         return confluence, required_votes, reset_votes, atr_pct
 
     def _trade_profile(self, model: ModelSpec) -> tuple[float, float, float, float]:
+        # Scalp segment: very tight TP/SL so trades resolve in seconds-minutes
+        if self.model_namespace == "SC":
+            if model.kind == "mean_reversion":
+                return 0.35, 0.55, 0.0008, 0.03
+            if model.kind == "xsec_momentum":
+                return 0.45, 0.70, 0.0010, 0.04
+            if model.kind == "onchain_sentiment_overlay":
+                return 0.40, 0.60, 0.0010, 0.03
+            if model.kind == "meta_ensemble":
+                return 0.45, 0.70, 0.0010, 0.04
+            return 0.50, 0.75, 0.0010, 0.04
         if model.kind == "mean_reversion":
             return 1.35, 2.75, 0.0025, 0.08
         if model.kind == "xsec_momentum":
@@ -509,7 +567,7 @@ class TradingEngine:
 
     def _build_trade_events(self, model: ModelSpec, prices: pd.Series, position: pd.Series) -> tuple[list[dict], int]:
         events: list[dict] = []
-        slot_size = self.config.risk.max_asset_exposure / 5
+        slot_size = PAPER_TRADE_SIZE_CZK / INITIAL_PAPER_WALLET_CZK
         position_filled = position.fillna(0.0)
         slot_series = np.floor((position_filled.abs() / (slot_size + 1e-9))).clip(0, 5).astype(int)
         side_series = np.sign(position_filled).astype(int)
@@ -620,8 +678,10 @@ class TradingEngine:
         high = market["high"].astype(float)
         low = market["low"].astype(float)
 
-        slot_size = self.config.risk.max_asset_exposure / 5
+        slot_size = PAPER_TRADE_SIZE_CZK / INITIAL_PAPER_WALLET_CZK
         warmup_bars = min(48, max(12, int(len(market) * 0.1)))
+        if self.model_namespace == "SC":
+            warmup_bars = min(20, max(8, int(len(market) * 0.05)))
         stop_atr_multiplier, target_atr_multiplier, min_stop_floor, signal_reset_floor = self._trade_profile(model)
 
         pos = pd.Series(0.0, index=market.index, dtype=float)
@@ -668,8 +728,7 @@ class TradingEngine:
                     confidence = short_confidence
 
                 if direction != 0:
-                    conviction = max(abs(signal_value), confidence)
-                    slots = int(np.clip(np.ceil(conviction * 5), 1, 5))
+                    slots = 1
                     position_size = float(direction * slots * slot_size)
                     side = direction
                     current_slots = slots
@@ -822,7 +881,27 @@ class TradingEngine:
         if isinstance(live_state, dict):
             state = live_state.get(model_id)
             if isinstance(state, dict):
-                return dict(state)
+                result = dict(state)
+                # Migrate old single-position format to positions list
+                if "positions" not in result:
+                    side = str(result.get("side", "")).upper()
+                    symbol = str(result.get("symbol", "")).upper()
+                    open_slots = int(result.get("open_slots", 0) or 0)
+                    if side in {"LONG", "SHORT"} and symbol and open_slots > 0:
+                        result["positions"] = [
+                            {
+                                "symbol": symbol,
+                                "side": side,
+                                "open_slots": open_slots,
+                                "entry_price": float(result.get("entry_price", 0.0) or 0.0),
+                                "stop_price": float(result.get("stop_price", 0.0) or 0.0),
+                                "target_price": float(result.get("target_price", 0.0) or 0.0),
+                                "opened_at": result.get("opened_at"),
+                            }
+                        ]
+                    else:
+                        result["positions"] = []
+                return result
 
         model_positions = previous_summary.get("model_open_positions", {})
         if not isinstance(model_positions, dict):
@@ -831,19 +910,43 @@ class TradingEngine:
         if not isinstance(positions, list) or not positions:
             return {}
 
-        first_position = next((item for item in positions if isinstance(item, dict)), None)
-        if not isinstance(first_position, dict):
+        valid_positions = [item for item in positions if isinstance(item, dict)]
+        if not valid_positions:
             return {}
 
+        # Group positions by (symbol, side) to build unique position entries
+        grouped: dict[tuple[str, str], dict[str, Any]] = {}
+        for pos in valid_positions:
+            sym = str(pos.get("symbol", "")).upper()
+            sd = str(pos.get("side", "")).upper()
+            if sd not in {"LONG", "SHORT"} or not sym:
+                continue
+            key = (sym, sd)
+            if key not in grouped:
+                grouped[key] = {
+                    "symbol": sym,
+                    "side": sd,
+                    "open_slots": 0,
+                    "entry_price": float(pos.get("entry_price", 0.0) or 0.0),
+                    "stop_price": float(pos.get("stop_price", 0.0) or 0.0),
+                    "target_price": float(pos.get("target_price", 0.0) or 0.0),
+                    "opened_at": pos.get("opened_at"),
+                }
+            grouped[key]["open_slots"] += max(1, int(pos.get("slots", 1) or 1))
+
+        pos_list = list(grouped.values())
+        total_slots = sum(int(p.get("open_slots", 0)) for p in pos_list)
+        first = pos_list[0] if pos_list else {}
         return {
             "entry_armed": False,
-            "symbol": str(first_position.get("symbol", "")).upper(),
-            "side": str(first_position.get("side", "")).upper(),
-            "open_slots": int(len([item for item in positions if isinstance(item, dict)])),
-            "entry_price": float(first_position.get("entry_price", 0.0) or 0.0),
-            "opened_at": first_position.get("opened_at"),
-            "stop_price": float(first_position.get("stop_price", 0.0) or 0.0),
-            "target_price": float(first_position.get("target_price", 0.0) or 0.0),
+            "symbol": str(first.get("symbol", "")).upper(),
+            "side": str(first.get("side", "")).upper(),
+            "open_slots": total_slots,
+            "entry_price": float(first.get("entry_price", 0.0) or 0.0),
+            "opened_at": first.get("opened_at"),
+            "stop_price": float(first.get("stop_price", 0.0) or 0.0),
+            "target_price": float(first.get("target_price", 0.0) or 0.0),
+            "positions": pos_list,
         }
 
     def _build_incremental_live_state(
@@ -862,7 +965,7 @@ class TradingEngine:
     ]:
         previous_trades = previous_summary.get("model_trades", {}) if isinstance(previous_summary, dict) else {}
         model_map = {model.model_id: model for model in self.models}
-        slot_size = self.config.risk.max_asset_exposure / 5
+        slot_size = PAPER_TRADE_SIZE_CZK / INITIAL_PAPER_WALLET_CZK
 
         cumulative_trades: dict[str, list[dict[str, Any]]] = {}
         trade_events_delta: dict[str, list[dict[str, Any]]] = {}
@@ -871,18 +974,31 @@ class TradingEngine:
         model_open_positions: dict[str, list[dict[str, Any]]] = {}
         live_model_state: dict[str, dict[str, Any]] = {}
         active_exposures: set[tuple[str, str]] = set()
+        claimed_symbols: set[str] = set()
 
+        # Pre-populate active_exposures from ALL models' previous positions
         if isinstance(previous_summary, dict):
             previous_live_state = previous_summary.get("live_model_state", {})
             if isinstance(previous_live_state, dict):
                 for state in previous_live_state.values():
                     if not isinstance(state, dict):
                         continue
-                    side = str(state.get("side", "")).upper()
-                    symbol = str(state.get("symbol", "")).upper()
-                    open_slots = int(state.get("open_slots", 0) or 0)
-                    if side in {"LONG", "SHORT"} and symbol and open_slots > 0:
-                        active_exposures.add((symbol, side))
+                    # New multi-position format
+                    for pos in state.get("positions", []):
+                        if not isinstance(pos, dict):
+                            continue
+                        p_side = str(pos.get("side", "")).upper()
+                        p_sym = str(pos.get("symbol", "")).upper()
+                        p_slots = int(pos.get("open_slots", 0) or 0)
+                        if p_side in {"LONG", "SHORT"} and p_sym and p_slots > 0:
+                            active_exposures.add((p_sym, p_side))
+                    # Fallback: old single-position format
+                    if not state.get("positions"):
+                        side = str(state.get("side", "")).upper()
+                        symbol = str(state.get("symbol", "")).upper()
+                        open_slots = int(state.get("open_slots", 0) or 0)
+                        if side in {"LONG", "SHORT"} and symbol and open_slots > 0:
+                            active_exposures.add((symbol, side))
 
         for run in selected_runs:
             result = run["result"]
@@ -908,6 +1024,7 @@ class TradingEngine:
                     "opened_at": None,
                     "stop_price": 0.0,
                     "target_price": 0.0,
+                    "positions": [],
                 }
                 for position in open_positions_override:
                     if not isinstance(position, dict):
@@ -925,194 +1042,258 @@ class TradingEngine:
                 final_positions[model_id] = 0.0
                 final_open_slots[model_id] = 0
                 model_open_positions[model_id] = []
-                live_model_state[model_id] = {"entry_armed": True}
+                live_model_state[model_id] = {"entry_armed": True, "positions": []}
                 continue
 
-            active_symbol = str(previous_state.get("symbol") or result.symbol or effective_symbol).upper()
-            market = markets_by_symbol.get(active_symbol, run.get("market"))
-            if market is None or market.empty:
+            # --- Build list of existing positions from previous state ---
+            prev_positions: list[dict[str, Any]] = list(previous_state.get("positions", []))
+            entry_armed = bool(previous_state.get("entry_armed", True))
+            prev_setup_active = bool(previous_state.get("setup_active", False))
+            prev_setup_direction = int(previous_state.get("setup_direction", 0) or 0)
+            current_setup_active = prev_setup_active
+            current_setup_direction = prev_setup_direction
+
+            # Determine a reference timestamp from the run's market
+            run_market = run.get("market")
+            ref_symbol = str(result.symbol).upper()
+            ref_market = markets_by_symbol.get(ref_symbol, run_market)
+            if ref_market is None or ref_market.empty:
                 cumulative_trades[model_id] = model_trade_history
                 trade_events_delta[model_id] = []
                 final_positions[model_id] = 0.0
                 final_open_slots[model_id] = 0
                 model_open_positions[model_id] = []
-                live_model_state[model_id] = {"entry_armed": True}
+                live_model_state[model_id] = {"entry_armed": True, "positions": []}
                 continue
 
-            ts = market.index[-1]
+            ts = ref_market.index[-1]
             ts_key = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
-            prev_last_bar_ts = str(previous_state.get("last_bar_ts") or "")
-            bar_is_new = bool(prev_last_bar_ts) and ts_key != prev_last_bar_ts
+            execution_ts = _current_execution_timestamp()
+            execution_ts_key = execution_ts.isoformat() if hasattr(execution_ts, "isoformat") else str(execution_ts)
 
-            close_price = float(pd.to_numeric(market["close"], errors="coerce").iloc[-1])
-            high_price = float(pd.to_numeric(market["high"], errors="coerce").iloc[-1])
-            low_price = float(pd.to_numeric(market["low"], errors="coerce").iloc[-1])
+            # --- EXIT logic: evaluate each existing position independently ---
+            surviving_positions: list[dict[str, Any]] = []
+            for pos in prev_positions:
+                if not isinstance(pos, dict):
+                    continue
+                pos_symbol = str(pos.get("symbol", "")).upper()
+                pos_side = str(pos.get("side", "")).upper()
+                pos_slots = int(pos.get("open_slots", 0) or 0)
+                if pos_side not in {"LONG", "SHORT"} or not pos_symbol or pos_slots <= 0:
+                    continue
 
-            entry_armed = bool(previous_state.get("entry_armed", True))
-            prev_open_slots = int(previous_state.get("open_slots", 0) or 0)
-            prev_side = str(previous_state.get("side", "")).upper()
-            prev_entry_price = float(previous_state.get("entry_price", 0.0) or 0.0)
-            prev_stop_price = float(previous_state.get("stop_price", 0.0) or 0.0)
-            prev_target_price = float(previous_state.get("target_price", 0.0) or 0.0)
-            prev_opened_at = previous_state.get("opened_at")
+                pos_entry_price = float(pos.get("entry_price", 0.0) or 0.0)
+                pos_stop_price = float(pos.get("stop_price", 0.0) or 0.0)
+                pos_target_price = float(pos.get("target_price", 0.0) or 0.0)
+                pos_opened_at = pos.get("opened_at")
 
-            current_side = prev_side if prev_open_slots > 0 else ""
-            current_open_slots = prev_open_slots
-            current_entry_price = prev_entry_price
-            current_stop_price = prev_stop_price
-            current_target_price = prev_target_price
-            current_opened_at = prev_opened_at
-            current_symbol = active_symbol if prev_open_slots > 0 else str(result.symbol).upper()
+                # Get market data for this position's symbol
+                pos_market = markets_by_symbol.get(pos_symbol)
+                if pos_market is None or pos_market.empty:
+                    surviving_positions.append(pos)
+                    continue
 
-            # --- EXIT logic: always evaluate (stop/target can be hit intra-bar) ---
-            if current_open_slots > 0 and current_side in {"LONG", "SHORT"}:
+                pos_close = float(pd.to_numeric(pos_market["close"], errors="coerce").iloc[-1])
+                pos_high = float(pd.to_numeric(pos_market["high"], errors="coerce").iloc[-1])
+                pos_low = float(pd.to_numeric(pos_market["low"], errors="coerce").iloc[-1])
+
+                forced_exit_reason = None
+                if pos_symbol in BLOCKED_TRADING_SYMBOLS:
+                    forced_exit_reason = "BLOCKED_SYMBOL"
+                elif pos_symbol in claimed_symbols:
+                    forced_exit_reason = "DUPLICATE_SYMBOL"
+
                 hit_exit = False
-                exit_reason = None
-                if current_side == "LONG":
-                    if current_stop_price > 0 and low_price <= current_stop_price:
+                exit_reason = forced_exit_reason
+                if forced_exit_reason is not None:
+                    hit_exit = True
+                if pos_side == "LONG":
+                    if pos_stop_price > 0 and pos_low <= pos_stop_price:
                         hit_exit = True
                         exit_reason = "STOP"
-                    if current_target_price > 0 and high_price >= current_target_price and exit_reason is None:
+                    if pos_target_price > 0 and pos_high >= pos_target_price and exit_reason is None:
                         hit_exit = True
                         exit_reason = "TARGET"
                 else:
-                    if current_stop_price > 0 and high_price >= current_stop_price:
+                    if pos_stop_price > 0 and pos_high >= pos_stop_price:
                         hit_exit = True
                         exit_reason = "STOP"
-                    if current_target_price > 0 and low_price <= current_target_price and exit_reason is None:
+                    if pos_target_price > 0 and pos_low <= pos_target_price and exit_reason is None:
                         hit_exit = True
                         exit_reason = "TARGET"
 
                 if hit_exit:
-                    active_exposures.discard((current_symbol, current_side))
+                    active_exposures.discard((pos_symbol, pos_side))
                     delta_events.append(
                         {
                             "timestamp": ts,
-                            "symbol": current_symbol,
+                            "market_timestamp": ts_key,
+                            "executed_at": execution_ts_key,
+                            "symbol": pos_symbol,
                             "model_id": model_id,
                             "model_name": result.name,
-                            "akce": f"Výstup {current_side} (-{current_open_slots})",
-                            "strana": current_side,
-                            "cena": close_price,
+                            "akce": f"Výstup {pos_side} (-{pos_slots})",
+                            "strana": pos_side,
+                            "cena": pos_close,
                             "pozice": 0.0,
                             "sloty": 0,
                             "duvod_vystupu": exit_reason or "NEURČENO",
-                            "opened_at": current_opened_at,
-                            "entry_price": current_entry_price,
-                            "quantity_slots": current_open_slots,
+                            "opened_at": pos_opened_at,
+                            "entry_price": pos_entry_price,
+                            "quantity_slots": pos_slots,
                         }
                     )
-                    current_side = ""
-                    current_open_slots = 0
-                    current_entry_price = 0.0
-                    current_stop_price = 0.0
-                    current_target_price = 0.0
-                    current_opened_at = None
-                    current_symbol = str(result.symbol).upper()
-                    entry_armed = False
+                else:
+                    surviving_positions.append(pos)
+                    claimed_symbols.add(pos_symbol)
 
-            # --- ENTRY logic: only on NEW bars (closed candle boundary) ---
-            elif bar_is_new:
-                raw = generate_signals(model, market, seed=0)
-                controlled_signal = apply_risk_controls(raw, market["ret"], self.config.risk)
-                confluence, required_votes, reset_votes, atr_pct = self._build_entry_confluence(model, market, controlled_signal)
-                _, _, min_stop_floor, signal_reset_floor = self._trade_profile(model)
+            # --- ENTRY logic: evaluate if model has capacity for more positions ---
+            total_used_slots = sum(int(p.get("open_slots", 0)) for p in surviving_positions)
+            remaining_slot_budget = max(0, 5 - total_used_slots)
+            if len(surviving_positions) < MAX_POSITIONS_PER_MODEL and remaining_slot_budget > 0:
+                entry_symbol = str(result.symbol).upper()
+                # Only evaluate entry on a symbol not already held by this model
+                model_held_symbols = {str(p.get("symbol", "")).upper() for p in surviving_positions}
+                if entry_symbol not in model_held_symbols:
+                    market = markets_by_symbol.get(entry_symbol, run_market)
+                    if market is not None and not market.empty:
+                        close_price = float(pd.to_numeric(market["close"], errors="coerce").iloc[-1])
 
-                signal_value = float(controlled_signal.loc[ts])
-                long_votes = int(confluence.loc[ts, "long_votes"])
-                short_votes = int(confluence.loc[ts, "short_votes"])
-                long_confidence = float(confluence.loc[ts, "long_confidence"])
-                short_confidence = float(confluence.loc[ts, "short_confidence"])
-                vol_step = float(atr_pct.loc[ts])
-                if np.isnan(vol_step) or vol_step <= 0:
-                    vol_step = min_stop_floor
+                        raw = generate_signals(model, market, seed=0)
+                        controlled_signal = apply_risk_controls(raw, market["ret"], self.config.risk)
+                        confluence, required_votes, reset_votes, atr_pct = self._build_entry_confluence(model, market, controlled_signal)
+                        _, _, min_stop_floor, signal_reset_floor = self._trade_profile(model)
 
-                if not entry_armed:
-                    setup_reset = max(long_votes, short_votes) <= reset_votes or abs(signal_value) <= signal_reset_floor
-                    if setup_reset:
-                        entry_armed = True
+                        signal_value = float(controlled_signal.loc[ts])
+                        long_votes = int(confluence.loc[ts, "long_votes"])
+                        short_votes = int(confluence.loc[ts, "short_votes"])
+                        long_confidence = float(confluence.loc[ts, "long_confidence"])
+                        short_confidence = float(confluence.loc[ts, "short_confidence"])
+                        vol_step = float(atr_pct.loc[ts])
+                        if np.isnan(vol_step) or vol_step <= 0:
+                            vol_step = min_stop_floor
 
-                direction = 0
-                confidence = 0.0
-                if entry_armed and long_votes >= required_votes and signal_value > 0 and long_votes > short_votes:
-                    direction = 1
-                    confidence = long_confidence
-                if entry_armed and short_votes >= required_votes and signal_value < 0 and short_votes > long_votes:
-                    direction = -1
-                    confidence = short_confidence
-
-                if direction != 0:
-                    proposed_side = "LONG" if direction > 0 else "SHORT"
-                    proposed_symbol = str(result.symbol).upper()
-                    exposure_key = (proposed_symbol, proposed_side)
-                    if exposure_key in active_exposures:
                         direction = 0
+                        confidence = 0.0
+                        if long_votes >= required_votes and signal_value > 0 and long_votes > short_votes:
+                            direction = 1
+                            confidence = long_confidence
+                        if short_votes >= required_votes and signal_value < 0 and short_votes > long_votes:
+                            direction = -1
+                            confidence = short_confidence
 
-                if direction != 0:
-                    conviction = max(abs(signal_value), confidence)
-                    current_open_slots = int(np.clip(np.ceil(conviction * 5), 1, 5))
-                    current_side = "LONG" if direction > 0 else "SHORT"
-                    current_entry_price = close_price
-                    current_opened_at = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
-                    current_symbol = str(result.symbol).upper()
-                    stop_dist = max(min_stop_floor, self._trade_profile(model)[0] * max(vol_step, min_stop_floor))
-                    target_dist = max(stop_dist * 1.8, self._trade_profile(model)[1] * max(vol_step, min_stop_floor))
-                    if current_side == "LONG":
-                        current_stop_price = close_price * (1.0 - stop_dist)
-                        current_target_price = close_price * (1.0 + target_dist)
-                    else:
-                        current_stop_price = close_price * (1.0 + stop_dist)
-                        current_target_price = close_price * (1.0 - target_dist)
+                        setup_reset = max(long_votes, short_votes) <= reset_votes or abs(signal_value) <= signal_reset_floor
+                        if setup_reset:
+                            entry_armed = True
+                            current_setup_active = False
+                            current_setup_direction = 0
+                        else:
+                            current_setup_active = direction != 0
+                            current_setup_direction = direction
 
-                    delta_events.append(
-                        {
-                            "timestamp": ts,
-                            "symbol": current_symbol,
-                            "model_id": model_id,
-                            "model_name": result.name,
-                            "akce": f"Vstup {current_side} (+{current_open_slots})",
-                            "strana": current_side,
-                            "cena": close_price,
-                            "pozice": float(direction * current_open_slots * slot_size),
-                            "sloty": current_open_slots,
-                        }
-                    )
-                    active_exposures.add((current_symbol, current_side))
-                    entry_armed = False
+                        setup_just_activated = current_setup_active and (
+                            not prev_setup_active or prev_setup_direction != current_setup_direction
+                        )
+
+                        if direction != 0:
+                            proposed_side = "LONG" if direction > 0 else "SHORT"
+                            proposed_symbol = entry_symbol
+                            exposure_key = (proposed_symbol, proposed_side)
+                            if exposure_key in active_exposures:
+                                direction = 0
+
+                        if direction != 0 and entry_armed and setup_just_activated:
+                            conviction = max(abs(signal_value), confidence)
+                            new_open_slots = int(np.clip(np.ceil(conviction * 5), 1, 5))
+                            new_side = "LONG" if direction > 0 else "SHORT"
+                            stop_dist = max(min_stop_floor, self._trade_profile(model)[0] * max(vol_step, min_stop_floor))
+                            target_dist = max(stop_dist * 1.8, self._trade_profile(model)[1] * max(vol_step, min_stop_floor))
+                            if new_side == "LONG":
+                                new_stop = close_price * (1.0 - stop_dist)
+                                new_target = close_price * (1.0 + target_dist)
+                            else:
+                                new_stop = close_price * (1.0 + stop_dist)
+                                new_target = close_price * (1.0 - target_dist)
+
+                            delta_events.append(
+                                {
+                                    "timestamp": ts,
+                                    "market_timestamp": ts_key,
+                                    "executed_at": execution_ts_key,
+                                    "symbol": entry_symbol,
+                                    "model_id": model_id,
+                                    "model_name": result.name,
+                                    "akce": f"Vstup {new_side} (+{new_open_slots})",
+                                    "strana": new_side,
+                                    "cena": close_price,
+                                    "pozice": float(direction * new_open_slots * slot_size),
+                                    "sloty": new_open_slots,
+                                }
+                            )
+                            active_exposures.add((entry_symbol, new_side))
+                            surviving_positions.append(
+                                {
+                                    "symbol": entry_symbol,
+                                    "side": new_side,
+                                    "open_slots": new_open_slots,
+                                    "entry_price": close_price,
+                                    "stop_price": new_stop,
+                                    "target_price": new_target,
+                                    "opened_at": execution_ts_key,
+                                }
+                            )
+                            entry_armed = False
+                            claimed_symbols.add(entry_symbol)
+
+            # --- Build final state ---
+            total_slots = sum(int(p.get("open_slots", 0)) for p in surviving_positions)
+            net_signed = sum(
+                (1 if p.get("side") == "LONG" else -1) * int(p.get("open_slots", 0))
+                for p in surviving_positions
+            )
+            primary = surviving_positions[0] if surviving_positions else {}
 
             cumulative_trades[model_id] = model_trade_history + delta_events
             trade_events_delta[model_id] = delta_events
-            final_open_slots[model_id] = int(current_open_slots)
-            side_sign = 1.0 if current_side == "LONG" else (-1.0 if current_side == "SHORT" else 0.0)
-            final_positions[model_id] = float(side_sign * current_open_slots * slot_size)
+            final_open_slots[model_id] = total_slots
+            final_positions[model_id] = float(net_signed * slot_size)
             live_model_state[model_id] = {
                 "entry_armed": entry_armed,
                 "last_bar_ts": ts_key,
-                "symbol": current_symbol,
-                "side": current_side,
-                "open_slots": int(current_open_slots),
-                "entry_price": float(current_entry_price),
-                "opened_at": current_opened_at,
-                "stop_price": float(current_stop_price),
-                "target_price": float(current_target_price),
+                "setup_active": current_setup_active,
+                "setup_direction": int(current_setup_direction),
+                "symbol": str(primary.get("symbol", result.symbol)).upper(),
+                "side": str(primary.get("side", "")).upper(),
+                "open_slots": total_slots,
+                "entry_price": float(primary.get("entry_price", 0.0) or 0.0),
+                "opened_at": primary.get("opened_at"),
+                "stop_price": float(primary.get("stop_price", 0.0) or 0.0),
+                "target_price": float(primary.get("target_price", 0.0) or 0.0),
+                "positions": surviving_positions,
             }
 
-            if current_open_slots > 0 and current_side in {"LONG", "SHORT"} and current_symbol:
-                model_open_positions[model_id] = [
-                    {
-                        "slot": slot_idx + 1,
-                        "slots": 1,
-                        "symbol": current_symbol,
-                        "side": current_side,
-                        "model_id": model_id,
-                        "model_name": result.name,
-                        "entry_price": float(current_entry_price),
-                        "opened_at": current_opened_at,
-                        "stop_price": float(current_stop_price),
-                        "target_price": float(current_target_price),
-                    }
-                    for slot_idx in range(current_open_slots)
-                ]
+            if surviving_positions:
+                pos_entries: list[dict[str, Any]] = []
+                for pos in surviving_positions:
+                    p_sym = str(pos.get("symbol", "")).upper()
+                    p_side = str(pos.get("side", "")).upper()
+                    p_slots = int(pos.get("open_slots", 0) or 0)
+                    for slot_idx in range(p_slots):
+                        pos_entries.append(
+                            {
+                                "slot": len(pos_entries) + 1,
+                                "slots": 1,
+                                "symbol": p_sym,
+                                "side": p_side,
+                                "model_id": model_id,
+                                "model_name": result.name,
+                                "entry_price": float(pos.get("entry_price", 0.0) or 0.0),
+                                "opened_at": pos.get("opened_at"),
+                                "stop_price": float(pos.get("stop_price", 0.0) or 0.0),
+                                "target_price": float(pos.get("target_price", 0.0) or 0.0),
+                            }
+                        )
+                model_open_positions[model_id] = pos_entries
             else:
                 model_open_positions[model_id] = []
 
@@ -1136,9 +1317,11 @@ class TradingEngine:
         model: ModelSpec,
         candidate_symbols: list[str],
         opportunity_scores: dict[str, float],
+        excluded_symbols: set[str] | None = None,
     ) -> list[str]:
+        excluded = {str(symbol).upper() for symbol in (excluded_symbols or set())}
         ranked = sorted(
-            candidate_symbols,
+            [symbol for symbol in candidate_symbols if symbol not in BLOCKED_TRADING_SYMBOLS and symbol not in excluded],
             key=lambda symbol: float(opportunity_scores.get(symbol, 0.0)),
             reverse=True,
         )
@@ -1146,7 +1329,7 @@ class TradingEngine:
         shortlist = ranked[:shortlist_size]
 
         previous_symbol = self._model_symbol_memory.get(model.model_id)
-        if previous_symbol and previous_symbol in candidate_symbols and previous_symbol not in shortlist:
+        if previous_symbol and previous_symbol in candidate_symbols and previous_symbol not in BLOCKED_TRADING_SYMBOLS and previous_symbol not in excluded and previous_symbol not in shortlist:
             shortlist = [previous_symbol] + shortlist[:-1]
 
         if model.kind == "mean_reversion" and len(ranked) > shortlist_size:
@@ -1154,7 +1337,8 @@ class TradingEngine:
             if tail_candidate not in shortlist:
                 shortlist.append(tail_candidate)
 
-        return list(dict.fromkeys(shortlist or candidate_symbols[:1]))
+        fallback_candidates = [symbol for symbol in candidate_symbols if symbol not in BLOCKED_TRADING_SYMBOLS]
+        return list(dict.fromkeys(shortlist or fallback_candidates[:1]))
 
     def run_week(
         self,
@@ -1241,8 +1425,32 @@ class TradingEngine:
 
         selected_runs: list[dict] = []
         models_to_run = list(self.models)
+        reserved_symbols: set[str] = set()
+        previous_live_states = {
+            model.model_id: self._previous_live_state(previous_summary, model.model_id)
+            for model in models_to_run
+        }
+
+        # Reserve ALL symbols held in any model's positions (multi-position aware)
+        for state in previous_live_states.values():
+            if not isinstance(state, dict):
+                continue
+            for pos in state.get("positions", []):
+                if not isinstance(pos, dict):
+                    continue
+                p_sym = str(pos.get("symbol", "")).upper()
+                p_slots = int(pos.get("open_slots", 0) or 0)
+                if p_sym and p_slots > 0:
+                    reserved_symbols.add(p_sym)
+            # Fallback: old single-position format
+            if not state.get("positions"):
+                if int(state.get("open_slots", 0) or 0) > 0:
+                    previous_symbol = str(state.get("symbol", "")).upper()
+                    if previous_symbol:
+                        reserved_symbols.add(previous_symbol)
 
         for model in models_to_run:
+            previous_state = previous_live_states.get(model.model_id, {})
             if model.kind == "copy_trader":
                 chosen_run = self._build_copy_trader_run(
                     model=model,
@@ -1252,11 +1460,53 @@ class TradingEngine:
                 )
                 self._model_symbol_memory[model.model_id] = str(chosen_run["result"].symbol).upper()
                 selected_runs.append(chosen_run)
+                for position in chosen_run.get("open_positions_override", []):
+                    if isinstance(position, dict):
+                        symbol_value = str(position.get("symbol", "")).upper()
+                        if symbol_value:
+                            reserved_symbols.add(symbol_value)
+                result_symbol = str(chosen_run["result"].symbol).upper()
+                if result_symbol:
+                    reserved_symbols.add(result_symbol)
                 continue
 
             candidate_runs: list[dict] = []
-            shortlist_symbols = self._shortlist_candidate_symbols(model, candidate_symbols, opportunity_scores)
+
+            # Collect symbols this model already holds (multi-position)
+            model_held_symbols: set[str] = set()
+            for pos in previous_state.get("positions", []):
+                if isinstance(pos, dict):
+                    p_sym = str(pos.get("symbol", "")).upper()
+                    p_slots = int(pos.get("open_slots", 0) or 0)
+                    if p_sym and p_slots > 0:
+                        model_held_symbols.add(p_sym)
+            # Fallback: old single-position format
+            if not model_held_symbols and isinstance(previous_state, dict) and int(previous_state.get("open_slots", 0) or 0) > 0:
+                p_sym = str(previous_state.get("symbol", "")).upper()
+                if p_sym:
+                    model_held_symbols.add(p_sym)
+
+            # If model is at max capacity, pin to primary symbol (no new entry possible)
+            if len(model_held_symbols) >= MAX_POSITIONS_PER_MODEL:
+                primary_symbol = str(previous_state.get("symbol", "")).upper()
+                if primary_symbol and primary_symbol in markets_by_symbol:
+                    shortlist_symbols = [primary_symbol]
+                else:
+                    shortlist_symbols = list(model_held_symbols)[:1]
+            else:
+                # Choose a NEW symbol not already held by this model
+                model_exclusions = reserved_symbols | model_held_symbols
+                shortlist_symbols = self._shortlist_candidate_symbols(
+                    model,
+                    candidate_symbols,
+                    opportunity_scores,
+                    excluded_symbols=model_exclusions,
+                )
+                if not shortlist_symbols:
+                    shortlist_symbols = self._shortlist_candidate_symbols(model, candidate_symbols, opportunity_scores)
             for candidate_symbol in shortlist_symbols:
+                if candidate_symbol in BLOCKED_TRADING_SYMBOLS:
+                    continue
                 market = markets_by_symbol[candidate_symbol]
                 result, events, final_position, final_open_slots = self._simulate_model(model, market, symbol=candidate_symbol)
                 candidate_runs.append(
@@ -1269,9 +1519,14 @@ class TradingEngine:
                         "opportunity_score": float(opportunity_scores.get(candidate_symbol, 0.0)),
                     }
                 )
+            if not candidate_runs:
+                continue
             chosen_run = self._select_candidate_run(candidate_runs)
             self._model_symbol_memory[model.model_id] = str(chosen_run["result"].symbol).upper()
             selected_runs.append(chosen_run)
+            chosen_symbol = str(chosen_run["result"].symbol).upper()
+            if chosen_symbol:
+                reserved_symbols.add(chosen_symbol)
 
         results = [run["result"] for run in selected_runs]
         model_trades = {run["result"].model_id: run["events"] for run in selected_runs}
@@ -1307,6 +1562,23 @@ class TradingEngine:
                 markets_by_symbol=markets_by_symbol,
                 effective_symbol=effective_symbol,
             )
+            for model_id, state in live_model_state.items():
+                if not isinstance(state, dict):
+                    continue
+                active_symbol = str(state.get("symbol", "")).upper()
+                if not active_symbol:
+                    continue
+                model_selected_symbols[str(model_id)] = active_symbol
+                if active_symbol in markets_by_symbol:
+                    model_markets[str(model_id)] = markets_by_symbol[active_symbol]
+            if not results_df.empty and "model_id" in results_df.columns:
+                results_df["symbol"] = results_df["model_id"].astype(str).map(model_selected_symbols).fillna(results_df["symbol"])
+                refreshed_champion_row = results_df[results_df["model_id"].astype(str) == champion_model_id]
+                if not refreshed_champion_row.empty:
+                    champion = refreshed_champion_row.iloc[0].to_dict()
+                    champion["reward_usd"] = max(1.0, float(champion.get("score", champion_score or 1.0)) * 10.0)
+                    champion_symbol = str(champion.get("symbol", effective_symbol)).upper()
+                    champion_market = model_markets.get(champion_model_id, markets_by_symbol.get(champion_symbol))
         else:
             model_open_positions = self._build_model_open_positions(
                 results_df=results_df,
@@ -1359,10 +1631,6 @@ class TradingEngine:
 
     def _evolve_generation(self, leaderboard: pd.DataFrame) -> None:
         self.generation += 1
-        top = leaderboard.head(2)
-        carry_ids = set(top["model_id"].tolist())
-
-        keep = [m for m in self.models if m.model_id in carry_ids and m.kind != "copy_trader"]
 
         def _model_id(base_id: str) -> str:
             namespace = self.model_namespace.strip().upper()
@@ -1370,18 +1638,34 @@ class TradingEngine:
 
         prefix = f"{self.model_label_prefix.strip()} | " if self.model_label_prefix.strip() else ""
 
-        offspring_pool = [
-            ModelSpec(_model_id("M6"), f"{prefix}Potomek A (mutovaný trend)", "trend_vol", self.generation),
-            ModelSpec(_model_id("M7"), f"{prefix}Potomek B (mutované momentum)", "xsec_momentum", self.generation),
-            ModelSpec(_model_id("M8"), f"{prefix}Potomek C (mutovaný meta model)", "meta_ensemble", self.generation),
-            ModelSpec(_model_id("M9"), f"{prefix}Stabilizační kotva MR", "mean_reversion", self.generation),
-            ModelSpec(_model_id("M10"), f"{prefix}Stabilizační kotva overlay", "onchain_sentiment_overlay", self.generation),
+        model_by_id = {model.model_id: model for model in self.models if model.kind != "copy_trader"}
+        scored_rows: list[tuple[str, float, str]] = []
+        if isinstance(leaderboard, pd.DataFrame) and {"model_id", "score"}.issubset(leaderboard.columns):
+            for _, row in leaderboard.iterrows():
+                model_id = str(row["model_id"])
+                model = model_by_id.get(model_id)
+                if model is None:
+                    continue
+                scored_rows.append((model.kind, float(row.get("score", 0.0)), model.name))
+
+        best_name_by_kind: dict[str, str] = {}
+        for kind, _score, model_name in sorted(scored_rows, key=lambda item: item[1], reverse=True):
+            if kind in best_name_by_kind:
+                continue
+            best_name_by_kind[kind] = str(model_name)
+
+        standard_models = [
+            ModelSpec(
+                _model_id(base_id),
+                best_name_by_kind.get(kind, f"{prefix}{default_name}"),
+                kind,
+                self.generation,
+            )
+            for base_id, default_name, kind in STANDARD_MODEL_BLUEPRINTS
         ]
-        children_needed = max(0, 5 - len(keep))
-        children = offspring_pool[:children_needed]
 
         copy_anchor = [
             ModelSpec(_model_id("MC"), f"{prefix}Kopie lead tradera Binance", "copy_trader", self.generation),
         ]
 
-        self.models = keep + children + copy_anchor
+        self.models = standard_models + copy_anchor

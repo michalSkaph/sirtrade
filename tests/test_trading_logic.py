@@ -15,7 +15,7 @@ from src.sirtrade.engine import ModelResult
 from src.sirtrade.execution import build_dry_run_orders
 from src.sirtrade.copy_trading import LeadTraderProfile, select_best_lead_trader
 from src.sirtrade.health_server import _build_worker_health_payload
-from src.sirtrade.live_worker import _apply_trade_cutoff, should_start_embedded_worker
+from src.sirtrade.live_worker import _apply_trade_cutoff, _choose_segments, _get_binance_cadence_seconds, should_start_embedded_worker
 from src.sirtrade.market_stream import apply_stream_kline_to_market
 from src.sirtrade.models import ModelSpec
 from src.sirtrade.storage import _build_closed_positions_rows, clear_trade_history, init_db, load_open_positions, save_open_positions
@@ -222,14 +222,28 @@ class TradingLogicTests(unittest.TestCase):
             atr_pct = pd.Series(0.01, index=index)
             return confluence, 5, 2, atr_pct
 
-        strong_signal_a = pd.Series(1.0, index=market_a.index)
+        def _weak_confluence(model, market, controlled_signal):
+            index = market.index
+            confluence = pd.DataFrame(
+                {
+                    "long_votes": [0] * len(index),
+                    "short_votes": [0] * len(index),
+                    "long_confidence": [0.0] * len(index),
+                    "short_confidence": [0.0] * len(index),
+                },
+                index=index,
+            )
+            atr_pct = pd.Series(0.01, index=index)
+            return confluence, 5, 2, atr_pct
+
+        strong_signal_a = pd.Series(0.0, index=market_a.index)
         strong_signal_b = pd.Series(1.0, index=market_b.index)
 
         with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
             "src.sirtrade.engine.get_market_data", return_value=market_a
         ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
             "src.sirtrade.engine.generate_signals", return_value=strong_signal_a
-        ), patch.object(TradingEngine, "_build_entry_confluence", side_effect=_mock_confluence):
+        ), patch.object(TradingEngine, "_build_entry_confluence", side_effect=_weak_confluence):
             first = engine.run_week(days=7, market_source="binance", symbol="BTCUSDT", interval="15m")
 
         self.assertEqual(first["final_open_slots"]["M1"], 0)
@@ -254,6 +268,126 @@ class TradingLogicTests(unittest.TestCase):
         self.assertEqual(second["final_open_slots"]["M1"], 4)
         self.assertEqual(second["trade_events_delta"]["M2"], [])
         self.assertEqual(second["final_open_slots"]["M2"], 0)
+
+    def test_live_cycle_closes_duplicate_symbol_positions_across_models(self) -> None:
+        engine = TradingEngine()
+        engine.models = [
+            ModelSpec("M1", "Trend", "trend_vol", 1),
+            ModelSpec("M2", "Momentum", "xsec_momentum", 1),
+        ]
+        market = _build_market_frame()
+        universe = pd.DataFrame([{"symbol": "BTCUSDT", "opportunity_score": 1.0}])
+        ts_key = market.index[-1].isoformat()
+        prev = {
+            "model_trades": {"M1": [], "M2": []},
+            "live_model_state": {
+                "M1": {
+                    "entry_armed": False,
+                    "last_bar_ts": ts_key,
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "open_slots": 2,
+                    "entry_price": 100.0,
+                    "opened_at": "2026-01-01T00:00:00Z",
+                    "stop_price": 95.0,
+                    "target_price": 110.0,
+                },
+                "M2": {
+                    "entry_armed": False,
+                    "last_bar_ts": ts_key,
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "open_slots": 1,
+                    "entry_price": 100.0,
+                    "opened_at": "2026-01-01T00:05:00Z",
+                    "stop_price": 95.0,
+                    "target_price": 110.0,
+                },
+            },
+            "model_open_positions": {
+                "M1": [{"symbol": "BTCUSDT", "side": "LONG", "slots": 2}],
+                "M2": [{"symbol": "BTCUSDT", "side": "LONG", "slots": 1}],
+            },
+        }
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None):
+            result = engine.run_week(days=7, market_source="binance", symbol="BTCUSDT", interval="15m", previous_summary=prev)
+
+        self.assertGreater(result["final_open_slots"]["M1"], 0)
+        self.assertEqual(result["final_open_slots"]["M2"], 0)
+        self.assertEqual(result["trade_events_delta"]["M2"][0]["duvod_vystupu"], "DUPLICATE_SYMBOL")
+
+    def test_run_week_pins_open_live_symbol_and_filters_usdcusdt(self) -> None:
+        engine = TradingEngine()
+        engine.models = [ModelSpec("M1", "Trend", "trend_vol", 1)]
+        btc_market = _build_market_frame()
+        sol_market = _build_flat_market_frame()
+        universe = pd.DataFrame(
+            [
+                {"symbol": "USDCUSDT", "opportunity_score": 5.0},
+                {"symbol": "BTCUSDT", "opportunity_score": 2.0},
+            ]
+        )
+        prev = {
+            "live_model_state": {
+                "M1": {
+                    "entry_armed": False,
+                    "symbol": "SOLUSDT",
+                    "side": "LONG",
+                    "open_slots": 1,
+                    "entry_price": 100.0,
+                    "opened_at": "2026-01-01T00:00:00Z",
+                    "stop_price": 98.0,
+                    "target_price": 102.0,
+                }
+            },
+            "model_open_positions": {"M1": [{"symbol": "SOLUSDT", "side": "LONG", "slots": 1}]},
+        }
+
+        def market_for_symbol(source, days, symbol, seed, interval="1d"):
+            return sol_market if symbol == "SOLUSDT" else btc_market
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", side_effect=market_for_symbol
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None):
+            summary = engine.run_week(days=7, market_source="binance", symbol="BTCUSDT", interval="15m", previous_summary=prev)
+
+        self.assertNotIn("USDCUSDT", summary["candidate_symbols"])
+        self.assertEqual(summary["model_selected_symbols"]["M1"], "SOLUSDT")
+        self.assertIs(summary["model_markets"]["M1"], sol_market)
+
+    def test_choose_segments_runs_all_runnable_segments_in_binance_mode(self) -> None:
+        worker_state = {"segment_cursor": 1}
+
+        selected = _choose_segments(
+            ["Scalp", "Intraday", "Swing"],
+            active_segment="Swing",
+            worker_state=worker_state,
+            data_source="binance",
+        )
+
+        self.assertEqual(selected, ["Scalp", "Intraday", "Swing"])
+        self.assertEqual(worker_state["segment_cursor"], 1)
+
+    def test_binance_cadence_uses_segment_defaults(self) -> None:
+        with patch.dict("os.environ", {}, clear=False):
+            self.assertEqual(_get_binance_cadence_seconds("Scalp"), 5)
+            self.assertEqual(_get_binance_cadence_seconds("Intraday"), 10)
+            self.assertEqual(_get_binance_cadence_seconds("Swing"), 30)
+
+    def test_binance_cadence_accepts_env_override(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "SIRTRADE_BINANCE_DECISION_SECONDS": "12",
+                "SIRTRADE_BINANCE_DECISION_SECONDS_SCALP": "3",
+            },
+            clear=False,
+        ):
+            self.assertEqual(_get_binance_cadence_seconds("Scalp"), 3)
+            self.assertEqual(_get_binance_cadence_seconds("Intraday"), 12)
 
     def test_init_db_is_idempotent_and_normalizes_legacy_sides(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -649,7 +783,8 @@ class TradingLogicTests(unittest.TestCase):
         self.assertEqual(summary["champion"]["symbol"], "SOLUSDT")
         standard_rows = summary["results"][summary["results"]["model_id"] != "MC"]
         self.assertEqual(len(summary["results"]), 6)
-        self.assertTrue(all(row_symbol == "SOLUSDT" for row_symbol in standard_rows["symbol"].tolist()))
+        self.assertIn("SOLUSDT", standard_rows["symbol"].tolist())
+        self.assertGreaterEqual(len(set(standard_rows["symbol"].tolist())), 2)
 
     def test_evolve_generation_keeps_fixed_model_budget_per_segment(self) -> None:
         engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")
@@ -669,6 +804,8 @@ class TradingLogicTests(unittest.TestCase):
         self.assertEqual(len(engine.models), 6)
         self.assertEqual(sum(model.kind == "copy_trader" for model in engine.models), 1)
         self.assertEqual(sum(model.kind != "copy_trader" for model in engine.models), 5)
+        standard_kinds = [model.kind for model in engine.models if model.kind != "copy_trader"]
+        self.assertEqual(len(set(standard_kinds)), 5)
 
     def test_select_best_lead_trader_prefers_higher_weighted_score(self) -> None:
         conservative = LeadTraderProfile(
@@ -727,96 +864,187 @@ class TradingLogicTests(unittest.TestCase):
         self.assertEqual(sum(int(item.get("slots", 0)) for item in summary["model_open_positions"]["MC"]), 5)
         self.assertEqual({order["symbol"] for order in summary["proposed_orders"]}, {"BTCUSDT", "ETHUSDT"})
 
-    def test_live_cycle_does_not_reopen_position_each_worker_tick(self) -> None:
-        """Entry fires only when bar changes; same bar = no new entry."""
+    def test_live_cycle_enters_when_setup_activates_without_waiting_for_new_bar(self) -> None:
+        """A newly active setup can enter on the current live candle."""
         engine = TradingEngine()
         engine.models = [ModelSpec("M1", "Trend", "trend_vol", 1)]
-        market_a = _build_market_frame()
-        # market_b has one extra bar at the end → different last-bar timestamp
-        extra_idx = market_a.index[-1] + pd.Timedelta(hours=1)
-        extra_row = market_a.iloc[[-1]].copy()
-        extra_row.index = pd.DatetimeIndex([extra_idx])
-        market_b = pd.concat([market_a, extra_row])
+        market = _build_market_frame()
 
         universe = pd.DataFrame([{"symbol": "BTCUSDT", "opportunity_score": 1.0}])
+        weak_signal = pd.Series(0.0, index=market.index)
+        strong_signal = pd.Series(1.0, index=market.index)
 
-        # Cycle 1: first ever run → seeds last_bar_ts, no entry (no prior bar to compare)
+        def _weak_confluence(model, market, controlled_signal):
+            index = market.index
+            confluence = pd.DataFrame(
+                {
+                    "long_votes": [0] * len(index),
+                    "short_votes": [0] * len(index),
+                    "long_confidence": [0.0] * len(index),
+                    "short_confidence": [0.0] * len(index),
+                },
+                index=index,
+            )
+            atr_pct = pd.Series(0.01, index=index)
+            return confluence, 5, 2, atr_pct
+
+        def _strong_confluence(model, market, controlled_signal):
+            index = market.index
+            confluence = pd.DataFrame(
+                {
+                    "long_votes": [6] * len(index),
+                    "short_votes": [0] * len(index),
+                    "long_confidence": [0.8] * len(index),
+                    "short_confidence": [0.0] * len(index),
+                },
+                index=index,
+            )
+            atr_pct = pd.Series(0.01, index=index)
+            return confluence, 5, 2, atr_pct
+
         with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
-            "src.sirtrade.engine.get_market_data", return_value=market_a
+            "src.sirtrade.engine.get_market_data", return_value=market
         ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None):
-            first = engine.run_week(days=7, market_source="binance", symbol="BTCUSDT", interval="15m")
+            with patch("src.sirtrade.engine.generate_signals", return_value=weak_signal), patch.object(
+                TradingEngine,
+                "_build_entry_confluence",
+                side_effect=_weak_confluence,
+            ):
+                first = engine.run_week(days=7, market_source="binance", symbol="BTCUSDT", interval="15m")
 
-        self.assertEqual(len(first["trade_events_delta"]["M1"]), 0, "First cycle must not enter (no prior bar)")
-        self.assertTrue(first["live_model_state"]["M1"].get("last_bar_ts"), "last_bar_ts must be seeded")
-
-        # Clear market-data cache so cycle 2 sees market_b
+        self.assertEqual(len(first["trade_events_delta"]["M1"]), 0)
+        self.assertTrue(first["live_model_state"]["M1"].get("entry_armed"))
         engine._live_snapshot_cache.clear()
 
-        # Cycle 2: new bar (market_b) → entry should fire
         with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
-            "src.sirtrade.engine.get_market_data", return_value=market_b
+            "src.sirtrade.engine.get_market_data", return_value=market
         ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None):
-            second = engine.run_week(
-                days=7, market_source="binance", symbol="BTCUSDT", interval="15m",
-                previous_summary=first,
-            )
+            with patch("src.sirtrade.engine.generate_signals", return_value=strong_signal), patch.object(
+                TradingEngine,
+                "_build_entry_confluence",
+                side_effect=_strong_confluence,
+            ):
+                second = engine.run_week(
+                    days=7,
+                    market_source="binance",
+                    symbol="BTCUSDT",
+                    interval="15m",
+                    previous_summary=first,
+                )
 
-        self.assertTrue(second["trade_events_delta"]["M1"], "New bar must trigger entry")
+        self.assertTrue(second["trade_events_delta"]["M1"])
         self.assertGreater(second["final_open_slots"]["M1"], 0)
+        self.assertEqual(second["live_model_state"]["M1"].get("last_bar_ts"), first["live_model_state"]["M1"].get("last_bar_ts"))
 
-        # Cycle 3: same bar (market_b again) → no new entry
         with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
-            "src.sirtrade.engine.get_market_data", return_value=market_b
+            "src.sirtrade.engine.get_market_data", return_value=market
         ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None):
-            third = engine.run_week(
-                days=7, market_source="binance", symbol="BTCUSDT", interval="15m",
-                previous_summary=second,
-            )
+            with patch("src.sirtrade.engine.generate_signals", return_value=strong_signal), patch.object(
+                TradingEngine,
+                "_build_entry_confluence",
+                side_effect=_strong_confluence,
+            ):
+                third = engine.run_week(
+                    days=7,
+                    market_source="binance",
+                    symbol="BTCUSDT",
+                    interval="15m",
+                    previous_summary=second,
+                )
 
-        self.assertEqual(len(third["trade_events_delta"]["M1"]), 0, "Same bar must not trigger entry")
-        self.assertGreater(third["final_open_slots"]["M1"], 0, "Position must remain open")
+        self.assertEqual(len(third["trade_events_delta"]["M1"]), 0)
+        self.assertGreater(third["final_open_slots"]["M1"], 0)
 
-    def test_same_bar_does_not_trigger_new_entry(self) -> None:
-        """Even with entry_armed=True and strong signal, same bar = no entry."""
+    def test_same_active_setup_does_not_retrigger_entry_on_same_bar(self) -> None:
+        """A setup that stays active must not emit duplicate entries on worker ticks."""
         engine = TradingEngine()
         engine.models = [ModelSpec("M1", "Trend", "trend_vol", 1)]
         market = _build_market_frame()
         universe = pd.DataFrame([{"symbol": "BTCUSDT", "opportunity_score": 1.0}])
         strong_signal = pd.Series(1.0, index=market.index)
 
-        # Build a fake previous_summary with last_bar_ts matching current market's last bar
-        last_ts = market.index[-1]
-        ts_key = last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts)
-        prev = {
-            "model_trades": {"M1": []},
-            "live_model_state": {
-                "M1": {
-                    "entry_armed": True,
-                    "last_bar_ts": ts_key,
-                    "symbol": "BTCUSDT",
-                    "side": "",
-                    "open_slots": 0,
-                    "entry_price": 0.0,
-                    "opened_at": None,
-                    "stop_price": 0.0,
-                    "target_price": 0.0,
-                }
-            },
-            "model_open_positions": {"M1": []},
-        }
+        def _strong_confluence(model, market, controlled_signal):
+            index = market.index
+            confluence = pd.DataFrame(
+                {
+                    "long_votes": [6] * len(index),
+                    "short_votes": [0] * len(index),
+                    "long_confidence": [0.8] * len(index),
+                    "short_confidence": [0.0] * len(index),
+                },
+                index=index,
+            )
+            atr_pct = pd.Series(0.01, index=index)
+            return confluence, 5, 2, atr_pct
 
         with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
             "src.sirtrade.engine.get_market_data", return_value=market
         ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
             "src.sirtrade.engine.generate_signals", return_value=strong_signal
-        ):
-            result = engine.run_week(
-                days=7, market_source="binance", symbol="BTCUSDT", interval="5m",
-                previous_summary=prev,
+        ), patch.object(TradingEngine, "_build_entry_confluence", side_effect=_strong_confluence):
+            first = engine.run_week(days=7, market_source="binance", symbol="BTCUSDT", interval="5m")
+
+        self.assertEqual(len(first["trade_events_delta"]["M1"]), 1)
+        self.assertGreater(first["final_open_slots"]["M1"], 0)
+
+        engine._live_snapshot_cache.clear()
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
+            "src.sirtrade.engine.generate_signals", return_value=strong_signal
+        ), patch.object(TradingEngine, "_build_entry_confluence", side_effect=_strong_confluence):
+            second = engine.run_week(
+                days=7,
+                market_source="binance",
+                symbol="BTCUSDT",
+                interval="5m",
+                previous_summary=first,
             )
 
-        self.assertEqual(len(result["trade_events_delta"]["M1"]), 0)
-        self.assertEqual(result["final_open_slots"]["M1"], 0)
+        self.assertEqual(len(second["trade_events_delta"]["M1"]), 0)
+        self.assertEqual(second["final_open_slots"]["M1"], first["final_open_slots"]["M1"])
+
+    def test_live_entry_records_execution_time_separately_from_bar_time(self) -> None:
+        engine = TradingEngine()
+        engine.models = [ModelSpec("M1", "Trend", "trend_vol", 1)]
+        market = _build_market_frame()
+        universe = pd.DataFrame([{"symbol": "BTCUSDT", "opportunity_score": 1.0}])
+        strong_signal = pd.Series(1.0, index=market.index)
+        execution_ts = pd.Timestamp("2026-01-03T12:34:56Z")
+
+        def _strong_confluence(model, market, controlled_signal):
+            index = market.index
+            confluence = pd.DataFrame(
+                {
+                    "long_votes": [6] * len(index),
+                    "short_votes": [0] * len(index),
+                    "long_confidence": [0.8] * len(index),
+                    "short_confidence": [0.0] * len(index),
+                },
+                index=index,
+            )
+            atr_pct = pd.Series(0.01, index=index)
+            return confluence, 5, 2, atr_pct
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
+            "src.sirtrade.engine.generate_signals", return_value=strong_signal
+        ), patch.object(TradingEngine, "_build_entry_confluence", side_effect=_strong_confluence), patch(
+            "src.sirtrade.engine._current_execution_timestamp",
+            return_value=execution_ts,
+        ):
+            result = engine.run_week(days=7, market_source="binance", symbol="BTCUSDT", interval="5m")
+
+        event = result["trade_events_delta"]["M1"][0]
+        self.assertEqual(str(event["executed_at"]), execution_ts.isoformat())
+        self.assertEqual(str(result["live_model_state"]["M1"]["opened_at"]), execution_ts.isoformat())
+        self.assertEqual(
+            pd.to_datetime(event["market_timestamp"], utc=True),
+            pd.to_datetime(event["timestamp"], utc=True),
+        )
+        self.assertNotEqual(str(event["executed_at"]), str(event["timestamp"]))
 
 
 if __name__ == "__main__":

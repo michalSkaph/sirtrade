@@ -73,7 +73,7 @@ def _build_closed_positions_rows(summary: dict) -> list[tuple]:
                 price = float(event.get("cena", 0.0))
             except Exception:
                 continue
-            timestamp = str(event.get("timestamp", ""))
+            timestamp = str(event.get("executed_at", event.get("timestamp", "")))
             symbol = str(event.get("symbol", default_symbol)).upper()
 
             if "Vstup" in action:

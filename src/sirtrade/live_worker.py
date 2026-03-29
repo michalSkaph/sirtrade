@@ -25,9 +25,9 @@ from .ui_state import (
 
 
 SEGMENT_DEFAULTS = {
-    "Scalp": {"interval": "5m", "sim_days": 3, "namespace": "SC"},
-    "Intraday": {"interval": "15m", "sim_days": 7, "namespace": "ID"},
-    "Swing": {"interval": "4h", "sim_days": 30, "namespace": "SW"},
+    "Scalp": {"interval": "1m", "sim_days": 1, "namespace": "SC", "binance_decision_seconds": 5},
+    "Intraday": {"interval": "15m", "sim_days": 7, "namespace": "ID", "binance_decision_seconds": 10},
+    "Swing": {"interval": "4h", "sim_days": 30, "namespace": "SW", "binance_decision_seconds": 30},
 }
 
 BINANCE_DECISION_SECONDS = 30
@@ -98,7 +98,7 @@ def _filter_events_since(events: Any, cutoff_ts: pd.Timestamp | None) -> list[di
     for event in events:
         if not isinstance(event, dict):
             continue
-        event_ts = pd.to_datetime(event.get("timestamp"), utc=True, errors="coerce")
+        event_ts = pd.to_datetime(event.get("executed_at", event.get("timestamp")), utc=True, errors="coerce")
         if pd.isna(event_ts) or event_ts < cutoff_ts:
             continue
         filtered.append(event)
@@ -110,7 +110,7 @@ def _build_open_position_states(events: list[dict[str, Any]]) -> list[dict[str, 
 
     sorted_events = sorted(
         events,
-        key=lambda item: pd.to_datetime(item.get("timestamp"), utc=True, errors="coerce"),
+        key=lambda item: pd.to_datetime(item.get("executed_at", item.get("timestamp")), utc=True, errors="coerce"),
     )
 
     for event in sorted_events:
@@ -124,7 +124,7 @@ def _build_open_position_states(events: list[dict[str, Any]]) -> list[dict[str, 
             price = float(event.get("cena", 0.0))
         except Exception:
             price = 0.0
-        timestamp = str(event.get("timestamp", ""))
+        timestamp = str(event.get("executed_at", event.get("timestamp", "")))
 
         if "Vstup" in action and side in {"LONG", "SHORT"}:
             if qty <= 0:
@@ -260,6 +260,19 @@ def _coerce_int(value: Any, default: int) -> int:
         return default
 
 
+def _get_binance_cadence_seconds(segment: str) -> int:
+    cfg = SEGMENT_DEFAULTS.get(segment, {})
+    default_seconds = max(1, _coerce_int(cfg.get("binance_decision_seconds"), BINANCE_DECISION_SECONDS))
+    env_key = f"SIRTRADE_BINANCE_DECISION_SECONDS_{segment.upper()}"
+    return max(
+        1,
+        _coerce_int(
+            os.getenv(env_key, os.getenv("SIRTRADE_BINANCE_DECISION_SECONDS", str(default_seconds))),
+            default_seconds,
+        ),
+    )
+
+
 def _hydrate_engines_from_saved_runs(
     engines: dict[str, TradingEngine],
     segment_runs: dict[str, dict[str, Any]],
@@ -284,14 +297,7 @@ def _choose_segments(
 ) -> list[str]:
     if not runnable_segments:
         return []
-    if data_source not in {"binance", "binance_copy"}:
-        return runnable_segments
-    if active_segment in runnable_segments:
-        return [active_segment]
-
-    cursor = int(worker_state.get("segment_cursor", 0)) % len(runnable_segments)
-    worker_state["segment_cursor"] = (cursor + 1) % len(runnable_segments)
-    return [runnable_segments[cursor]]
+    return runnable_segments
 
 
 def _run_worker_loop() -> None:
@@ -321,11 +327,7 @@ def _run_worker_loop() -> None:
         data_source = str(runtime_state.get("data_source", "binance"))
         symbol = str(runtime_state.get("symbol", "BTCUSDT")).upper()
         paper_trade_cutoff_ts = runtime_state.get("paper_trade_cutoff_ts")
-        cadence_seconds = (
-            BINANCE_DECISION_SECONDS
-            if data_source in {"binance", "binance_copy"}
-            else max(1, _coerce_int(runtime_state.get("simulation_cycle_seconds"), 10))
-        )
+        default_simulation_seconds = max(1, _coerce_int(runtime_state.get("simulation_cycle_seconds"), 10))
 
         runnable_segments = [
             segment
@@ -337,6 +339,11 @@ def _run_worker_loop() -> None:
         updated_segment_runs = dict(segment_runs)
 
         for segment in selected_segments:
+            cadence_seconds = (
+                _get_binance_cadence_seconds(segment)
+                if data_source in {"binance", "binance_copy"}
+                else default_simulation_seconds
+            )
             last_run = float(worker_state["last_run_by_segment"].get(segment, 0.0))
             if (now - last_run) < cadence_seconds:
                 continue
