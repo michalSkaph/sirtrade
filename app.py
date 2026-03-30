@@ -14,7 +14,6 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-from streamlit_autorefresh import st_autorefresh
 
 from src.sirtrade.config import DEFAULT_CONFIG, INITIAL_PAPER_WALLET_CZK, PAPER_TRADE_SIZE_CZK
 from src.sirtrade.data import fetch_binance_market
@@ -713,7 +712,9 @@ def _compute_paper_wallet_state(
 ) -> dict[str, float]:
     open_slots = 0.0
     if not open_positions.empty and "position_size" in open_positions.columns:
-        open_slots = float(pd.to_numeric(open_positions["position_size"], errors="coerce").fillna(0.0).abs().sum())
+        open_slots = float(
+            pd.to_numeric(open_positions["position_size"], errors="coerce").fillna(0.0).abs().gt(0.0).sum()
+        )
 
     realized_pnl_czk = 0.0
     if not closed_positions.empty and {"quantity_slots", "pnl_pct"}.issubset(closed_positions.columns):
@@ -855,9 +856,9 @@ def _restore_missing_segments_from_storage(existing_segments: set[str]) -> dict[
                 known_models[model_id] = model_name
                 side = _normalize_side(open_row.get("side", ""))
                 qty = float(open_row.get("position_size", 0.0) or 0.0)
-                signed_qty = qty if side == "LONG" else (-qty if side == "SHORT" else 0.0)
+                slot_count = 1 if abs(qty) > 1e-9 else 0
+                signed_qty = float(slot_count) if side == "LONG" else (-float(slot_count) if side == "SHORT" else 0.0)
                 final_positions[model_id] = final_positions.get(model_id, 0.0) + signed_qty
-                slot_count = max(1, int(round(abs(qty))))
                 final_open_slots[model_id] = final_open_slots.get(model_id, 0) + slot_count
                 symbol_value = str(open_row.get("symbol", symbol)).upper()
                 position_key = (symbol_value, side)
@@ -1593,15 +1594,6 @@ else:
 
     source_label = {"simulation": "Simulace", "binance": "Binance", "binance_copy": "Binance Copy"}.get(latest["market_source"], latest["market_source"])
 
-    refreshable_views = {"Dashboard", "Pozice"}
-    if (
-        st.session_state.live_refresh_enabled
-        and st.session_state.active_view in refreshable_views
-        and (active_segment_running or st.session_state.live_refresh_when_stopped)
-    ):
-        refresh_ms = max(1, int(st.session_state.live_refresh_seconds)) * 1000
-        st_autorefresh(interval=refresh_ms, key="sirtrade_live_refresh")
-
     if (
         st.session_state.live_refresh_enabled
         and st.session_state.active_view == "Grafy"
@@ -1644,12 +1636,8 @@ else:
         st.caption(
             f"Zdroj dat: {source_label} | Champion coin: {latest['symbol']} | Univerzum: {len(latest.get('candidate_symbols', [])) or 1} coinů | Timeframe: {latest.get('interval', '1d')} | Exekuce: pouze dry-run"
         )
-        if (
-            active_segment_running
-            and st.session_state.live_refresh_enabled
-            and st.session_state.active_view in refreshable_views
-        ):
-            st.caption(f"Live refresh aktivní: každých {st.session_state.live_refresh_seconds}s")
+        if active_segment_running and st.session_state.live_refresh_enabled:
+            st.caption("Live data běží bez automatického refreshování celé stránky.")
 
         st.subheader("Vítěz týdne")
         champ = latest["champion"]
@@ -1704,8 +1692,6 @@ else:
         model_position_rows = []
         model_markets = latest.get("model_markets", {})
         latest_prices = latest.get("latest_prices", {})
-        slot_size_frac = DEFAULT_CONFIG.risk.max_asset_exposure / 5
-
         for _, row in latest["results"].iterrows():
             model_id = str(row["model_id"])
             model_name = str(row["name"])
@@ -1747,7 +1733,7 @@ else:
                 if pos_side not in {"LONG", "SHORT"} or pos_slots <= 0:
                     continue
 
-                invested_czk = round(pos_slots * slot_size_frac * INITIAL_PAPER_WALLET_CZK, 0)
+                invested_czk = round(PAPER_TRADE_SIZE_CZK, 0)
 
                 model_market = model_markets.get(model_id, latest["market"])
                 pos_latest_price = latest_prices.get(pos_symbol)

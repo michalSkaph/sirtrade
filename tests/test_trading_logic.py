@@ -746,6 +746,54 @@ class TradingLogicTests(unittest.TestCase):
         self.assertEqual(len(exit_events), 1)
         self.assertEqual(exit_events[0].get("duvod_vystupu"), "TARGET")
 
+    def test_scalp_simulation_exits_when_momentum_thesis_invalidates(self) -> None:
+        engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")
+        model = ModelSpec("SC_M1", "Scalp Trend", "trend_vol", 1)
+        index = pd.date_range("2026-01-01", periods=80, freq="min", tz="UTC")
+        close = np.full(len(index), 100.0)
+        open_ = close.copy()
+        high = close * 1.00015
+        low = close * 0.99985
+        ret = pd.Series(close).pct_change().fillna(0.0).to_numpy()
+        market = pd.DataFrame(
+            {
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "ret": ret,
+                "sentiment": np.full(len(index), 0.4),
+                "onchain": np.full(len(index), 0.4),
+                "regime": np.zeros(len(index)),
+            },
+            index=index,
+        )
+        signal = pd.Series(np.concatenate([np.full(20, 0.8), np.zeros(len(index) - 20)]), index=index)
+        confluence = pd.DataFrame(
+            {
+                "long_votes": np.concatenate([np.full(20, 5), np.zeros(len(index) - 20)]),
+                "short_votes": np.zeros(len(index)),
+                "long_confidence": np.concatenate([np.full(20, 0.8), np.zeros(len(index) - 20)]),
+                "short_confidence": np.zeros(len(index)),
+            },
+            index=index,
+        )
+        atr_pct = pd.Series(0.0015, index=index)
+
+        with patch("src.sirtrade.engine.generate_signals", return_value=signal), patch.object(
+            TradingEngine,
+            "_build_entry_confluence",
+            return_value=(confluence, 4, 1, atr_pct),
+            autospec=True,
+        ):
+            _, events, final_position, final_open_slots = engine._simulate_model(model, market, symbol="BTCUSDT")
+
+        exit_events = [event for event in events if str(event.get("akce", "")).startswith("Výstup")]
+        self.assertTrue(exit_events)
+        self.assertEqual(exit_events[0].get("duvod_vystupu"), "SCALP_INVALIDATION")
+        self.assertEqual(final_open_slots, 0)
+        self.assertEqual(final_position, 0.0)
+
     def test_run_week_selects_coin_from_dynamic_top20(self) -> None:
         engine = TradingEngine()
         universe = pd.DataFrame(
@@ -1045,6 +1093,101 @@ class TradingLogicTests(unittest.TestCase):
             pd.to_datetime(event["timestamp"], utc=True),
         )
         self.assertNotEqual(str(event["executed_at"]), str(event["timestamp"]))
+
+    def test_live_scalp_cycle_exits_when_setup_invalidates(self) -> None:
+        engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")
+        engine.models = [ModelSpec("SC_M1", "Scalp Trend", "trend_vol", 1)]
+        market = _build_flat_market_frame()
+        universe = pd.DataFrame([{"symbol": "BTCUSDT", "opportunity_score": 1.0}])
+        weak_signal = pd.Series(0.0, index=market.index)
+
+        def _weak_confluence(model, market, controlled_signal):
+            index = market.index
+            confluence = pd.DataFrame(
+                {
+                    "long_votes": [0] * len(index),
+                    "short_votes": [0] * len(index),
+                    "long_confidence": [0.0] * len(index),
+                    "short_confidence": [0.0] * len(index),
+                },
+                index=index,
+            )
+            atr_pct = pd.Series(0.0015, index=index)
+            return confluence, 4, 1, atr_pct
+
+        previous_summary = {
+            "model_trades": {"SC_M1": []},
+            "live_model_state": {
+                "SC_M1": {
+                    "entry_armed": False,
+                    "setup_active": True,
+                    "setup_direction": 1,
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "open_slots": 2,
+                    "entry_price": 100.0,
+                    "opened_at": "2026-01-01T00:00:00Z",
+                    "stop_price": 98.50,
+                    "target_price": 101.50,
+                    "positions": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "side": "LONG",
+                            "open_slots": 2,
+                            "entry_price": 100.0,
+                            "stop_price": 98.50,
+                            "target_price": 101.50,
+                            "opened_at": "2026-01-01T00:00:00Z",
+                        }
+                    ],
+                }
+            },
+            "model_open_positions": {
+                "SC_M1": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "side": "LONG",
+                        "slots": 2,
+                        "entry_price": 100.0,
+                        "opened_at": "2026-01-01T00:00:00Z",
+                        "stop_price": 98.50,
+                        "target_price": 101.50,
+                    }
+                ]
+            },
+        }
+
+        def _fake_simulate(_engine: TradingEngine, model: ModelSpec, market_frame: pd.DataFrame, symbol: str):
+            result = ModelResult(
+                model_id=model.model_id,
+                name=model.name,
+                generation=model.generation,
+                symbol=symbol,
+                sortino=1.0,
+                calmar=1.0,
+                cvar95=0.01,
+                max_dd=0.01,
+                cost=0.0,
+                turnover=0.0,
+                score=1.0,
+                passed=True,
+            )
+            return result, [], 0.0, 0
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
+            "src.sirtrade.engine.generate_signals", return_value=weak_signal
+        ), patch.object(TradingEngine, "_build_entry_confluence", side_effect=_weak_confluence), patch.object(
+            TradingEngine,
+            "_simulate_model",
+            side_effect=_fake_simulate,
+            autospec=True,
+        ):
+            result = engine.run_week(days=1, market_source="binance", symbol="BTCUSDT", interval="1m", previous_summary=previous_summary)
+
+        self.assertEqual(result["final_open_slots"]["SC_M1"], 0)
+        self.assertEqual(result["trade_events_delta"]["SC_M1"][0]["duvod_vystupu"], "SCALP_INVALIDATION")
 
 
 if __name__ == "__main__":

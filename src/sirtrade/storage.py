@@ -442,16 +442,13 @@ def save_open_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
                 if side not in {"LONG", "SHORT"}:
                     continue
                 symbol_value = str(position.get("symbol", symbol)).upper()
-                try:
-                    slot_count = max(1.0, float(position.get("slots", 1.0) or 1.0))
-                except Exception:
-                    slot_count = 1.0
+                slot_count = 1.0
                 key = (str(model_id), symbol_value, side)
                 model_name = model_names.get(str(model_id), str(position.get("model_name", model_id)))
                 previous = aggregated_positions.get(key)
                 aggregated_positions[key] = (
                     model_name,
-                    slot_count if previous is None else previous[1] + slot_count,
+                    slot_count,
                 )
         rows_to_insert.extend(
             (
@@ -476,7 +473,7 @@ def save_open_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
                     model_names.get(str(model_id), str(model_id)),
                     symbol,
                     side,
-                    abs(size_val),
+                    1.0,
                     market_source,
                 )
             )

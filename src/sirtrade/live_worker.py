@@ -9,7 +9,7 @@ from typing import Any
 import pandas as pd
 
 from .automation import run_segment_cycle
-from .config import DEFAULT_CONFIG, PAPER_TRADE_SIZE_CZK
+from .config import DEFAULT_CONFIG, INITIAL_PAPER_WALLET_CZK, PAPER_TRADE_SIZE_CZK
 from .engine import TradingEngine
 from .execution import build_dry_run_orders
 from .market_stream import get_stream_diagnostics
@@ -116,7 +116,6 @@ def _build_open_position_states(events: list[dict[str, Any]]) -> list[dict[str, 
     for event in sorted_events:
         action = str(event.get("akce", ""))
         side = _normalize_side(event.get("strana", ""))
-        qty = _extract_slot_delta(action, entry="Vstup" in action)
         event_symbol = str(event.get("symbol", "")).upper()
         if not event_symbol:
             continue
@@ -127,23 +126,20 @@ def _build_open_position_states(events: list[dict[str, Any]]) -> list[dict[str, 
         timestamp = str(event.get("executed_at", event.get("timestamp", "")))
 
         if "Vstup" in action and side in {"LONG", "SHORT"}:
-            if qty <= 0:
-                qty = 1
             state_key = (event_symbol, side)
             state = states.get(
                 state_key,
                 {
-                    "open_slots": 0,
+                    "open_slots": 1,
                     "side": side,
                     "symbol": event_symbol,
                     "opened_at": timestamp,
                     "entry_price": price,
                 },
             )
-            total_cost = (float(state["entry_price"]) * int(state["open_slots"])) + (price * qty)
-            total_slots = int(state["open_slots"]) + qty
-            state["open_slots"] = total_slots
-            state["entry_price"] = total_cost / max(total_slots, 1)
+            state["open_slots"] = 1
+            if float(state.get("entry_price", 0.0) or 0.0) <= 0.0:
+                state["entry_price"] = price
             state["opened_at"] = state.get("opened_at") or timestamp
             state["symbol"] = event_symbol
             state["side"] = side
@@ -155,13 +151,7 @@ def _build_open_position_states(events: list[dict[str, Any]]) -> list[dict[str, 
             state = states.get(state_key)
             if state is None or int(state.get("open_slots", 0)) <= 0:
                 continue
-            if qty <= 0:
-                qty = int(state.get("open_slots", 0))
-            state["open_slots"] = max(0, int(state.get("open_slots", 0)) - qty)
-            if int(state["open_slots"]) <= 0:
-                states.pop(state_key, None)
-            else:
-                states[state_key] = state
+            states.pop(state_key, None)
 
     return [state for state in states.values() if int(state.get("open_slots", 0)) > 0]
 
@@ -181,7 +171,7 @@ def _apply_trade_cutoff(summary: dict[str, Any], cutoff_value: Any) -> dict[str,
         str(model_id): _filter_events_since(events, cutoff_ts)
         for model_id, events in model_trades.items()
     }
-    slot_size = DEFAULT_CONFIG.risk.max_asset_exposure / 5
+    slot_size = PAPER_TRADE_SIZE_CZK / INITIAL_PAPER_WALLET_CZK
     final_positions: dict[str, float] = {}
     final_open_slots: dict[str, int] = {}
     model_open_positions: dict[str, list[dict[str, Any]]] = {}

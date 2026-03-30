@@ -164,35 +164,7 @@ class TradingEngine:
             return []
 
         capped_positions = positions[:slot_budget]
-        if len(capped_positions) == slot_budget:
-            return [1] * slot_budget
-
-        notionals = [max(0.0, float(position.get("notional_usd", 0.0))) for position in capped_positions]
-        total_notional = sum(notionals)
-        if total_notional <= 0:
-            return [1] + [0] * (len(capped_positions) - 1)
-
-        raw_allocations = [(notional / total_notional) * slot_budget for notional in notionals]
-        base_allocations = [int(value) for value in raw_allocations]
-        remainders = [value - int(value) for value in raw_allocations]
-
-        allocated = sum(base_allocations)
-        while allocated < slot_budget:
-            next_index = max(range(len(remainders)), key=lambda idx: remainders[idx])
-            base_allocations[next_index] += 1
-            remainders[next_index] = 0.0
-            allocated += 1
-
-        while allocated > slot_budget:
-            next_index = max(range(len(base_allocations)), key=lambda idx: base_allocations[idx])
-            if base_allocations[next_index] <= 0:
-                break
-            base_allocations[next_index] -= 1
-            allocated -= 1
-
-        if all(value == 0 for value in base_allocations):
-            base_allocations[0] = 1
-        return base_allocations
+        return [1] * len(capped_positions)
 
     def _build_copy_trader_run(
         self,
@@ -230,7 +202,7 @@ class TradingEngine:
             return self._inactive_copy_trader_run(model, fallback_symbol)
 
         allocations = self._copy_trader_slot_allocations(ranked_positions, slot_budget=5)
-        slot_size = self.config.risk.max_asset_exposure / 5
+        slot_size = PAPER_TRADE_SIZE_CZK / INITIAL_PAPER_WALLET_CZK
         events: list[dict] = []
         open_positions_override: list[dict[str, object]] = []
         open_positions_by_key: dict[tuple[str, str], dict[str, object]] = {}
@@ -565,6 +537,63 @@ class TradingEngine:
             return 1.95, 4.10, 0.0032, 0.09
         return 2.10, 4.40, 0.0035, 0.10
 
+    def _latest_setup_snapshot(self, model: ModelSpec, market: pd.DataFrame) -> dict[str, float | int]:
+        raw = generate_signals(model, market, seed=0)
+        controlled_signal = apply_risk_controls(raw, market["ret"], self.config.risk)
+        confluence, required_votes, reset_votes, atr_pct = self._build_entry_confluence(model, market, controlled_signal)
+        latest_ts = market.index[-1]
+        _, _, min_stop_floor, signal_reset_floor = self._trade_profile(model)
+        vol_step = float(atr_pct.loc[latest_ts])
+        if np.isnan(vol_step) or vol_step <= 0:
+            vol_step = min_stop_floor
+
+        return {
+            "signal_value": float(controlled_signal.loc[latest_ts]),
+            "long_votes": int(confluence.loc[latest_ts, "long_votes"]),
+            "short_votes": int(confluence.loc[latest_ts, "short_votes"]),
+            "long_confidence": float(confluence.loc[latest_ts, "long_confidence"]),
+            "short_confidence": float(confluence.loc[latest_ts, "short_confidence"]),
+            "required_votes": int(required_votes),
+            "reset_votes": int(reset_votes),
+            "vol_step": float(vol_step),
+            "min_stop_floor": float(min_stop_floor),
+            "signal_reset_floor": float(signal_reset_floor),
+        }
+
+    def _scalp_invalidation_reason(
+        self,
+        side: str,
+        signal_value: float,
+        long_votes: int,
+        short_votes: int,
+        required_votes: int,
+        reset_votes: int,
+        signal_reset_floor: float,
+    ) -> str | None:
+        if self.model_namespace != "SC":
+            return None
+
+        normalized_side = str(side).upper()
+        if normalized_side not in {"LONG", "SHORT"}:
+            return None
+
+        same_votes = long_votes if normalized_side == "LONG" else short_votes
+        opposite_votes = short_votes if normalized_side == "LONG" else long_votes
+        reversal_signal = signal_value <= -signal_reset_floor if normalized_side == "LONG" else signal_value >= signal_reset_floor
+        edge_faded = abs(signal_value) <= signal_reset_floor and same_votes <= reset_votes
+        opposite_pressure = opposite_votes >= max(reset_votes + 1, required_votes - 1)
+        setup_lost = (
+            same_votes < max(2, required_votes - 1)
+            and opposite_votes >= same_votes
+            and abs(signal_value) <= (signal_reset_floor * 1.5)
+        )
+
+        if reversal_signal or opposite_pressure:
+            return "SCALP_REVERSAL"
+        if edge_faded or setup_lost:
+            return "SCALP_INVALIDATION"
+        return None
+
     def _build_trade_events(self, model: ModelSpec, prices: pd.Series, position: pd.Series) -> tuple[list[dict], int]:
         events: list[dict] = []
         slot_size = PAPER_TRADE_SIZE_CZK / INITIAL_PAPER_WALLET_CZK
@@ -778,6 +807,20 @@ class TradingEngine:
                 if target_price is not None and low_price <= target_price:
                     hit_exit = True
                     exit_reason = "TARGET" if exit_reason is None else exit_reason
+
+            if not hit_exit:
+                scalp_exit_reason = self._scalp_invalidation_reason(
+                    side="LONG" if side > 0 else "SHORT",
+                    signal_value=signal_value,
+                    long_votes=long_votes,
+                    short_votes=short_votes,
+                    required_votes=required_votes,
+                    reset_votes=reset_votes,
+                    signal_reset_floor=signal_reset_floor,
+                )
+                if scalp_exit_reason is not None:
+                    hit_exit = True
+                    exit_reason = scalp_exit_reason
 
             if hit_exit:
                 exit_side = "LONG" if side > 0 else "SHORT"
@@ -1070,6 +1113,7 @@ class TradingEngine:
             ts_key = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
             execution_ts = _current_execution_timestamp()
             execution_ts_key = execution_ts.isoformat() if hasattr(execution_ts, "isoformat") else str(execution_ts)
+            setup_snapshot_cache: dict[str, dict[str, float | int]] = {}
 
             # --- EXIT logic: evaluate each existing position independently ---
             surviving_positions: list[dict[str, Any]] = []
@@ -1092,6 +1136,11 @@ class TradingEngine:
                 if pos_market is None or pos_market.empty:
                     surviving_positions.append(pos)
                     continue
+
+                setup_snapshot = setup_snapshot_cache.get(pos_symbol)
+                if setup_snapshot is None:
+                    setup_snapshot = self._latest_setup_snapshot(model, pos_market)
+                    setup_snapshot_cache[pos_symbol] = setup_snapshot
 
                 pos_close = float(pd.to_numeric(pos_market["close"], errors="coerce").iloc[-1])
                 pos_high = float(pd.to_numeric(pos_market["high"], errors="coerce").iloc[-1])
@@ -1121,6 +1170,20 @@ class TradingEngine:
                     if pos_target_price > 0 and pos_low <= pos_target_price and exit_reason is None:
                         hit_exit = True
                         exit_reason = "TARGET"
+
+                if not hit_exit:
+                    scalp_exit_reason = self._scalp_invalidation_reason(
+                        side=pos_side,
+                        signal_value=float(setup_snapshot["signal_value"]),
+                        long_votes=int(setup_snapshot["long_votes"]),
+                        short_votes=int(setup_snapshot["short_votes"]),
+                        required_votes=int(setup_snapshot["required_votes"]),
+                        reset_votes=int(setup_snapshot["reset_votes"]),
+                        signal_reset_floor=float(setup_snapshot["signal_reset_floor"]),
+                    )
+                    if scalp_exit_reason is not None:
+                        hit_exit = True
+                        exit_reason = scalp_exit_reason
 
                 if hit_exit:
                     active_exposures.discard((pos_symbol, pos_side))
@@ -1158,20 +1221,21 @@ class TradingEngine:
                     market = markets_by_symbol.get(entry_symbol, run_market)
                     if market is not None and not market.empty:
                         close_price = float(pd.to_numeric(market["close"], errors="coerce").iloc[-1])
+                        setup_snapshot = setup_snapshot_cache.get(entry_symbol)
+                        if setup_snapshot is None:
+                            setup_snapshot = self._latest_setup_snapshot(model, market)
+                            setup_snapshot_cache[entry_symbol] = setup_snapshot
 
-                        raw = generate_signals(model, market, seed=0)
-                        controlled_signal = apply_risk_controls(raw, market["ret"], self.config.risk)
-                        confluence, required_votes, reset_votes, atr_pct = self._build_entry_confluence(model, market, controlled_signal)
-                        _, _, min_stop_floor, signal_reset_floor = self._trade_profile(model)
-
-                        signal_value = float(controlled_signal.loc[ts])
-                        long_votes = int(confluence.loc[ts, "long_votes"])
-                        short_votes = int(confluence.loc[ts, "short_votes"])
-                        long_confidence = float(confluence.loc[ts, "long_confidence"])
-                        short_confidence = float(confluence.loc[ts, "short_confidence"])
-                        vol_step = float(atr_pct.loc[ts])
-                        if np.isnan(vol_step) or vol_step <= 0:
-                            vol_step = min_stop_floor
+                        signal_value = float(setup_snapshot["signal_value"])
+                        long_votes = int(setup_snapshot["long_votes"])
+                        short_votes = int(setup_snapshot["short_votes"])
+                        long_confidence = float(setup_snapshot["long_confidence"])
+                        short_confidence = float(setup_snapshot["short_confidence"])
+                        required_votes = int(setup_snapshot["required_votes"])
+                        reset_votes = int(setup_snapshot["reset_votes"])
+                        vol_step = float(setup_snapshot["vol_step"])
+                        min_stop_floor = float(setup_snapshot["min_stop_floor"])
+                        signal_reset_floor = float(setup_snapshot["signal_reset_floor"])
 
                         direction = 0
                         confidence = 0.0

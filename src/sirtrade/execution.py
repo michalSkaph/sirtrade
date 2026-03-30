@@ -31,7 +31,7 @@ def build_dry_run_orders(
         if not isinstance(positions, list) or not positions:
             continue
 
-        grouped_positions: dict[tuple[str, str], int] = {}
+        grouped_positions: set[tuple[str, str]] = set()
         for position in positions:
             if not isinstance(position, dict):
                 continue
@@ -39,19 +39,13 @@ def build_dry_run_orders(
             symbol_value = str(position.get("symbol", symbol)).upper()
             if side not in {"LONG", "SHORT"} or not symbol_value:
                 continue
-            raw_slot_count = position.get("slots", 1)
-            try:
-                slot_count = max(1, int(round(abs(float(raw_slot_count)))))
-            except Exception:
-                slot_count = 1
-            group_key = (symbol_value, side)
-            grouped_positions[group_key] = grouped_positions.get(group_key, 0) + slot_count
+            grouped_positions.add((symbol_value, side))
 
         confidence = float(max(0.0, min(1.0, 0.5 + float(row["score"]) / 5)))
-        for (symbol_value, side), slot_count in grouped_positions.items():
+        for symbol_value, side in sorted(grouped_positions):
             direction = "BUY" if side == "LONG" else "SELL"
             instrument = "spot" if direction == "BUY" else "perpetual"
-            qty = float(max(1, slot_count)) * float(trade_size_czk)
+            qty = float(trade_size_czk)
             orders.append(
                 ProposedOrder(
                     model_id=str(row["model_id"]),
