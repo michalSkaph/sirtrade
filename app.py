@@ -1320,20 +1320,6 @@ st.session_state.simulation_cycle_seconds = FIXED_SIMULATION_CYCLE_SECONDS
 active_segment_running = bool(st.session_state.simulation_running_by_segment.get(st.session_state.active_segment, False))
 has_running_segments = any(st.session_state.simulation_running_by_segment.values())
 force_simulation_cycle = False
-status_run = "BĚŽÍ" if active_segment_running else "STOP"
-status_source = {"simulation": "Simulace", "binance": "Binance", "binance_copy": "Binance Copy"}.get(
-    st.session_state.data_source,
-    st.session_state.data_source,
-)
-status_profile = st.session_state.active_segment
-status_symbol = (
-    "Top lead trader + jeho otevřené pozice"
-    if st.session_state.data_source == "binance_copy"
-    else "Dynamické Top 20"
-    if st.session_state.data_source == "binance"
-    else "Simulační Top 20"
-)
-status_interval = SEGMENT_DEFAULTS.get(st.session_state.active_segment, SEGMENT_DEFAULTS["Swing"])["interval"]
 health_port = int(os.getenv("SIRTRADE_HEALTH_PORT", str(DEFAULT_HEALTH_PORT)))
 platform_status = _fetch_platform_status_cached(health_port)
 health_payload = platform_status.get("health") if isinstance(platform_status, dict) else None
@@ -1367,24 +1353,25 @@ with st.sidebar:
             if worker_status.get("active_segment"):
                 st.write(f"Aktivní segment workeru: {worker_status['active_segment']}")
 
-    if st.session_state.active_segment not in ["Scalp", "Intraday", "Swing"]:
+    segment_options = ["Scalp", "Intraday", "Swing"]
+    if st.session_state.active_segment not in segment_options:
         st.session_state.active_segment = "Swing"
-    st.session_state.active_segment = st.selectbox(
+    st.selectbox(
         "Segment",
-        ["Scalp", "Intraday", "Swing"],
-        index=["Scalp", "Intraday", "Swing"].index(st.session_state.active_segment),
+        segment_options,
+        key="active_segment",
         help="Vybere detail segmentu v hlavní části aplikace.",
     )
 
-    data_source = st.selectbox(
+    data_source_options = ["simulation", "binance", "binance_copy"]
+    if st.session_state.data_source not in data_source_options:
+        st.session_state.data_source = "simulation"
+    st.selectbox(
         "Data",
-        ["simulation", "binance", "binance_copy"],
-        index=["simulation", "binance", "binance_copy"].index(st.session_state.data_source)
-        if st.session_state.data_source in ["simulation", "binance", "binance_copy"]
-        else 0,
+        data_source_options,
+        key="data_source",
         format_func=lambda value: {"simulation": "Simulace", "binance": "Binance", "binance_copy": "Binance Copy"}.get(value, value),
     )
-    st.session_state.data_source = data_source
 
     if st.session_state.data_source == "binance":
         st.caption("Univerzum: dynamické Top 20 coiny z Binance podle aktuální atraktivity a likvidity.")
@@ -1500,6 +1487,20 @@ st.radio(
 
 active_segment_running = bool(st.session_state.simulation_running_by_segment.get(st.session_state.active_segment, False))
 has_running_segments = any(st.session_state.simulation_running_by_segment.values())
+status_run = "BĚŽÍ" if active_segment_running else "STOP"
+status_source = {"simulation": "Simulace", "binance": "Binance", "binance_copy": "Binance Copy"}.get(
+    st.session_state.data_source,
+    st.session_state.data_source,
+)
+status_profile = st.session_state.active_segment
+status_symbol = (
+    "Top lead trader + jeho otevřené pozice"
+    if st.session_state.data_source == "binance_copy"
+    else "Dynamické Top 20"
+    if st.session_state.data_source == "binance"
+    else "Simulační Top 20"
+)
+status_interval = SEGMENT_DEFAULTS.get(st.session_state.active_segment, SEGMENT_DEFAULTS["Swing"])["interval"]
 
 _save_runtime_state_if_changed(
     {

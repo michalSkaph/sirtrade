@@ -1189,6 +1189,120 @@ class TradingLogicTests(unittest.TestCase):
         self.assertEqual(result["final_open_slots"]["SC_M1"], 0)
         self.assertEqual(result["trade_events_delta"]["SC_M1"][0]["duvod_vystupu"], "SCALP_INVALIDATION")
 
+    def test_live_scalp_cycle_rearms_on_new_symbol_with_same_setup_direction(self) -> None:
+        engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")
+        engine.models = [ModelSpec("SC_M1", "Scalp Trend", "trend_vol", 1)]
+        market = _build_market_frame()
+        universe = pd.DataFrame([{"symbol": "ETHUSDT", "opportunity_score": 1.0}])
+        strong_signal = pd.Series(1.0, index=market.index)
+
+        def _strong_confluence(model, market, controlled_signal):
+            index = market.index
+            confluence = pd.DataFrame(
+                {
+                    "long_votes": [6] * len(index),
+                    "short_votes": [0] * len(index),
+                    "long_confidence": [0.8] * len(index),
+                    "short_confidence": [0.0] * len(index),
+                },
+                index=index,
+            )
+            atr_pct = pd.Series(0.01, index=index)
+            return confluence, 5, 2, atr_pct
+
+        previous_summary = {
+            "model_trades": {"SC_M1": []},
+            "live_model_state": {
+                "SC_M1": {
+                    "entry_armed": False,
+                    "setup_active": True,
+                    "setup_direction": 1,
+                    "symbol": "BTCUSDT",
+                    "side": "",
+                    "open_slots": 0,
+                    "entry_price": 0.0,
+                    "opened_at": None,
+                    "stop_price": 0.0,
+                    "target_price": 0.0,
+                    "positions": [],
+                }
+            },
+            "model_open_positions": {"SC_M1": []},
+        }
+
+        def _fake_simulate(_engine: TradingEngine, model: ModelSpec, market_frame: pd.DataFrame, symbol: str):
+            result = ModelResult(
+                model_id=model.model_id,
+                name=model.name,
+                generation=model.generation,
+                symbol=symbol,
+                sortino=1.0,
+                calmar=1.0,
+                cvar95=0.01,
+                max_dd=0.01,
+                cost=0.0,
+                turnover=0.0,
+                score=1.0,
+                passed=True,
+            )
+            return result, [], 0.0, 0
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
+            "src.sirtrade.engine.generate_signals", return_value=strong_signal
+        ), patch.object(TradingEngine, "_build_entry_confluence", side_effect=_strong_confluence), patch.object(
+            TradingEngine,
+            "_simulate_model",
+            side_effect=_fake_simulate,
+            autospec=True,
+        ):
+            result = engine.run_week(days=1, market_source="binance", symbol="BTCUSDT", interval="1m", previous_summary=previous_summary)
+
+        self.assertEqual(len(result["trade_events_delta"]["SC_M1"]), 1)
+        self.assertIn("Vstup LONG", result["trade_events_delta"]["SC_M1"][0]["akce"])
+        self.assertEqual(result["trade_events_delta"]["SC_M1"][0]["symbol"], "ETHUSDT")
+        self.assertEqual(result["live_model_state"]["SC_M1"].get("setup_symbol"), "ETHUSDT")
+        self.assertGreater(result["final_open_slots"]["SC_M1"], 0)
+
+    def test_run_week_handles_inactive_copy_trader_champion_without_ret_crash(self) -> None:
+        engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")
+        market = _build_market_frame()
+        universe = pd.DataFrame([{"symbol": "BTCUSDT", "opportunity_score": 1.0}])
+
+        def _very_weak_simulate(_engine: TradingEngine, model: ModelSpec, market_frame: pd.DataFrame, symbol: str):
+            score = -2.0 if model.model_id != "SC_MC" else -1.0
+            result = ModelResult(
+                model_id=model.model_id,
+                name=model.name,
+                generation=model.generation,
+                symbol=symbol,
+                sortino=0.0,
+                calmar=0.0,
+                cvar95=1.0,
+                max_dd=1.0,
+                cost=0.0,
+                turnover=0.0,
+                score=score,
+                passed=False,
+            )
+            return result, [], 0.0, 0
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch.object(
+            TradingEngine,
+            "_simulate_model",
+            side_effect=_very_weak_simulate,
+            autospec=True,
+        ):
+            result = engine.run_week(days=1, market_source="binance", symbol="BTCUSDT", interval="1m")
+
+        self.assertIn("ret", result["market"].columns)
+        self.assertEqual(result["champion"]["model_id"], "SC_MC")
+        self.assertEqual(result["symbol"], "BTCUSDT")
+        self.assertGreaterEqual(result["portfolio_vol_annual"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

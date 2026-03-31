@@ -60,6 +60,10 @@ class TradingEngine:
         self._live_snapshot_cache: dict[tuple[str, int, str], dict] = {}
         self._model_symbol_memory: dict[str, str] = {}
 
+    @staticmethod
+    def _has_returns_column(market: pd.DataFrame | None) -> bool:
+        return isinstance(market, pd.DataFrame) and not market.empty and "ret" in market.columns
+
     def _market_seed(self, symbol: str, offset: int = 0) -> int:
         digest = hashlib.md5(f"{symbol}:{self.week}:{offset}".encode("utf-8")).hexdigest()
         return int(digest[:8], 16)
@@ -134,7 +138,7 @@ class TradingEngine:
         self._live_snapshot_cache[cache_key] = snapshot
         return long_tail, candidate_symbols, markets_by_symbol, latest_prices
 
-    def _inactive_copy_trader_run(self, model: ModelSpec, symbol: str) -> dict:
+    def _inactive_copy_trader_run(self, model: ModelSpec, symbol: str, fallback_market: pd.DataFrame | None = None) -> dict:
         result = ModelResult(
             model_id=model.model_id,
             name=model.name,
@@ -154,7 +158,7 @@ class TradingEngine:
             "events": [],
             "final_position": 0.0,
             "final_open_slots": 0,
-            "market": pd.DataFrame(),
+            "market": fallback_market.copy() if isinstance(fallback_market, pd.DataFrame) else pd.DataFrame(),
             "opportunity_score": 0.0,
             "open_positions_override": [],
         }
@@ -173,13 +177,14 @@ class TradingEngine:
         markets_by_symbol: dict[str, pd.DataFrame],
         fallback_symbol: str,
     ) -> dict:
+        fallback_market = markets_by_symbol.get(str(fallback_symbol).upper())
         if not isinstance(snapshot, dict):
-            return self._inactive_copy_trader_run(model, fallback_symbol)
+            return self._inactive_copy_trader_run(model, fallback_symbol, fallback_market=fallback_market)
 
         leader = snapshot.get("leader", {})
         raw_positions = snapshot.get("positions", [])
         if not isinstance(leader, dict) or not isinstance(raw_positions, list):
-            return self._inactive_copy_trader_run(model, fallback_symbol)
+            return self._inactive_copy_trader_run(model, fallback_symbol, fallback_market=fallback_market)
 
         ranked_positions = []
         for position in raw_positions:
@@ -199,7 +204,7 @@ class TradingEngine:
             reverse=True,
         )
         if not ranked_positions:
-            return self._inactive_copy_trader_run(model, fallback_symbol)
+            return self._inactive_copy_trader_run(model, fallback_symbol, fallback_market=fallback_market)
 
         allocations = self._copy_trader_slot_allocations(ranked_positions, slot_budget=5)
         slot_size = PAPER_TRADE_SIZE_CZK / INITIAL_PAPER_WALLET_CZK
@@ -1093,8 +1098,10 @@ class TradingEngine:
             entry_armed = bool(previous_state.get("entry_armed", True))
             prev_setup_active = bool(previous_state.get("setup_active", False))
             prev_setup_direction = int(previous_state.get("setup_direction", 0) or 0)
+            prev_setup_symbol = str(previous_state.get("setup_symbol", "")).upper()
             current_setup_active = prev_setup_active
             current_setup_direction = prev_setup_direction
+            current_setup_symbol = prev_setup_symbol
 
             # Determine a reference timestamp from the run's market
             run_market = run.get("market")
@@ -1220,6 +1227,9 @@ class TradingEngine:
                 if entry_symbol not in model_held_symbols:
                     market = markets_by_symbol.get(entry_symbol, run_market)
                     if market is not None and not market.empty:
+                        if entry_symbol != prev_setup_symbol:
+                            entry_armed = True
+
                         close_price = float(pd.to_numeric(market["close"], errors="coerce").iloc[-1])
                         setup_snapshot = setup_snapshot_cache.get(entry_symbol)
                         if setup_snapshot is None:
@@ -1251,12 +1261,16 @@ class TradingEngine:
                             entry_armed = True
                             current_setup_active = False
                             current_setup_direction = 0
+                            current_setup_symbol = ""
                         else:
                             current_setup_active = direction != 0
                             current_setup_direction = direction
+                            current_setup_symbol = entry_symbol if current_setup_active else ""
 
                         setup_just_activated = current_setup_active and (
-                            not prev_setup_active or prev_setup_direction != current_setup_direction
+                            entry_symbol != prev_setup_symbol
+                            or not prev_setup_active
+                            or prev_setup_direction != current_setup_direction
                         )
 
                         if direction != 0:
@@ -1326,6 +1340,7 @@ class TradingEngine:
                 "last_bar_ts": ts_key,
                 "setup_active": current_setup_active,
                 "setup_direction": int(current_setup_direction),
+                "setup_symbol": current_setup_symbol,
                 "symbol": str(primary.get("symbol", result.symbol)).upper(),
                 "side": str(primary.get("side", "")).upper(),
                 "open_slots": total_slots,
@@ -1610,6 +1625,11 @@ class TradingEngine:
         champion_model_id = str(champion["model_id"])
         champion_symbol = str(champion.get("symbol", effective_symbol)).upper()
         champion_market = model_markets.get(champion_model_id, markets_by_symbol.get(champion_symbol))
+        if not self._has_returns_column(champion_market):
+            champion_market = next(
+                (market for market in model_markets.values() if self._has_returns_column(market)),
+                champion_market,
+            )
 
         live_model_state: dict[str, dict[str, Any]] = {}
         if effective_source in {"binance", "binance_copy"}:
@@ -1669,7 +1689,7 @@ class TradingEngine:
         summary = {
             "week": self.week,
             "generation": self.generation,
-            "portfolio_vol_annual": float(annualized_vol(champion_market["ret"])) if champion_market is not None else 0.0,
+            "portfolio_vol_annual": float(annualized_vol(champion_market["ret"])) if self._has_returns_column(champion_market) else 0.0,
             "market_source": effective_source,
             "symbol": champion_symbol,
             "interval": interval,
