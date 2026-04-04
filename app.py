@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import html
 import urllib.error
 import urllib.request
 import re
@@ -19,7 +20,7 @@ from src.sirtrade.config import DEFAULT_CONFIG, INITIAL_PAPER_WALLET_CZK, PAPER_
 from src.sirtrade.data import fetch_binance_market
 from src.sirtrade.engine import TradingEngine
 from src.sirtrade.health_server import DEFAULT_HEALTH_PORT, ensure_health_server_started
-from src.sirtrade.live_worker import ensure_live_worker_started, should_start_embedded_worker
+from src.sirtrade.live_worker import ensure_live_worker_started, is_live_worker_started, should_start_embedded_worker
 from src.sirtrade.reporting import export_weekly_report
 from src.sirtrade.storage import (
     clear_trade_history,
@@ -41,11 +42,39 @@ from src.sirtrade.ui_state import (
     save_last_ui_run,
     save_runtime_state,
     save_segment_runs,
+    sanitize_runtime_state_for_ui_boot,
 )
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _reset_embedded_worker_boot_state() -> None:
+    runtime_state = load_runtime_state()
+    sanitized_state = sanitize_runtime_state_for_ui_boot(
+        runtime_state,
+        resume_running_segments=_env_flag("SIRTRADE_RESUME_SEGMENTS_ON_UI_BOOT", False),
+    )
+    if sanitized_state == runtime_state:
+        return
+    save_runtime_state(sanitized_state)
+
+
+def _clear_optional_streamlit_cache(func: object) -> None:
+    clear = getattr(func, "clear", None)
+    if callable(clear):
+        clear()
+
 
 st.set_page_config(page_title="SirTrade", page_icon="S", layout="wide")
 init_db()
 if should_start_embedded_worker():
+    if not is_live_worker_started():
+        _reset_embedded_worker_boot_state()
     ensure_live_worker_started()
 ensure_health_server_started()
 
@@ -115,14 +144,12 @@ def _load_segment_runs_cached() -> dict[str, dict[str, object]]:
     return runs if isinstance(runs, dict) else {}
 
 
-@st.cache_data(ttl=3, show_spinner=False)
-def _load_closed_positions_cached(limit: int) -> pd.DataFrame:
-    return load_closed_positions(limit=limit)
+def _load_closed_positions_cached(limit: int, segment: str | None = None) -> pd.DataFrame:
+    return load_closed_positions(limit=limit, segment=segment)
 
 
-@st.cache_data(ttl=3, show_spinner=False)
-def _load_open_positions_cached() -> pd.DataFrame:
-    return load_open_positions()
+def _load_open_positions_cached(segment: str | None = None) -> pd.DataFrame:
+    return load_open_positions(segment=segment)
 
 
 @st.cache_data(ttl=10, show_spinner=False)
@@ -264,6 +291,60 @@ def _compute_trade_levels(entry_price: float, side: str, vol: float) -> tuple[fl
     if normalized_side == "LONG":
         return entry_price * (1 - stop_dist), entry_price * (1 + target_dist)
     return entry_price * (1 + stop_dist), entry_price * (1 - target_dist)
+
+
+def _build_current_open_positions(
+    open_positions: pd.DataFrame,
+    summary: dict[str, object],
+) -> dict[str, list[dict[str, object]]]:
+    summary_positions = summary.get("model_open_positions", {}) if isinstance(summary, dict) else {}
+    summary_lookup: dict[tuple[str, str, str], dict[str, object]] = {}
+    if isinstance(summary_positions, dict):
+        for model_id, positions in summary_positions.items():
+            if not isinstance(positions, list):
+                continue
+            for position in positions:
+                if not isinstance(position, dict):
+                    continue
+                key = (
+                    str(model_id),
+                    str(position.get("symbol", "")).upper(),
+                    str(position.get("side", "")).upper(),
+                )
+                summary_lookup[key] = position
+
+    if open_positions.empty:
+        return {
+            str(model_id): [position for position in positions if isinstance(position, dict)]
+            for model_id, positions in summary_positions.items()
+            if isinstance(positions, list) and positions
+        } if isinstance(summary_positions, dict) else {}
+
+    current_positions: dict[str, list[dict[str, object]]] = {}
+    normalized = open_positions.copy()
+    for _, row in normalized.iterrows():
+        model_id = str(row.get("model_id", ""))
+        symbol = str(row.get("symbol", "")).upper()
+        side = str(row.get("side", "")).upper()
+        if side not in {"LONG", "SHORT"} or not model_id or not symbol:
+            continue
+
+        try:
+            slots = max(1, int(abs(float(row.get("position_size", 0.0) or 0.0))))
+        except Exception:
+            slots = 1
+
+        merged_position: dict[str, object] = {
+            "symbol": symbol,
+            "side": side,
+            "slots": slots,
+            "model_id": model_id,
+            "model_name": str(row.get("model_name", model_id)),
+        }
+        merged_position.update(summary_lookup.get((model_id, symbol, side), {}))
+        current_positions.setdefault(model_id, []).append(merged_position)
+
+    return current_positions
 
 
 def _chart_unix_time(value: object) -> int | None:
@@ -660,12 +741,11 @@ def _build_live_chart_html(payload: dict[str, object], height: int = 980) -> str
 
 
 def _load_segment_closed_positions(segment: str, limit: int = CLOSED_POSITIONS_LIMIT) -> pd.DataFrame:
-    closed_positions = _load_closed_positions_cached(limit=limit)
-    if closed_positions.empty or "model_id" not in closed_positions.columns:
+    closed_positions = _load_closed_positions_cached(limit=limit, segment=segment)
+    if closed_positions.empty:
         return pd.DataFrame()
 
-    namespace = f"{SEGMENT_DEFAULTS[segment]['namespace']}_"
-    segment_closed = closed_positions[closed_positions["model_id"].astype(str).str.startswith(namespace)].copy()
+    segment_closed = closed_positions.copy()
     if segment_closed.empty:
         return segment_closed
 
@@ -695,6 +775,79 @@ def _compute_closed_position_metrics(frame: pd.DataFrame) -> tuple[str, str, int
     return win_rate_label, avg_pnl_label, wins, losses, len(pnl)
 
 
+def _compute_trade_analytics(frame: pd.DataFrame) -> dict[str, object]:
+    empty_exit_frame = pd.DataFrame(columns=["Důvod výstupu", "Počet"])
+    default_payload = {
+        "closed_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": 0.0,
+        "avg_pnl_pct": 0.0,
+        "avg_win_pct": 0.0,
+        "avg_loss_pct": 0.0,
+        "expectancy_pct": 0.0,
+        "expectancy_czk": 0.0,
+        "profit_factor": 0.0,
+        "avg_holding_minutes": 0.0,
+        "exit_reason_frame": empty_exit_frame,
+    }
+    if frame.empty or "pnl_pct" not in frame.columns:
+        return default_payload
+
+    pnl_pct = pd.to_numeric(frame["pnl_pct"], errors="coerce").dropna()
+    if pnl_pct.empty:
+        return default_payload
+
+    aligned = frame.loc[pnl_pct.index].copy()
+    slots = pd.to_numeric(aligned.get("quantity_slots"), errors="coerce").fillna(0.0).abs()
+    pnl_czk = (slots * float(PAPER_TRADE_SIZE_CZK) * (pnl_pct / 100.0)).astype(float)
+    wins = pnl_pct[pnl_pct > 0]
+    losses = pnl_pct[pnl_pct < 0]
+    trade_count = int(len(pnl_pct))
+    win_rate = (len(wins) / trade_count) if trade_count > 0 else 0.0
+    avg_win_pct = float(wins.mean()) if not wins.empty else 0.0
+    avg_loss_pct = float(losses.mean()) if not losses.empty else 0.0
+    expectancy_pct = (win_rate * avg_win_pct) + ((1.0 - win_rate) * avg_loss_pct)
+    gross_profit = float(pnl_czk[pnl_czk > 0].sum())
+    gross_loss = float(abs(pnl_czk[pnl_czk < 0].sum()))
+
+    opened_at = pd.to_datetime(aligned.get("opened_at"), utc=True, errors="coerce")
+    closed_at = pd.to_datetime(aligned.get("closed_at"), utc=True, errors="coerce")
+    holding_minutes = ((closed_at - opened_at).dt.total_seconds() / 60.0).dropna()
+
+    exit_reason_frame = empty_exit_frame
+    if "exit_reason" in aligned.columns:
+        reason_counts = aligned["exit_reason"].fillna("NEURČENO").astype(str).value_counts().reset_index()
+        reason_counts.columns = ["Důvod výstupu", "Počet"]
+        exit_reason_frame = reason_counts
+
+    return {
+        "closed_trades": trade_count,
+        "wins": int((pnl_pct > 0).sum()),
+        "losses": int((pnl_pct < 0).sum()),
+        "win_rate": float(win_rate * 100.0),
+        "avg_pnl_pct": float(pnl_pct.mean()),
+        "avg_win_pct": avg_win_pct,
+        "avg_loss_pct": avg_loss_pct,
+        "expectancy_pct": float(expectancy_pct),
+        "expectancy_czk": float(pnl_czk.mean()) if len(pnl_czk) else 0.0,
+        "profit_factor": float(gross_profit / gross_loss) if gross_loss > 0 else float(gross_profit > 0),
+        "avg_holding_minutes": float(holding_minutes.mean()) if not holding_minutes.empty else 0.0,
+        "exit_reason_frame": exit_reason_frame,
+    }
+
+
+def _format_holding_time(minutes_value: float) -> str:
+    if minutes_value <= 0:
+        return "N/A"
+    if minutes_value < 60:
+        return f"{minutes_value:.0f} min"
+    hours = minutes_value / 60.0
+    if hours < 24:
+        return f"{hours:.1f} h"
+    return f"{(hours / 24.0):.1f} d"
+
+
 def _format_czk(value: float) -> str:
     return f"{value:,.0f} Kč".replace(",", " ")
 
@@ -702,6 +855,47 @@ def _format_czk(value: float) -> str:
 def _format_czk_delta(value: float) -> str:
     sign = "+" if value > 0 else ""
     return f"{sign}{value:,.0f} Kč".replace(",", " ")
+
+
+def _render_segment_header_card(label: str, value: str, detail: str | None = None) -> None:
+    detail_html = ""
+    if detail:
+        detail_html = (
+            "<div style='margin-top:6px;font-size:0.8rem;line-height:1.2;color:#64748b;'>"
+            f"{html.escape(detail)}"
+            "</div>"
+        )
+
+    st.markdown(
+        (
+            "<div style='height:100%;min-height:86px;padding:12px 14px;border-radius:14px;"
+            "background:linear-gradient(180deg,rgba(248,250,252,0.96) 0%,rgba(241,245,249,0.96) 100%);"
+            "border:1px solid rgba(148,163,184,0.18);box-shadow:0 8px 24px rgba(15,23,42,0.06);'>"
+            "<div style='font-size:0.72rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;"
+            "color:#64748b;line-height:1.15;'>"
+            f"{html.escape(label)}"
+            "</div>"
+            "<div style='margin-top:8px;font-size:1.18rem;font-weight:700;line-height:1.15;color:#0f172a;"
+            "word-break:break-word;'>"
+            f"{html.escape(value)}"
+            "</div>"
+            f"{detail_html}"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _compute_realized_pnl_czk(
+    closed_positions: pd.DataFrame,
+    trade_size_czk: float = PAPER_TRADE_SIZE_CZK,
+) -> float:
+    if closed_positions.empty or {"quantity_slots", "pnl_pct"}.issubset(closed_positions.columns) is False:
+        return 0.0
+
+    slot_counts = pd.to_numeric(closed_positions["quantity_slots"], errors="coerce").fillna(0.0).abs()
+    pnl_pct = pd.to_numeric(closed_positions["pnl_pct"], errors="coerce").fillna(0.0)
+    return float(((slot_counts * float(trade_size_czk)) * (pnl_pct / 100.0)).sum())
 
 
 def _compute_paper_wallet_state(
@@ -713,14 +907,10 @@ def _compute_paper_wallet_state(
     open_slots = 0.0
     if not open_positions.empty and "position_size" in open_positions.columns:
         open_slots = float(
-            pd.to_numeric(open_positions["position_size"], errors="coerce").fillna(0.0).abs().gt(0.0).sum()
+            pd.to_numeric(open_positions["position_size"], errors="coerce").fillna(0.0).abs().sum()
         )
 
-    realized_pnl_czk = 0.0
-    if not closed_positions.empty and {"quantity_slots", "pnl_pct"}.issubset(closed_positions.columns):
-        slot_counts = pd.to_numeric(closed_positions["quantity_slots"], errors="coerce").fillna(0.0).abs()
-        pnl_pct = pd.to_numeric(closed_positions["pnl_pct"], errors="coerce").fillna(0.0)
-        realized_pnl_czk = float(((slot_counts * float(trade_size_czk)) * (pnl_pct / 100.0)).sum())
+    realized_pnl_czk = _compute_realized_pnl_czk(closed_positions, trade_size_czk=trade_size_czk)
 
     locked_capital_czk = open_slots * float(trade_size_czk)
     equity_czk = float(initial_wallet_czk) + realized_pnl_czk
@@ -856,7 +1046,7 @@ def _restore_missing_segments_from_storage(existing_segments: set[str]) -> dict[
                 known_models[model_id] = model_name
                 side = _normalize_side(open_row.get("side", ""))
                 qty = float(open_row.get("position_size", 0.0) or 0.0)
-                slot_count = 1 if abs(qty) > 1e-9 else 0
+                slot_count = int(round(abs(qty))) if abs(qty) > 1e-9 else 0
                 signed_qty = float(slot_count) if side == "LONG" else (-float(slot_count) if side == "SHORT" else 0.0)
                 final_positions[model_id] = final_positions.get(model_id, 0.0) + signed_qty
                 final_open_slots[model_id] = final_open_slots.get(model_id, 0) + slot_count
@@ -1467,16 +1657,17 @@ if reset_btn:
             "paper_trade_cutoff_ts": st.session_state.paper_trade_cutoff_ts,
         }
     )
-    _load_last_ui_run_cached.clear()
-    _load_segment_runs_cached.clear()
-    _load_open_positions_cached.clear()
-    _load_closed_positions_cached.clear()
-    _load_recent_runs_cached.clear()
+    _clear_optional_streamlit_cache(_load_last_ui_run_cached)
+    _clear_optional_streamlit_cache(_load_segment_runs_cached)
+    _clear_optional_streamlit_cache(_load_open_positions_cached)
+    _clear_optional_streamlit_cache(_load_closed_positions_cached)
+    _clear_optional_streamlit_cache(_load_recent_runs_cached)
     st.rerun()
 
 view_options = ["Dashboard", "Grafy", "Pozice", "Uzavřené pozice", "Analýza", "Historie & Export"]
 if st.session_state.active_view not in view_options:
     st.session_state.active_view = "Dashboard"
+
 st.radio(
     "Sekce",
     view_options,
@@ -1500,7 +1691,6 @@ status_symbol = (
     if st.session_state.data_source == "binance"
     else "Simulační Top 20"
 )
-status_interval = SEGMENT_DEFAULTS.get(st.session_state.active_segment, SEGMENT_DEFAULTS["Swing"])["interval"]
 
 _save_runtime_state_if_changed(
     {
@@ -1522,27 +1712,38 @@ _save_runtime_state_if_changed(
     }
 )
 
-wallet_open_positions = _load_open_positions_cached()
-wallet_closed_positions = _load_closed_positions_cached(limit=CLOSED_POSITIONS_LIMIT)
+wallet_open_positions = _load_open_positions_cached(segment=st.session_state.active_segment)
+wallet_closed_positions = _load_closed_positions_cached(
+    limit=CLOSED_POSITIONS_LIMIT,
+    segment=st.session_state.active_segment,
+)
 wallet_state = _compute_paper_wallet_state(wallet_open_positions, wallet_closed_positions)
 
 status1, status2, status3, status4, status5, status6 = st.columns(6)
-status1.metric("Režim", status_run)
-status2.metric("Zdroj dat", status_source)
-status3.metric("Segment", status_profile)
-status4.metric("Timeframe", status_interval)
-status5.metric(
-    "Peněženka k dispozici",
-    _format_czk(wallet_state["available_cash_czk"]),
-    f"Equity {_format_czk(wallet_state['equity_czk'])}",
-)
-status6.metric(
-    "Blokováno v obchodech",
-    _format_czk(wallet_state["locked_capital_czk"]),
-    f"Realizované PnL {_format_czk_delta(wallet_state['realized_pnl_czk'])}",
-)
+with status1:
+    _render_segment_header_card("Režim", status_run)
+with status2:
+    _render_segment_header_card("Zdroj dat", status_source)
+with status3:
+    _render_segment_header_card("Segment", status_profile)
+with status4:
+    _render_segment_header_card(
+        "Peněženka segmentu",
+        _format_czk(wallet_state["available_cash_czk"]),
+        f"Equity {_format_czk(wallet_state['equity_czk'])}",
+    )
+with status5:
+    _render_segment_header_card(
+        "Blokováno v obchodech",
+        _format_czk(wallet_state["locked_capital_czk"]),
+    )
+with status6:
+    _render_segment_header_card(
+        "Celkový zisk/ztráta",
+        _format_czk_delta(wallet_state["realized_pnl_czk"]),
+    )
 st.caption(
-    "Paper peněženka je sdílená napříč segmenty. "
+    f"Paper peněženka segmentu {st.session_state.active_segment} je oddělená od ostatních segmentů. "
     f"Start: {_format_czk(wallet_state['initial_wallet_czk'])} | "
     f"Na každý obchod/slot: {_format_czk(wallet_state['trade_size_czk'])} | "
     f"Aktivně blokováno slotů: {int(round(wallet_state['open_slots']))} | "
@@ -1616,18 +1817,20 @@ else:
             live_market_change_pct = None
 
     if st.session_state.active_view == "Dashboard":
-        st.subheader(f"Detail segmentu: {st.session_state.active_segment}")
-        dashboard_closed_positions = _load_segment_closed_positions(st.session_state.active_segment)
+        dashboard_closed_positions = wallet_closed_positions.copy()
         win_rate_label, avg_pnl_label, _, _, _ = _compute_closed_position_metrics(dashboard_closed_positions)
+        dashboard_trade_analytics = _compute_trade_analytics(dashboard_closed_positions)
+
+        st.subheader(f"Detail segmentu: {st.session_state.active_segment}")
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Týden", latest["week"])
         c2.metric("Generace", latest["generation"])
         c3.metric("Win-rate segmentu", win_rate_label)
         c4.metric("Avg PnL segmentu", avg_pnl_label)
-        c5, c6 = st.columns(2)
-        c5.metric("Volatilita portfolia (roč.)", f"{latest['portfolio_vol_annual']:.2%}")
-        c6.metric("Odměna vítěze", "$1")
+        c6, c7 = st.columns(2)
+        c6.metric("Volatilita portfolia (roč.)", f"{latest['portfolio_vol_annual']:.2%}")
+        c7.metric("Odměna vítěze", "$1")
         if live_market_price is not None:
             st.metric(
                 f"Aktuální cena {latest['symbol']}",
@@ -1639,6 +1842,22 @@ else:
         )
         if active_segment_running and st.session_state.live_refresh_enabled:
             st.caption("Live data běží bez automatického refreshování celé stránky.")
+
+        if int(dashboard_trade_analytics["closed_trades"]) > 0:
+            st.subheader("Expectancy a kvalita exekuce")
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("Expectancy / obchod", f"{float(dashboard_trade_analytics['expectancy_pct']):.3f}%")
+            a2.metric("Profit factor", f"{float(dashboard_trade_analytics['profit_factor']):.2f}")
+            a3.metric(
+                "Průměrný zisk / ztráta",
+                f"{float(dashboard_trade_analytics['avg_win_pct']):.3f}% / {float(dashboard_trade_analytics['avg_loss_pct']):.3f}%",
+            )
+            a4.metric("Průměrná doba držení", _format_holding_time(float(dashboard_trade_analytics["avg_holding_minutes"])))
+
+            exit_reason_frame = dashboard_trade_analytics.get("exit_reason_frame", pd.DataFrame())
+            if isinstance(exit_reason_frame, pd.DataFrame) and not exit_reason_frame.empty:
+                st.caption("Nejčastější důvody výstupu ukazují, zda segment naráží spíš na stop-loss, invalidaci setupu nebo nedokáže dotahovat targety.")
+                st.dataframe(exit_reason_frame, use_container_width=True, hide_index=True)
 
         st.subheader("Vítěz týdne")
         champ = latest["champion"]
@@ -1693,16 +1912,14 @@ else:
         model_position_rows = []
         model_markets = latest.get("model_markets", {})
         latest_prices = latest.get("latest_prices", {})
+        current_open_positions = _build_current_open_positions(wallet_open_positions, latest)
         for _, row in latest["results"].iterrows():
             model_id = str(row["model_id"])
             model_name = str(row["name"])
             model_symbol = str(row.get("symbol") or latest.get("model_selected_symbols", {}).get(model_id, latest["symbol"])).upper()
             model_live_state = latest.get("live_model_state", {}).get(model_id, {})
-            position_value = float(latest.get("final_positions", {}).get(model_id, 0.0))
-            open_slots = int(latest.get("final_open_slots", {}).get(model_id, 0))
-            is_open = abs(position_value) > 1e-9
-
-            open_pos_list = latest.get("model_open_positions", {}).get(model_id, [])
+            open_pos_list = current_open_positions.get(model_id, [])
+            is_open = bool(open_pos_list)
 
             if not open_pos_list or not is_open:
                 # Model without open positions – single inactive row
@@ -1734,7 +1951,7 @@ else:
                 if pos_side not in {"LONG", "SHORT"} or pos_slots <= 0:
                     continue
 
-                invested_czk = round(PAPER_TRADE_SIZE_CZK, 0)
+                invested_czk = round(PAPER_TRADE_SIZE_CZK * pos_slots, 0)
 
                 model_market = model_markets.get(model_id, latest["market"])
                 pos_latest_price = latest_prices.get(pos_symbol)
@@ -1866,6 +2083,7 @@ else:
                 else:
                     filtered["pnl_status"] = filtered["pnl_status"].astype(str).str.upper()
                     filtered["side"] = filtered["side"].astype(str).str.upper().replace({"BUY": "LONG", "SELL": "SHORT"})
+                    filtered_trade_analytics = _compute_trade_analytics(filtered)
 
                     # Compute financial PnL column before renaming
                     slots = pd.to_numeric(filtered["quantity_slots"], errors="coerce").fillna(0.0).abs()
@@ -1886,13 +2104,12 @@ else:
                             "pnl_pct": "PnL %",
                             "pnl_czk": "PnL CZK",
                             "pnl_status": "Výsledek",
+                            "exit_reason": "Důvod výstupu",
                             "market_source": "Zdroj dat",
                             "week": "Týden",
                             "generation": "Generace",
                         }
                     )
-                    if "exit_reason" in overview.columns:
-                        overview = overview.drop(columns=["exit_reason"])
                     overview["Zdroj dat"] = overview["Zdroj dat"].replace({"simulation": "Simulace", "binance": "Binance"})
 
                     # Format datetimes: combine date+time, opened first
@@ -1911,10 +2128,12 @@ else:
                     overview = overview[ordered_cols + remaining_cols]
 
                     win_rate_label, avg_pnl_label, _, _, _ = _compute_closed_position_metrics(filtered)
-                    m1, m2, m3 = st.columns(3)
+                    m1, m2, m3, m4, m5 = st.columns(5)
                     m1.metric("Uzavřené obchody", len(overview))
                     m2.metric("Win rate", win_rate_label)
                     m3.metric("Průměrné PnL", avg_pnl_label)
+                    m4.metric("Expectancy", f"{float(filtered_trade_analytics['expectancy_pct']):.3f}%")
+                    m5.metric("Profit factor", f"{float(filtered_trade_analytics['profit_factor']):.2f}")
 
                     def _style_result(value):
                         if value == "ZISK":
@@ -1946,6 +2165,14 @@ else:
                         .map(_style_datetime, subset=[c for c in ["Otevřeno", "Uzavřeno"] if c in overview.columns])
                     )
                     st.dataframe(styled_overview, use_container_width=True)
+
+                    exit_reason_frame = filtered_trade_analytics.get("exit_reason_frame", pd.DataFrame())
+                    if isinstance(exit_reason_frame, pd.DataFrame) and not exit_reason_frame.empty:
+                        st.caption(
+                            f"Průměrná doba držení: {_format_holding_time(float(filtered_trade_analytics['avg_holding_minutes']))} | "
+                            f"Expectancy v Kč: {_format_czk_delta(float(filtered_trade_analytics['expectancy_czk']))}"
+                        )
+                        st.dataframe(exit_reason_frame, use_container_width=True, hide_index=True)
 
     if st.session_state.active_view == "Grafy":
         _render_graph_view_body()

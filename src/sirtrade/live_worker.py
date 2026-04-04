@@ -4,9 +4,20 @@ import os
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 from .automation import run_segment_cycle
 from .config import DEFAULT_CONFIG, INITIAL_PAPER_WALLET_CZK, PAPER_TRADE_SIZE_CZK
@@ -33,9 +44,81 @@ SEGMENT_DEFAULTS = {
 BINANCE_DECISION_SECONDS = 30
 WORKER_SLEEP_SECONDS = 1.0
 WORKER_HEARTBEAT_SECONDS = 10.0
+WORKER_LOCK_FILE = Path("data/live_worker.lock")
 
 _worker_lock = threading.Lock()
 _worker_started = False
+_worker_process_lock: "_WorkerProcessLock | None" = None
+
+
+class _WorkerProcessLock:
+    def __init__(self, lock_path: Path = WORKER_LOCK_FILE) -> None:
+        self.lock_path = Path(lock_path)
+        self._handle = None
+
+    def acquire(self) -> bool:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.lock_path.open("a+b")
+        try:
+            handle.seek(0)
+            handle.write(b"0")
+            handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                if msvcrt is None:
+                    raise OSError("msvcrt is unavailable")
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                if fcntl is None:
+                    raise OSError("fcntl is unavailable")
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            handle.seek(0)
+            handle.truncate()
+            payload = f"pid={os.getpid()} acquired_at={pd.Timestamp.utcnow().isoformat()}\n"
+            handle.write(payload.encode("utf-8"))
+            handle.flush()
+            self._handle = handle
+            return True
+        except OSError:
+            handle.close()
+            return False
+
+    def release(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                if msvcrt is not None:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            elif fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+            self._handle = None
+
+
+def _acquire_worker_process_lock() -> bool:
+    global _worker_process_lock
+    if _worker_process_lock is not None:
+        return True
+
+    process_lock = _WorkerProcessLock()
+    if not process_lock.acquire():
+        return False
+
+    _worker_process_lock = process_lock
+    return True
+
+
+def _release_worker_process_lock() -> None:
+    global _worker_process_lock
+    if _worker_process_lock is None:
+        return
+    _worker_process_lock.release()
+    _worker_process_lock = None
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -163,6 +246,7 @@ def _apply_trade_cutoff(summary: dict[str, Any], cutoff_value: Any) -> dict[str,
 
     filtered_summary = dict(summary)
     model_trades = summary.get("model_trades", {})
+    trade_events_delta = summary.get("trade_events_delta", {})
     results_df = summary.get("results")
     if not isinstance(model_trades, dict) or not isinstance(results_df, pd.DataFrame):
         return filtered_summary
@@ -171,6 +255,10 @@ def _apply_trade_cutoff(summary: dict[str, Any], cutoff_value: Any) -> dict[str,
         str(model_id): _filter_events_since(events, cutoff_ts)
         for model_id, events in model_trades.items()
     }
+    filtered_trade_events_delta = {
+        str(model_id): _filter_events_since(events, cutoff_ts)
+        for model_id, events in trade_events_delta.items()
+    } if isinstance(trade_events_delta, dict) else {}
     slot_size = PAPER_TRADE_SIZE_CZK / INITIAL_PAPER_WALLET_CZK
     final_positions: dict[str, float] = {}
     final_open_slots: dict[str, int] = {}
@@ -213,6 +301,7 @@ def _apply_trade_cutoff(summary: dict[str, Any], cutoff_value: Any) -> dict[str,
             model_open_positions[model_id] = []
 
     filtered_summary["model_trades"] = filtered_trades
+    filtered_summary["trade_events_delta"] = filtered_trade_events_delta
     champion_model_id = str(summary.get("champion", {}).get("model_id", ""))
     filtered_summary["champion_trades"] = filtered_trades.get(champion_model_id, [])
     filtered_summary["final_positions"] = final_positions
@@ -287,7 +376,16 @@ def _choose_segments(
 ) -> list[str]:
     if not runnable_segments:
         return []
-    return runnable_segments
+    if data_source in {"binance", "binance_copy"}:
+        return runnable_segments
+
+    cursor = _coerce_int(worker_state.get("segment_cursor"), 0)
+    if cursor < 0:
+        cursor = 0
+    cursor %= len(runnable_segments)
+    selected_segment = runnable_segments[cursor]
+    worker_state["segment_cursor"] = (cursor + 1) % len(runnable_segments)
+    return [selected_segment]
 
 
 def _run_worker_loop() -> None:
@@ -401,8 +499,25 @@ def _run_worker_loop() -> None:
         time.sleep(WORKER_SLEEP_SECONDS)
 
 
+def _run_worker_loop_forever() -> None:
+    global _worker_started
+    try:
+        _run_worker_loop()
+    finally:
+        with _worker_lock:
+            _worker_started = False
+        _release_worker_process_lock()
+
+
 def serve_live_worker() -> None:
-    _run_worker_loop()
+    if not _acquire_worker_process_lock():
+        print("[WORKER] Another SirTrade worker process is already running; skipping duplicate worker start.")
+        return
+    _run_worker_loop_forever()
+
+
+def is_live_worker_started() -> bool:
+    return _worker_started
 
 
 def ensure_live_worker_started() -> None:
@@ -410,6 +525,9 @@ def ensure_live_worker_started() -> None:
     with _worker_lock:
         if _worker_started:
             return
-        thread = threading.Thread(target=_run_worker_loop, name="sirtrade-live-worker", daemon=True)
+        if not _acquire_worker_process_lock():
+            print("[WORKER] Another SirTrade worker process already holds the worker lock; embedded worker will not start.")
+            return
+        thread = threading.Thread(target=_run_worker_loop_forever, name="sirtrade-live-worker", daemon=True)
         thread.start()
         _worker_started = True

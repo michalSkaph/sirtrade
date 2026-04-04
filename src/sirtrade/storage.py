@@ -37,11 +37,132 @@ def _extract_slot_delta(action: str, entry: bool) -> float:
         return 0.0
 
 
+def _infer_segment_from_model_id(model_id: object) -> str | None:
+    normalized = str(model_id).strip().upper()
+    if normalized.startswith("SC_"):
+        return "Scalp"
+    if normalized.startswith("ID_"):
+        return "Intraday"
+    if normalized.startswith("SW_"):
+        return "Swing"
+    return None
+
+
+def _closed_trade_identity(
+    *,
+    opened_at: object,
+    segment: object,
+    model_id: object,
+    symbol: object,
+    side: object,
+    entry_price: object,
+    quantity_slots: object,
+    market_source: object,
+    week: object,
+    generation: object,
+) -> tuple[object, ...]:
+    try:
+        entry_price_value = round(float(entry_price), 12)
+    except Exception:
+        entry_price_value = 0.0
+    try:
+        quantity_value = round(float(quantity_slots), 8)
+    except Exception:
+        quantity_value = 0.0
+
+    return (
+        str(opened_at),
+        str(segment or ""),
+        str(model_id),
+        str(symbol).upper(),
+        _normalize_side(str(side)),
+        entry_price_value,
+        quantity_value,
+        str(market_source),
+        int(week or 0),
+        int(generation or 0),
+    )
+
+
+def _closed_trade_identity_from_row(row: tuple) -> tuple[object, ...]:
+    return _closed_trade_identity(
+        opened_at=row[1],
+        segment=row[13],
+        model_id=row[2],
+        symbol=row[4],
+        side=row[5],
+        entry_price=row[6],
+        quantity_slots=row[8],
+        market_source=row[12],
+        week=row[14],
+        generation=row[15],
+    )
+
+
+def _closed_trade_already_saved(conn: sqlite3.Connection, row: tuple) -> bool:
+    identity = _closed_trade_identity_from_row(row)
+    existing = conn.execute(
+        """
+        SELECT 1
+        FROM closed_positions
+        WHERE hidden = 0
+          AND opened_at = ?
+          AND COALESCE(segment, '') = ?
+          AND model_id = ?
+          AND symbol = ?
+          AND side = ?
+          AND ABS(entry_price - ?) <= 1e-12
+          AND ABS(quantity_slots - ?) <= 1e-8
+          AND market_source = ?
+          AND week = ?
+          AND generation = ?
+        LIMIT 1
+        """,
+        identity,
+    ).fetchone()
+    return existing is not None
+
+
+def _dedupe_closed_positions(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        WITH ranked AS (
+            SELECT
+                id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY
+                        opened_at,
+                        COALESCE(segment, ''),
+                        model_id,
+                        symbol,
+                        side,
+                        ROUND(entry_price, 12),
+                        ROUND(quantity_slots, 8),
+                        market_source,
+                        week,
+                        generation
+                    ORDER BY closed_at ASC, id ASC
+                ) AS row_num
+            FROM closed_positions
+            WHERE hidden = 0
+        )
+        UPDATE closed_positions
+        SET hidden = 1
+        WHERE id IN (
+            SELECT id
+            FROM ranked
+            WHERE row_num > 1
+        )
+        """
+    )
+
+
 def _build_closed_positions_rows(summary: dict) -> list[tuple]:
     model_trades = summary.get("trade_events_delta", summary.get("model_trades", {}))
     results_df = summary.get("results")
     default_symbol = str(summary.get("symbol", "BTCUSDT"))
     market_source = str(summary.get("market_source", "simulation"))
+    segment = str(summary.get("segment", "")).strip() or None
     week = int(summary.get("week", 0))
     generation = int(summary.get("generation", 0))
 
@@ -137,6 +258,7 @@ def _build_closed_positions_rows(summary: dict) -> list[tuple]:
                         pnl_status,
                         exit_reason,
                         market_source,
+                        segment,
                         week,
                         generation,
                     )
@@ -189,6 +311,7 @@ def _build_closed_positions_rows(summary: dict) -> list[tuple]:
                         pnl_status,
                         exit_reason,
                         market_source,
+                        segment,
                         week,
                         generation,
                     )
@@ -248,6 +371,20 @@ def _normalize_open_position_sides(conn: sqlite3.Connection) -> None:
     )
 
 
+def _backfill_segments(conn: sqlite3.Connection, table_name: str) -> None:
+    rows = conn.execute(
+        f"SELECT id, model_id FROM {table_name} WHERE segment IS NULL OR TRIM(segment) = ''"
+    ).fetchall()
+    for row_id, model_id in rows:
+        segment = _infer_segment_from_model_id(model_id)
+        if segment is None:
+            continue
+        conn.execute(
+            f"UPDATE {table_name} SET segment = ? WHERE id = ?",
+            (segment, int(row_id)),
+        )
+
+
 def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
     key = _db_key(db_path)
     if key in _initialized_dbs:
@@ -295,6 +432,7 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
                     CREATE TABLE IF NOT EXISTS open_positions (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        segment TEXT,
                         model_id TEXT NOT NULL,
                         model_name TEXT NOT NULL,
                         symbol TEXT NOT NULL,
@@ -310,6 +448,7 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         closed_at TEXT NOT NULL,
                         opened_at TEXT NOT NULL,
+                        segment TEXT,
                         model_id TEXT NOT NULL,
                         model_name TEXT NOT NULL,
                         symbol TEXT NOT NULL,
@@ -327,6 +466,14 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
                     """
                 )
                 try:
+                    conn.execute("ALTER TABLE open_positions ADD COLUMN segment TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    conn.execute("ALTER TABLE closed_positions ADD COLUMN segment TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                try:
                     conn.execute("ALTER TABLE closed_positions ADD COLUMN exit_reason TEXT NOT NULL DEFAULT 'NEURČENO'")
                 except sqlite3.OperationalError:
                     pass
@@ -335,7 +482,13 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
                     "CREATE INDEX IF NOT EXISTS idx_open_positions_updated_model ON open_positions(updated_at DESC, model_id ASC)"
                 )
                 conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_open_positions_segment_updated ON open_positions(segment, updated_at DESC)"
+                )
+                conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_closed_positions_closed_id ON closed_positions(closed_at DESC, id DESC)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_closed_positions_segment_closed ON closed_positions(segment, closed_at DESC, id DESC)"
                 )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_weekly_runs_created_id ON weekly_runs(created_at DESC, id DESC)"
@@ -349,6 +502,9 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
                 except sqlite3.OperationalError:
                     pass
                 _normalize_open_position_sides(conn)
+                _backfill_segments(conn, "open_positions")
+                _backfill_segments(conn, "closed_positions")
+                _dedupe_closed_positions(conn)
                 conn.commit()
                 _initialized_dbs.add(key)
                 return
@@ -410,8 +566,10 @@ def load_recent_runs(limit: int = 50, db_path: Path = DEFAULT_DB_PATH) -> pd.Dat
 
 def save_open_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
     final_positions = summary.get("final_positions", {})
+    final_open_slots = summary.get("final_open_slots", {})
     model_open_positions = summary.get("model_open_positions", {})
     results_df = summary.get("results")
+    segment = str(summary.get("segment", "")).strip() or None
     symbol = str(summary.get("symbol", "BTCUSDT"))
     market_source = str(summary.get("market_source", "simulation"))
 
@@ -442,16 +600,19 @@ def save_open_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
                 if side not in {"LONG", "SHORT"}:
                     continue
                 symbol_value = str(position.get("symbol", symbol)).upper()
-                slot_count = 1.0
+                slot_count = abs(float(position.get("slots", position.get("open_slots", 1.0)) or 0.0))
+                if slot_count <= 0:
+                    continue
                 key = (str(model_id), symbol_value, side)
                 model_name = model_names.get(str(model_id), str(position.get("model_name", model_id)))
                 previous = aggregated_positions.get(key)
                 aggregated_positions[key] = (
                     model_name,
-                    slot_count,
+                    slot_count if previous is None else float(previous[1]) + slot_count,
                 )
         rows_to_insert.extend(
             (
+                segment,
                 model_id,
                 model_name,
                 symbol_value,
@@ -467,13 +628,17 @@ def save_open_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
             if abs(size_val) < 1e-9:
                 continue
             side = _normalize_side("LONG" if size_val > 0 else "SHORT")
+            slot_count = abs(float(final_open_slots.get(model_id, 1.0) or 0.0))
+            if slot_count <= 0:
+                slot_count = 1.0
             rows_to_insert.append(
                 (
+                    segment,
                     str(model_id),
                     model_names.get(str(model_id), str(model_id)),
                     symbol,
                     side,
-                    1.0,
+                    slot_count,
                     market_source,
                 )
             )
@@ -493,24 +658,35 @@ def save_open_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
             namespace_to_delete = next(iter(namespace_prefixes))
 
         if namespace_to_delete is not None:
-            conn.execute(
-                "DELETE FROM open_positions WHERE model_id LIKE ?",
-                (f"{namespace_to_delete}_%",),
-            )
+            if segment is not None:
+                conn.execute(
+                    "DELETE FROM open_positions WHERE segment = ? OR (segment IS NULL AND model_id LIKE ?)",
+                    (segment, f"{namespace_to_delete}_%"),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM open_positions WHERE model_id LIKE ?",
+                    (f"{namespace_to_delete}_%",),
+                )
         elif summary_model_ids:
             placeholders = ", ".join("?" for _ in summary_model_ids)
-            conn.execute(
-                f"DELETE FROM open_positions WHERE model_id IN ({placeholders})",
-                tuple(sorted(summary_model_ids)),
-            )
+            delete_sql = f"DELETE FROM open_positions WHERE model_id IN ({placeholders})"
+            delete_params: tuple[object, ...] = tuple(sorted(summary_model_ids))
+            if segment is not None:
+                delete_sql = f"DELETE FROM open_positions WHERE segment = ? OR model_id IN ({placeholders})"
+                delete_params = (segment, *delete_params)
+            conn.execute(delete_sql, delete_params)
         else:
-            conn.execute("DELETE FROM open_positions")
+            if segment is not None:
+                conn.execute("DELETE FROM open_positions WHERE segment = ?", (segment,))
+            else:
+                conn.execute("DELETE FROM open_positions")
         if rows_to_insert:
             conn.executemany(
                 """
                 INSERT INTO open_positions (
-                    model_id, model_name, symbol, side, position_size, market_source
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    segment, model_id, model_name, symbol, side, position_size, market_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows_to_insert,
             )
@@ -519,13 +695,20 @@ def save_open_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
         conn.close()
 
 
-def load_open_positions(db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
+def load_open_positions(segment: str | None = None, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
     conn = _connect_db(db_path)
     try:
-        frame = pd.read_sql_query(
-            "SELECT * FROM open_positions ORDER BY updated_at DESC, model_id ASC",
-            conn,
-        )
+        if segment is None:
+            frame = pd.read_sql_query(
+                "SELECT * FROM open_positions ORDER BY updated_at DESC, model_id ASC",
+                conn,
+            )
+        else:
+            frame = pd.read_sql_query(
+                "SELECT * FROM open_positions WHERE segment = ? ORDER BY updated_at DESC, model_id ASC",
+                conn,
+                params=(str(segment),),
+            )
         if "side" in frame.columns:
             frame["side"] = frame["side"].astype(str).map(_normalize_side)
         return frame
@@ -540,28 +723,49 @@ def save_closed_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> Non
 
     conn = _connect_db(db_path)
     try:
+        unique_rows: list[tuple] = []
+        seen_identities: set[tuple[object, ...]] = set()
+        for row in rows_to_insert:
+            identity = _closed_trade_identity_from_row(row)
+            if identity in seen_identities:
+                continue
+            if _closed_trade_already_saved(conn, row):
+                continue
+            seen_identities.add(identity)
+            unique_rows.append(row)
+
+        if not unique_rows:
+            return
+
         conn.executemany(
             """
             INSERT INTO closed_positions (
                 closed_at, opened_at, model_id, model_name, symbol, side,
                 entry_price, exit_price, quantity_slots, pnl_pct, pnl_status, exit_reason,
-                market_source, week, generation
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                market_source, segment, week, generation
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            rows_to_insert,
+            unique_rows,
         )
+        _dedupe_closed_positions(conn)
         conn.commit()
     finally:
         conn.close()
 
 
-def load_closed_positions(limit: int = 2000, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
+def load_closed_positions(limit: int = 2000, segment: str | None = None, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
     conn = _connect_db(db_path)
     try:
+        if segment is None:
+            return pd.read_sql_query(
+                "SELECT * FROM closed_positions WHERE hidden = 0 ORDER BY closed_at DESC, id DESC LIMIT ?",
+                conn,
+                params=(int(limit),),
+            )
         return pd.read_sql_query(
-            "SELECT * FROM closed_positions WHERE hidden = 0 ORDER BY closed_at DESC, id DESC LIMIT ?",
+            "SELECT * FROM closed_positions WHERE hidden = 0 AND segment = ? ORDER BY closed_at DESC, id DESC LIMIT ?",
             conn,
-            params=(int(limit),),
+            params=(str(segment), int(limit)),
         )
     finally:
         conn.close()

@@ -15,6 +15,7 @@ UI_STATE_FILE = Path("data/ui_last_run.json")
 UI_RUNTIME_FILE = Path("data/ui_runtime_state.json")
 UI_SEGMENT_STATE_FILE = Path("data/ui_segment_runs.json")
 WORKER_STATUS_FILE = Path("data/worker_status.json")
+PERSISTED_MARKET_TAIL_ROWS = 360
 
 
 def _write_json_atomic(file_path: Path, payload: Any) -> None:
@@ -97,8 +98,10 @@ def _sanitize_json(value: Any) -> Any:
     return value
 
 
-def _df_to_payload(df: pd.DataFrame) -> dict[str, Any]:
+def _df_to_payload(df: pd.DataFrame, tail_rows: int | None = None) -> dict[str, Any]:
     frame = df.copy()
+    if tail_rows is not None and tail_rows > 0 and len(frame) > tail_rows:
+        frame = frame.tail(tail_rows).copy()
     if isinstance(frame.index, pd.DatetimeIndex):
         frame = frame.copy()
         frame.index = frame.index.astype(str)
@@ -153,9 +156,9 @@ def _serialize_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "latest_prices": summary.get("latest_prices", {}),
         "results": _df_to_payload(summary.get("results", pd.DataFrame())),
         "long_tail": _df_to_payload(summary.get("long_tail", pd.DataFrame())),
-        "market": _df_to_payload(summary.get("market", pd.DataFrame())),
+        "market": _df_to_payload(summary.get("market", pd.DataFrame()), tail_rows=PERSISTED_MARKET_TAIL_ROWS),
         "model_markets": {
-            str(model_id): _df_to_payload(frame)
+            str(model_id): _df_to_payload(frame, tail_rows=PERSISTED_MARKET_TAIL_ROWS)
             for model_id, frame in model_markets.items()
             if isinstance(frame, pd.DataFrame)
         },
@@ -248,6 +251,36 @@ def save_runtime_state(state: dict[str, Any], file_path: Path = UI_RUNTIME_FILE)
 def load_runtime_state(file_path: Path = UI_RUNTIME_FILE) -> dict[str, Any]:
     data = _load_json_resilient(file_path, {})
     return data if isinstance(data, dict) else {}
+
+
+def sanitize_runtime_state_for_ui_boot(
+    state: dict[str, Any] | None,
+    *,
+    resume_running_segments: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(state, dict):
+        return {}
+
+    sanitized = dict(state)
+    if resume_running_segments:
+        return sanitized
+
+    running_by_segment = sanitized.get("simulation_running_by_segment", {})
+    if isinstance(running_by_segment, dict):
+        has_running_segments = any(bool(value) for value in running_by_segment.values())
+        sanitized["simulation_running_by_segment"] = {
+            str(segment): False
+            for segment in running_by_segment.keys()
+        }
+    else:
+        has_running_segments = False
+        sanitized["simulation_running_by_segment"] = {}
+
+    if bool(sanitized.get("simulation_running")) or has_running_segments:
+        sanitized["simulation_running"] = False
+        sanitized["last_simulation_tick"] = 0.0
+
+    return sanitized
 
 
 def clear_runtime_state(file_path: Path = UI_RUNTIME_FILE) -> None:

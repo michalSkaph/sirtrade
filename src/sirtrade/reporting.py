@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from .config import AppConfig
+from .scoring import CALMAR_CAP, SORTINO_CAP
 
 
 def export_weekly_report(summary: dict, config: AppConfig, out_dir: Path | str = "reports") -> dict:
@@ -36,7 +37,7 @@ def export_weekly_report(summary: dict, config: AppConfig, out_dir: Path | str =
         "interval": summary.get("interval"),
         "champion": summary.get("champion", {}),
         "decision_matrix": {
-            "formula": "S = 0.28*Sortino + 0.22*Calmar - 0.18*CVaR95 - 0.14*MaxDD - 0.10*Cost - 0.08*Turnover",
+            "formula": "S = w_sortino*clip(Sortino) + w_calmar*clip(Calmar) - w_cvar95*CVaR95 - w_maxdd*MaxDD - w_cost*Cost - w_turnover*Turnover",
             "weights": {
                 "sortino": config.weights.sortino,
                 "calmar": config.weights.calmar,
@@ -45,6 +46,10 @@ def export_weekly_report(summary: dict, config: AppConfig, out_dir: Path | str =
                 "cost": config.weights.cost,
                 "turnover": config.weights.turnover,
             },
+            "metric_caps": {
+                "sortino_abs": SORTINO_CAP,
+                "calmar_abs": CALMAR_CAP,
+            },
             "thresholds": {
                 "min_sortino": config.thresholds.min_sortino,
                 "min_calmar": config.thresholds.min_calmar,
@@ -52,6 +57,7 @@ def export_weekly_report(summary: dict, config: AppConfig, out_dir: Path | str =
                 "max_cvar95": config.thresholds.max_cvar95,
             },
         },
+        "trade_analytics": summary.get("trade_analytics", {}),
         "proposed_orders": summary.get("proposed_orders", []),
     }
 
