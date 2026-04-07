@@ -24,6 +24,7 @@ def bound_metrics(metrics: dict) -> dict[str, float]:
     return {
         "sortino": _clip(float(metrics.get("sortino", 0.0)), -SORTINO_CAP, SORTINO_CAP),
         "calmar": _clip(float(metrics.get("calmar", 0.0)), -CALMAR_CAP, CALMAR_CAP),
+        "win_rate": _clip((float(metrics.get("win_rate", 50.0)) - 50.0) / 50.0, -1.0, 1.0),
         "cvar95": _clip(float(metrics.get("cvar95", 0.0)), 0.0, CVAR95_CAP),
         "max_dd": _clip(float(metrics.get("max_dd", 0.0)), 0.0, MAX_DD_CAP),
         "cost": _clip(float(metrics.get("cost", 0.0)), 0.0, COST_CAP),
@@ -58,6 +59,7 @@ def decision_score(metrics: dict, weights: DecisionWeights) -> float:
     return (
         weights.sortino * bounded["sortino"]
         + weights.calmar * bounded["calmar"]
+        + weights.win_rate * bounded["win_rate"]
         + weights.cvar95 * bounded["cvar95"]
         + weights.max_dd * bounded["max_dd"]
         + weights.cost * bounded["cost"]

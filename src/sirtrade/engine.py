@@ -45,6 +45,8 @@ class ModelResult:
     turnover: float
     score: float
     passed: bool
+    closed_trades: int = 0
+    win_rate: float = 50.0
 
 
 def _current_execution_timestamp() -> pd.Timestamp:
@@ -255,6 +257,30 @@ class TradingEngine:
                 {"reason": str(reason), "count": int(count)}
                 for reason, count in exit_breakdown
             ],
+        }
+
+    def _min_closed_trades_for_evolution(self) -> int:
+        if self.model_namespace == "SC":
+            return max(1, int(self.config.min_closed_trades_scalp))
+        if self.model_namespace == "ID":
+            return max(1, int(self.config.min_closed_trades_intraday))
+        if self.model_namespace == "SW":
+            return max(1, int(self.config.min_closed_trades_swing))
+        return max(1, int(self.config.min_closed_trades_swing))
+
+    def _sample_confidence(self, closed_trades: int) -> float:
+        required_trades = self._min_closed_trades_for_evolution()
+        return float(np.clip(float(max(0, closed_trades)) / float(required_trades), 0.0, 1.0))
+
+    def _stabilized_win_rate(self, raw_win_rate: float, closed_trades: int) -> float:
+        confidence = self._sample_confidence(closed_trades)
+        return 50.0 + ((float(raw_win_rate) - 50.0) * confidence)
+
+    def _trade_analytics_for_events(self, model_id: str, events: list[dict[str, Any]]) -> dict[str, float | int]:
+        analytics = self._summarize_trade_analytics({str(model_id): list(events or [])})
+        return {
+            "closed_trades": int(analytics.get("closed_trades", 0) or 0),
+            "win_rate": float(analytics.get("win_rate", 50.0) or 50.0),
         }
 
     def _market_seed(self, symbol: str, offset: int = 0) -> int:
@@ -511,6 +537,11 @@ class TradingEngine:
             "cost": 0.0,
             "turnover": 0.0,
         }
+        trade_analytics = self._trade_analytics_for_events(model.model_id, events)
+        metrics["win_rate"] = self._stabilized_win_rate(
+            raw_win_rate=float(trade_analytics["win_rate"]),
+            closed_trades=int(trade_analytics["closed_trades"]),
+        )
         score = decision_score(metrics, self.config.weights) + float(leader.get("score", 0.0))
         passed = pass_thresholds(metrics, self.config.thresholds)
         result = ModelResult(
@@ -526,6 +557,8 @@ class TradingEngine:
             turnover=0.0,
             score=score,
             passed=passed,
+            closed_trades=int(trade_analytics["closed_trades"]),
+            win_rate=float(trade_analytics["win_rate"]),
         )
         return {
             "result": result,
@@ -1262,6 +1295,11 @@ class TradingEngine:
             "cost": fee_cost,
             "turnover": turnover,
         }
+        trade_analytics = self._trade_analytics_for_events(model.model_id, events)
+        metrics["win_rate"] = self._stabilized_win_rate(
+            raw_win_rate=float(trade_analytics["win_rate"]),
+            closed_trades=int(trade_analytics["closed_trades"]),
+        )
         score = decision_score(metrics, self.config.weights)
         passed = pass_thresholds(metrics, self.config.thresholds)
 
@@ -1278,6 +1316,8 @@ class TradingEngine:
             turnover=turnover,
             score=score,
             passed=passed,
+            closed_trades=int(trade_analytics["closed_trades"]),
+            win_rate=float(trade_analytics["win_rate"]),
         )
         final_position = float(pos.iloc[-1]) if not pos.empty else 0.0
         final_open_slots = int(current_slots if side != 0 else 0)
@@ -1766,6 +1806,9 @@ class TradingEngine:
             key=lambda item: (
                 bool(item["result"].passed),
                 float(item["result"].score),
+                self._sample_confidence(int(getattr(item["result"], "closed_trades", 0))),
+                int(getattr(item["result"], "closed_trades", 0)),
+                float(getattr(item["result"], "win_rate", 50.0)),
                 float(item.get("opportunity_score", 0.0)),
                 abs(float(item.get("final_position", 0.0))),
             ),
@@ -1992,7 +2035,12 @@ class TradingEngine:
         final_positions = {run["result"].model_id: run["final_position"] for run in selected_runs}
         final_open_slots = {run["result"].model_id: run["final_open_slots"] for run in selected_runs}
         model_markets = {run["result"].model_id: run["market"] for run in selected_runs}
-        results_df = pd.DataFrame([r.__dict__ for r in results]).sort_values("score", ascending=False)
+        results_df = pd.DataFrame([r.__dict__ for r in results])
+        if not results_df.empty:
+            results_df = results_df.sort_values(
+                by=["passed", "score", "closed_trades", "win_rate"],
+                ascending=[False, False, False, False],
+            )
         model_selected_symbols = {
             str(row["model_id"]): str(row.get("symbol", "")).upper()
             for _, row in results_df.iterrows()
@@ -2104,9 +2152,26 @@ class TradingEngine:
         prefix = f"{self.model_label_prefix.strip()} | " if self.model_label_prefix.strip() else ""
 
         model_by_id = {model.model_id: model for model in self.models if model.kind != "copy_trader"}
+        incumbent_name_by_kind = {model.kind: model.name for model in self.models if model.kind != "copy_trader"}
         scored_rows: list[tuple[str, float, str]] = []
         if isinstance(leaderboard, pd.DataFrame) and {"model_id", "score"}.issubset(leaderboard.columns):
-            for _, row in leaderboard.iterrows():
+            ranked_leaderboard = leaderboard.copy()
+            if "closed_trades" not in ranked_leaderboard.columns:
+                ranked_leaderboard["closed_trades"] = 0
+            if "win_rate" not in ranked_leaderboard.columns:
+                ranked_leaderboard["win_rate"] = 50.0
+            if "passed" not in ranked_leaderboard.columns:
+                ranked_leaderboard["passed"] = False
+
+            ranked_leaderboard = ranked_leaderboard[
+                pd.to_numeric(ranked_leaderboard["closed_trades"], errors="coerce").fillna(0.0)
+                >= float(self._min_closed_trades_for_evolution())
+            ].sort_values(
+                by=["passed", "score", "closed_trades", "win_rate"],
+                ascending=[False, False, False, False],
+            )
+
+            for _, row in ranked_leaderboard.iterrows():
                 model_id = str(row["model_id"])
                 model = model_by_id.get(model_id)
                 if model is None:
@@ -2122,7 +2187,7 @@ class TradingEngine:
         standard_models = [
             ModelSpec(
                 _model_id(base_id),
-                best_name_by_kind.get(kind, f"{prefix}{default_name}"),
+                best_name_by_kind.get(kind, incumbent_name_by_kind.get(kind, f"{prefix}{default_name}")),
                 kind,
                 self.generation,
             )

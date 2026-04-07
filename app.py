@@ -837,6 +837,22 @@ def _compute_trade_analytics(frame: pd.DataFrame) -> dict[str, object]:
     }
 
 
+def _segment_min_closed_trades(segment: str) -> int:
+    segment_name = str(segment).strip()
+    if segment_name == "Scalp":
+        return int(DEFAULT_CONFIG.min_closed_trades_scalp)
+    if segment_name == "Intraday":
+        return int(DEFAULT_CONFIG.min_closed_trades_intraday)
+    return int(DEFAULT_CONFIG.min_closed_trades_swing)
+
+
+def _segment_evolution_progress(segment: str, closed_trade_count: int) -> tuple[int, int, float]:
+    required = max(1, _segment_min_closed_trades(segment))
+    current = max(0, int(closed_trade_count))
+    progress = min(1.0, float(current) / float(required))
+    return current, required, progress
+
+
 def _format_holding_time(minutes_value: float) -> str:
     if minutes_value <= 0:
         return "N/A"
@@ -1610,6 +1626,15 @@ with st.sidebar:
     st.write(f"Měkký DD limit: {cfg.risk.soft_dd_alert:.0%}")
     st.write(f"Tvrdý DD limit: {cfg.risk.hard_dd_limit:.0%}")
     st.write(f"Maximální expozice na aktivum: {cfg.risk.max_asset_exposure:.0%}")
+    st.markdown("---")
+    st.subheader("Evoluce modelů")
+    st.write(f"Generační horizont: {int(DEFAULT_CONFIG.generation_horizon_weeks)} běhů")
+    st.write(
+        "Min. uzavřené obchody pro evoluci: "
+        f"Scalp {int(DEFAULT_CONFIG.min_closed_trades_scalp)} | "
+        f"Intraday {int(DEFAULT_CONFIG.min_closed_trades_intraday)} | "
+        f"Swing {int(DEFAULT_CONFIG.min_closed_trades_swing)}"
+    )
 
 if reset_btn:
     st.session_state.simulation_running_by_segment = {segment: False for segment in SEGMENT_DEFAULTS.keys()}
@@ -1820,6 +1845,10 @@ else:
         dashboard_closed_positions = wallet_closed_positions.copy()
         win_rate_label, avg_pnl_label, _, _, _ = _compute_closed_position_metrics(dashboard_closed_positions)
         dashboard_trade_analytics = _compute_trade_analytics(dashboard_closed_positions)
+        segment_closed_trades, segment_trade_requirement, segment_progress = _segment_evolution_progress(
+            st.session_state.active_segment,
+            int(dashboard_trade_analytics.get("closed_trades", 0) or 0),
+        )
 
         st.subheader(f"Detail segmentu: {st.session_state.active_segment}")
 
@@ -1831,6 +1860,11 @@ else:
         c6, c7 = st.columns(2)
         c6.metric("Volatilita portfolia (roč.)", f"{latest['portfolio_vol_annual']:.2%}")
         c7.metric("Odměna vítěze", "$1")
+        st.caption(
+            f"Evoluce segmentu: {segment_closed_trades}/{segment_trade_requirement} uzavřených obchodů "
+            f"({segment_progress * 100:.0f} % minima pro zařazení do generační selekce)."
+        )
+        st.progress(segment_progress, text=f"Progres vzorku pro evoluci: {segment_closed_trades}/{segment_trade_requirement}")
         if live_market_price is not None:
             st.metric(
                 f"Aktuální cena {latest['symbol']}",

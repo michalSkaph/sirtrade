@@ -24,6 +24,7 @@ class DecisionWeights:
     # low-turnover but low-return models.
     sortino: float = 0.40
     calmar: float = 0.30
+    win_rate: float = 0.12
     cvar95: float = -0.12
     max_dd: float = -0.10
     cost: float = -0.05
@@ -54,7 +55,10 @@ class AppConfig:
     ethical_restrictions: list[str] = field(
         default_factory=lambda: ["exclude_privacy_coins", "exclude_aml_high_risk_assets"]
     )
-    generation_horizon_weeks: int = 8
+    generation_horizon_weeks: int = 24
+    min_closed_trades_scalp: int = 50
+    min_closed_trades_intraday: int = 20
+    min_closed_trades_swing: int = 15
     review_frequency_days: int = 7
     fee_bps_assumption: float = 10.0
     risk: RiskPolicy = field(default_factory=RiskPolicy)

@@ -105,6 +105,21 @@ class TradingLogicTests(unittest.TestCase):
         self.assertLessEqual(score, (DEFAULT_CONFIG.weights.sortino * 6.0) + (DEFAULT_CONFIG.weights.calmar * 8.0))
         self.assertGreater(score, 0.0)
 
+    def test_decision_score_rewards_higher_win_rate_when_other_metrics_match(self) -> None:
+        base_metrics = {
+            "sortino": 1.6,
+            "calmar": 1.1,
+            "cvar95": 0.01,
+            "max_dd": 0.04,
+            "cost": 0.002,
+            "turnover": 0.10,
+        }
+
+        low_win_rate_score = decision_score({**base_metrics, "win_rate": 42.0}, DEFAULT_CONFIG.weights)
+        high_win_rate_score = decision_score({**base_metrics, "win_rate": 68.0}, DEFAULT_CONFIG.weights)
+
+        self.assertGreater(high_win_rate_score, low_win_rate_score)
+
     def test_trade_analytics_summary_reports_expectancy_and_exit_reasons(self) -> None:
         engine = TradingEngine()
         analytics = engine._summarize_trade_analytics(
@@ -1329,6 +1344,64 @@ class TradingLogicTests(unittest.TestCase):
         self.assertEqual(sum(model.kind != "copy_trader" for model in engine.models), 5)
         standard_kinds = [model.kind for model in engine.models if model.kind != "copy_trader"]
         self.assertEqual(len(set(standard_kinds)), 5)
+
+    def test_select_candidate_run_prefers_better_sampled_candidate(self) -> None:
+        engine = TradingEngine()
+        under_sampled = {
+            "result": ModelResult(
+                model_id="M1",
+                name="Under-sampled",
+                generation=1,
+                symbol="BTCUSDT",
+                sortino=1.0,
+                calmar=1.0,
+                cvar95=0.01,
+                max_dd=0.03,
+                cost=0.0,
+                turnover=0.0,
+                score=1.25,
+                passed=True,
+                closed_trades=1,
+                win_rate=100.0,
+            ),
+            "final_position": 0.05,
+            "final_open_slots": 1,
+            "opportunity_score": 0.4,
+        }
+        better_sampled = {
+            "result": ModelResult(
+                model_id="M1",
+                name="Better-sampled",
+                generation=1,
+                symbol="ETHUSDT",
+                sortino=1.0,
+                calmar=1.0,
+                cvar95=0.01,
+                max_dd=0.03,
+                cost=0.0,
+                turnover=0.0,
+                score=1.25,
+                passed=True,
+                closed_trades=8,
+                win_rate=62.0,
+            ),
+            "final_position": 0.05,
+            "final_open_slots": 1,
+            "opportunity_score": 0.4,
+        }
+
+        selected = engine._select_candidate_run([under_sampled, better_sampled])
+
+        self.assertEqual(selected["result"].name, "Better-sampled")
+
+    def test_segment_minimum_closed_trades_are_configured_per_segment(self) -> None:
+        scalp_engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")
+        intraday_engine = TradingEngine(model_namespace="ID", model_label_prefix="Intraday")
+        swing_engine = TradingEngine(model_namespace="SW", model_label_prefix="Swing")
+
+        self.assertEqual(scalp_engine._min_closed_trades_for_evolution(), 50)
+        self.assertEqual(intraday_engine._min_closed_trades_for_evolution(), 20)
+        self.assertEqual(swing_engine._min_closed_trades_for_evolution(), 15)
 
     def test_select_best_lead_trader_prefers_higher_weighted_score(self) -> None:
         conservative = LeadTraderProfile(
