@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 
+from .copy_trading import get_copy_trading_status
 from .data import fetch_binance_market
 from .market_stream import get_stream_diagnostics
 from .ui_state import load_runtime_state
@@ -107,6 +108,7 @@ def _build_status_payload() -> dict[str, object]:
         "runtime_state": runtime_state,
         "worker": worker_status,
         "market_stream": worker_status.get("market_stream", get_stream_diagnostics()),
+        "copy_trading": get_copy_trading_status(),
         "updated_at": pd.Timestamp.utcnow(),
     }
 

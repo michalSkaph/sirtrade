@@ -57,11 +57,20 @@ Nastav tyto proměnné prostředí:
 - `SIRTRADE_COPY_TRADER_POSITIONS_URL_TEMPLATE` - URL šablona pro pozice s placeholderem `{trader_id}`
 - `SIRTRADE_COPY_TRADER_HEADERS_JSON` - volitelně JSON s HTTP hlavičkami
 
+Nejjednodušší lokální varianta je vytvořit soubor `.env` v kořeni projektu. Aplikace, worker i health server ho načtou automaticky:
+
+```env
+SIRTRADE_COPY_TRADER_LIST_URL=https://.../leaderboard
+SIRTRADE_COPY_TRADER_POSITIONS_URL_TEMPLATE=https://.../positions/{trader_id}
+SIRTRADE_COPY_TRADER_HEADERS_JSON={"Authorization":"Bearer ...","User-Agent":"SirTrade/1.0"}
+```
+
 Poznámky:
 
 - Projekt dál vynucuje paper mode a bez leverage.
 - Pokud feed vrací leveraged nebo short futures pozice, systém je v copy režimu odfiltruje.
 - Vybraný lead trader je určen interním skóre z ROI, PnL, win-rate a drawdownu.
+- Když konfigurace chybí nebo feed vrací nepodporovanou odpověď, UI i `/status` nově ukazují diagnostiku místo tichého selhání.
 
 ## Deploy na VPS (Docker)
 
@@ -77,6 +86,8 @@ bash deploy_production.sh
 ```bash
 docker compose up -d --build
 ```
+
+Docker Compose nyní předá copy-trader proměnné z host prostředí nebo z lokálního `.env` souboru i do workeru a health serveru.
 
 Tím se spustí:
 - `sirtrade-ui` na portu `8501`

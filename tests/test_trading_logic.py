@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from contextlib import closing
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -15,7 +16,7 @@ from src.sirtrade.data import simulate_market
 from src.sirtrade.engine import TradingEngine
 from src.sirtrade.engine import ModelResult
 from src.sirtrade.execution import build_dry_run_orders
-from src.sirtrade.copy_trading import LeadTraderProfile, select_best_lead_trader
+from src.sirtrade.copy_trading import LeadTraderProfile, fetch_copy_trader_leaderboard, get_copy_trading_status, select_best_lead_trader
 from src.sirtrade.config import DEFAULT_CONFIG
 from src.sirtrade.health_server import _build_worker_health_payload
 from src.sirtrade.live_worker import (
@@ -227,6 +228,35 @@ class TradingLogicTests(unittest.TestCase):
         }
 
         self.assertIn("sanitize_runtime_state_for_ui_boot", called_names)
+
+    def test_app_boot_preserves_running_segments_by_default_for_embedded_worker(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        tree = ast.parse(app_path.read_text(encoding="utf-8"))
+
+        boot_func = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_reset_embedded_worker_boot_state"
+        )
+
+        sanitizer_call = next(
+            node
+            for node in ast.walk(boot_func)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "sanitize_runtime_state_for_ui_boot"
+        )
+
+        resume_keyword = next(
+            keyword for keyword in sanitizer_call.keywords if keyword.arg == "resume_running_segments"
+        )
+
+        self.assertIsInstance(resume_keyword.value, ast.Call)
+        self.assertIsInstance(resume_keyword.value.func, ast.Name)
+        self.assertEqual(resume_keyword.value.func.id, "_env_flag")
+        self.assertEqual(len(resume_keyword.value.args), 2)
+        self.assertIsInstance(resume_keyword.value.args[0], ast.Constant)
+        self.assertEqual(resume_keyword.value.args[0].value, "SIRTRADE_RESUME_SEGMENTS_ON_UI_BOOT")
+        self.assertIsInstance(resume_keyword.value.args[1], ast.Constant)
+        self.assertIs(resume_keyword.value.args[1].value, True)
 
     def test_app_resets_embedded_worker_state_only_before_first_worker_start(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
@@ -1161,6 +1191,25 @@ class TradingLogicTests(unittest.TestCase):
         self.assertAlmostEqual(stop_dist, 0.002, places=8)
         self.assertAlmostEqual(target_dist, stop_dist * 3.0, places=8)
 
+    def test_scalp_trade_plan_accepts_low_vol_setup_above_real_fee_floor(self) -> None:
+        engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")
+        market = _build_flat_market_frame()
+
+        with patch.object(
+            TradingEngine,
+            "_scalp_target_context_cap",
+            return_value=0.0040,
+            autospec=True,
+        ):
+            actionable = engine._trade_plan_is_actionable(
+                market=market,
+                close_price=float(market["close"].iloc[-1]),
+                target_dist=0.0030,
+                min_stop_floor=0.0010,
+            )
+
+        self.assertTrue(actionable)
+
     def test_non_scalp_target_distance_enforces_three_to_one_ratio(self) -> None:
         engine = TradingEngine()
         market = _build_market_frame()
@@ -1429,6 +1478,47 @@ class TradingLogicTests(unittest.TestCase):
 
         self.assertIsNotNone(best)
         self.assertEqual(best.trader_id, "B")
+
+    def test_copy_trading_status_reports_missing_env(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            status = get_copy_trading_status()
+
+        self.assertFalse(status["ready"])
+        self.assertIn("SIRTRADE_COPY_TRADER_LIST_URL", status["missing"])
+        self.assertIn("SIRTRADE_COPY_TRADER_POSITIONS_URL_TEMPLATE", status["missing"])
+
+    def test_copy_trading_status_rejects_template_without_trader_placeholder(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "SIRTRADE_COPY_TRADER_LIST_URL": "https://example.test/leaderboard",
+                "SIRTRADE_COPY_TRADER_POSITIONS_URL_TEMPLATE": "https://example.test/positions/static",
+            },
+            clear=True,
+        ):
+            status = get_copy_trading_status()
+
+        self.assertFalse(status["ready"])
+        self.assertEqual(
+            status["headers_error"],
+            "SIRTRADE_COPY_TRADER_POSITIONS_URL_TEMPLATE must contain the {trader_id} placeholder.",
+        )
+
+    def test_fetch_copy_trader_leaderboard_handles_fetch_failure(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "SIRTRADE_COPY_TRADER_LIST_URL": "https://example.test/leaderboard",
+                "SIRTRADE_COPY_TRADER_POSITIONS_URL_TEMPLATE": "https://example.test/positions/{trader_id}",
+            },
+            clear=True,
+        ), patch("src.sirtrade.copy_trading.urlopen", side_effect=OSError("network down")):
+            profiles = fetch_copy_trader_leaderboard()
+            status = get_copy_trading_status()
+
+        self.assertEqual(profiles, [])
+        self.assertEqual(status["last_error_stage"], "leaderboard")
+        self.assertIn("network down", status["last_error"])
 
     def test_run_week_binance_copy_uses_copy_trader_positions_without_leverage(self) -> None:
         engine = TradingEngine(model_namespace="", model_label_prefix="")
@@ -1810,8 +1900,14 @@ class TradingLogicTests(unittest.TestCase):
         self.assertEqual(len(result["trade_events_delta"]["SC_M1"]), 1)
         self.assertIn("Vstup LONG", result["trade_events_delta"]["SC_M1"][0]["akce"])
         self.assertEqual(result["trade_events_delta"]["SC_M1"][0]["symbol"], "ETHUSDT")
+        self.assertEqual(int(result["trade_events_delta"]["SC_M1"][0]["sloty"]), 1)
         self.assertEqual(result["live_model_state"]["SC_M1"].get("setup_symbol"), "ETHUSDT")
-        self.assertGreater(result["final_open_slots"]["SC_M1"], 0)
+        self.assertEqual(result["final_open_slots"]["SC_M1"], 1)
+
+    def test_live_scalp_entry_uses_single_slot_to_preserve_multi_position_capacity(self) -> None:
+        engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")
+        self.assertEqual(engine._resolve_live_entry_slots(conviction=0.95, remaining_slot_budget=5), 1)
+        self.assertEqual(engine._resolve_live_entry_slots(conviction=0.55, remaining_slot_budget=3), 1)
 
     def test_live_scalp_entry_skips_trade_when_micro_range_cannot_support_three_to_one(self) -> None:
         engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")

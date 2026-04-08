@@ -6,10 +6,20 @@ from dataclasses import asdict, dataclass
 from typing import Any
 from urllib.request import Request, urlopen
 
+import pandas as pd
+
+from .env import load_env_file
+
 
 COPY_TRADER_LIST_URL_ENV = "SIRTRADE_COPY_TRADER_LIST_URL"
 COPY_TRADER_POSITIONS_URL_ENV = "SIRTRADE_COPY_TRADER_POSITIONS_URL_TEMPLATE"
 COPY_TRADER_HEADERS_ENV = "SIRTRADE_COPY_TRADER_HEADERS_JSON"
+
+_copy_trading_runtime: dict[str, Any] = {
+    "last_error": None,
+    "last_error_stage": None,
+    "last_success_at": None,
+}
 
 
 @dataclass
@@ -80,6 +90,62 @@ def _load_headers() -> dict[str, str]:
     return {str(key): str(value) for key, value in payload.items()}
 
 
+def _runtime_success() -> None:
+    _copy_trading_runtime["last_error"] = None
+    _copy_trading_runtime["last_error_stage"] = None
+    _copy_trading_runtime["last_success_at"] = pd.Timestamp.utcnow().isoformat()
+
+
+def _runtime_error(stage: str, detail: str) -> None:
+    _copy_trading_runtime["last_error"] = detail
+    _copy_trading_runtime["last_error_stage"] = stage
+
+
+def get_copy_trading_status() -> dict[str, Any]:
+    load_env_file()
+
+    list_url = os.getenv(COPY_TRADER_LIST_URL_ENV, "").strip()
+    positions_template = os.getenv(COPY_TRADER_POSITIONS_URL_ENV, "").strip()
+    raw_headers = os.getenv(COPY_TRADER_HEADERS_ENV, "").strip()
+    missing: list[str] = []
+    if not list_url:
+        missing.append(COPY_TRADER_LIST_URL_ENV)
+    if not positions_template:
+        missing.append(COPY_TRADER_POSITIONS_URL_ENV)
+
+    headers_valid = True
+    headers_error: str | None = None
+    if raw_headers:
+        try:
+            parsed_headers = json.loads(raw_headers)
+            if not isinstance(parsed_headers, dict):
+                headers_valid = False
+                headers_error = f"{COPY_TRADER_HEADERS_ENV} must contain a JSON object."
+        except json.JSONDecodeError:
+            headers_valid = False
+            headers_error = f"{COPY_TRADER_HEADERS_ENV} is not valid JSON."
+
+    template_has_placeholder = "{trader_id}" in positions_template if positions_template else False
+    if positions_template and not template_has_placeholder:
+        headers_valid = False
+        headers_error = f"{COPY_TRADER_POSITIONS_URL_ENV} must contain the {{trader_id}} placeholder."
+
+    ready = not missing and headers_valid
+    return {
+        "ready": ready,
+        "missing": missing,
+        "headers_configured": bool(raw_headers),
+        "headers_valid": headers_valid,
+        "headers_error": headers_error,
+        "list_url_configured": bool(list_url),
+        "positions_url_configured": bool(positions_template),
+        "positions_template_has_placeholder": template_has_placeholder,
+        "last_error": _copy_trading_runtime.get("last_error"),
+        "last_error_stage": _copy_trading_runtime.get("last_error_stage"),
+        "last_success_at": _copy_trading_runtime.get("last_success_at"),
+    }
+
+
 def _http_get_json_url(url: str, headers: dict[str, str] | None = None) -> list | dict:
     request = Request(url, headers=headers or {})
     with urlopen(request, timeout=10) as response:
@@ -140,16 +206,24 @@ def _position_from_payload(item: dict[str, Any], trader_id: str) -> LeadTraderPo
 
 
 def fetch_copy_trader_leaderboard() -> list[LeadTraderProfile]:
+    load_env_file()
     url = os.getenv(COPY_TRADER_LIST_URL_ENV, "").strip()
     if not url:
         return []
 
-    payload = _http_get_json_url(url, headers=_load_headers())
+    try:
+        payload = _http_get_json_url(url, headers=_load_headers())
+    except Exception as exc:
+        _runtime_error("leaderboard", f"Leaderboard fetch failed: {exc}")
+        return []
+
     profiles: list[LeadTraderProfile] = []
     for item in _extract_items(payload):
         profile = _profile_from_payload(item)
         if profile is not None:
             profiles.append(profile)
+    if not profiles:
+        _runtime_error("leaderboard", "Leaderboard response contained no supported trader profiles.")
     return profiles
 
 
@@ -171,17 +245,25 @@ def select_best_lead_trader(profiles: list[LeadTraderProfile]) -> LeadTraderProf
 
 
 def fetch_copy_trader_positions(trader_id: str) -> list[LeadTraderPosition]:
+    load_env_file()
     template = os.getenv(COPY_TRADER_POSITIONS_URL_ENV, "").strip()
     if not template or not trader_id:
         return []
 
     url = template.format(trader_id=trader_id)
-    payload = _http_get_json_url(url, headers=_load_headers())
+    try:
+        payload = _http_get_json_url(url, headers=_load_headers())
+    except Exception as exc:
+        _runtime_error("positions", f"Positions fetch failed: {exc}")
+        return []
+
     positions: list[LeadTraderPosition] = []
     for item in _extract_items(payload):
         position = _position_from_payload(item, trader_id=trader_id)
         if position is not None:
             positions.append(position)
+    if not positions:
+        _runtime_error("positions", "Positions response contained no supported open positions.")
     return positions
 
 
@@ -189,8 +271,12 @@ def load_top_copy_trader_snapshot(
     allow_shorts: bool,
     allow_leverage: bool,
 ) -> dict[str, Any] | None:
+    load_env_file()
     leader = select_best_lead_trader(fetch_copy_trader_leaderboard())
     if leader is None:
+        status = get_copy_trading_status()
+        if status.get("ready") and not status.get("last_error"):
+            _runtime_error("leaderboard", "No eligible lead trader was selected from the leaderboard feed.")
         return None
 
     raw_positions = fetch_copy_trader_positions(leader.trader_id)
@@ -206,6 +292,12 @@ def load_top_copy_trader_snapshot(
             continue
         seen.add(dedupe_key)
         filtered_positions.append(position)
+
+    if not filtered_positions:
+        _runtime_error("positions", "Lead trader has no eligible positions after SirTrade paper-risk filters.")
+        return None
+
+    _runtime_success()
 
     return {
         "leader": asdict(leader),

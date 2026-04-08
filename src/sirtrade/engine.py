@@ -81,6 +81,18 @@ class TradingEngine:
         base_cost = (2.0 * float(self.config.fee_bps_assumption)) / 10_000.0
         return float(base_cost * self._segment_cost_multiplier())
 
+    def _estimated_execution_round_trip_cost_pct(self) -> float:
+        return float((2.0 * float(self.config.fee_bps_assumption)) / 10_000.0)
+
+    def _resolve_live_entry_slots(self, conviction: float, remaining_slot_budget: int) -> int:
+        budget = max(0, int(remaining_slot_budget))
+        if budget <= 0:
+            return 0
+        if self.model_namespace == "SC":
+            return 1
+        requested_slots = int(np.clip(np.ceil(float(conviction) * 5), 1, 5))
+        return min(budget, requested_slots)
+
     @staticmethod
     def _normalize_trade_side(value: object) -> str:
         side = str(value).strip().upper()
@@ -941,7 +953,8 @@ class TradingEngine:
         target_dist: float,
         min_stop_floor: float,
     ) -> bool:
-        if float(target_dist) <= max(self._estimated_round_trip_cost_pct() * 2.0, float(min_stop_floor) * 1.5):
+        execution_cost_floor = self._estimated_execution_round_trip_cost_pct()
+        if float(target_dist) <= max(execution_cost_floor, float(min_stop_floor) * 1.5):
             return False
         if self.model_namespace != "SC":
             return True
@@ -1689,7 +1702,9 @@ class TradingEngine:
 
                         if direction != 0 and entry_armed and setup_just_activated:
                             conviction = max(abs(signal_value), confidence)
-                            new_open_slots = int(np.clip(np.ceil(conviction * 5), 1, 5))
+                            new_open_slots = self._resolve_live_entry_slots(conviction, remaining_slot_budget)
+                            if new_open_slots <= 0:
+                                continue
                             new_side = "LONG" if direction > 0 else "SHORT"
                             stop_dist, target_dist = self._resolve_trade_distances(
                                 model=model,

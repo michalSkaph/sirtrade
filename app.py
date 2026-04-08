@@ -17,7 +17,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from src.sirtrade.config import DEFAULT_CONFIG, INITIAL_PAPER_WALLET_CZK, PAPER_TRADE_SIZE_CZK
+from src.sirtrade.copy_trading import get_copy_trading_status
 from src.sirtrade.data import fetch_binance_market
+from src.sirtrade.env import load_env_file
 from src.sirtrade.engine import TradingEngine
 from src.sirtrade.health_server import DEFAULT_HEALTH_PORT, ensure_health_server_started
 from src.sirtrade.live_worker import ensure_live_worker_started, is_live_worker_started, should_start_embedded_worker
@@ -57,7 +59,7 @@ def _reset_embedded_worker_boot_state() -> None:
     runtime_state = load_runtime_state()
     sanitized_state = sanitize_runtime_state_for_ui_boot(
         runtime_state,
-        resume_running_segments=_env_flag("SIRTRADE_RESUME_SEGMENTS_ON_UI_BOOT", False),
+        resume_running_segments=_env_flag("SIRTRADE_RESUME_SEGMENTS_ON_UI_BOOT", True),
     )
     if sanitized_state == runtime_state:
         return
@@ -71,6 +73,7 @@ def _clear_optional_streamlit_cache(func: object) -> None:
 
 
 st.set_page_config(page_title="SirTrade", page_icon="S", layout="wide")
+load_env_file()
 init_db()
 if should_start_embedded_worker():
     if not is_live_worker_started():
@@ -1579,6 +1582,8 @@ with st.sidebar:
         format_func=lambda value: {"simulation": "Simulace", "binance": "Binance", "binance_copy": "Binance Copy"}.get(value, value),
     )
 
+    copy_trading_status = get_copy_trading_status()
+
     if st.session_state.data_source == "binance":
         st.caption("Univerzum: dynamické Top 20 coiny z Binance podle aktuální atraktivity a likvidity.")
         st.caption(
@@ -1594,6 +1599,20 @@ with st.sidebar:
         st.caption(
             f"Simulace běží do ručního vypnutí. Každý cyklus přidá {SIMULATION_WEEKS_PER_CYCLE} týden. Graf se obnovuje po {FIXED_LIVE_REFRESH_SECONDS} s, přepočet po {FIXED_SIMULATION_CYCLE_SECONDS} s."
         )
+
+    if st.session_state.data_source in {"binance", "binance_copy"}:
+        if copy_trading_status.get("ready"):
+            last_success_at = copy_trading_status.get("last_success_at")
+            if last_success_at:
+                st.caption(f"Copy-trader feed: připraven. Poslední úspěšné načtení {_format_prague_timestamp(last_success_at)}.")
+            else:
+                st.caption("Copy-trader feed: konfigurace připravena.")
+        else:
+            missing = ", ".join(copy_trading_status.get("missing", []))
+            detail = copy_trading_status.get("headers_error") or copy_trading_status.get("last_error") or "Chybí konfigurace feedu."
+            if missing:
+                detail = f"{detail} Chybí: {missing}."
+            st.warning(f"Copy-trader model je neaktivní: {detail}")
 
     st.session_state.auto_center_last_candle = st.checkbox(
         "Držet graf na konci",
