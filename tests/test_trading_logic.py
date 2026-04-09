@@ -1373,6 +1373,22 @@ class TradingLogicTests(unittest.TestCase):
         self.assertIn("SOLUSDT", standard_rows["symbol"].tolist())
         self.assertGreaterEqual(len(set(standard_rows["symbol"].tolist())), 2)
 
+    def test_build_candidate_universe_filters_stable_like_symbols(self) -> None:
+        engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")
+        universe = pd.DataFrame(
+            [
+                {"symbol": "USD1USDT", "opportunity_score": 5.0},
+                {"symbol": "FDUSDUSDT", "opportunity_score": 4.0},
+                {"symbol": "SOLUSDT", "opportunity_score": 3.0},
+            ]
+        )
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe):
+            long_tail, candidate_symbols = engine._build_candidate_universe("binance", "BTCUSDT")
+
+        self.assertEqual(candidate_symbols, ["SOLUSDT"])
+        self.assertEqual(long_tail["symbol"].tolist(), ["SOLUSDT"])
+
     def test_evolve_generation_keeps_fixed_model_budget_per_segment(self) -> None:
         engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")
         leaderboard = pd.DataFrame(
@@ -1909,6 +1925,70 @@ class TradingLogicTests(unittest.TestCase):
         self.assertEqual(engine._resolve_live_entry_slots(conviction=0.95, remaining_slot_budget=5), 1)
         self.assertEqual(engine._resolve_live_entry_slots(conviction=0.55, remaining_slot_budget=3), 1)
 
+    def test_live_scalp_entry_uses_actionable_shortlist_symbol_not_only_best_backtest_symbol(self) -> None:
+        engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")
+        engine.models = [ModelSpec("SC_M1", "Scalp Trend", "trend_vol", 1)]
+        market = _build_market_frame()
+        universe = pd.DataFrame(
+            [
+                {"symbol": "USD1USDT", "opportunity_score": 2.0},
+                {"symbol": "TAOUSDT", "opportunity_score": 1.0},
+            ]
+        )
+        strong_signal = pd.Series(1.0, index=market.index)
+
+        def _strong_confluence(model, market, controlled_signal):
+            index = market.index
+            confluence = pd.DataFrame(
+                {
+                    "long_votes": [6] * len(index),
+                    "short_votes": [0] * len(index),
+                    "long_confidence": [0.8] * len(index),
+                    "short_confidence": [0.0] * len(index),
+                },
+                index=index,
+            )
+            atr_pct = pd.Series(0.01, index=index)
+            return confluence, 5, 2, atr_pct
+
+        def _fake_simulate(_engine: TradingEngine, model: ModelSpec, market_frame: pd.DataFrame, symbol: str):
+            score = 2.0 if symbol == "USD1USDT" else 1.0
+            result = ModelResult(
+                model_id=model.model_id,
+                name=model.name,
+                generation=model.generation,
+                symbol=symbol,
+                sortino=1.0,
+                calmar=1.0,
+                cvar95=0.01,
+                max_dd=0.01,
+                cost=0.0,
+                turnover=0.0,
+                score=score,
+                passed=True,
+            )
+            return result, [], 0.0, 0
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market
+        ), patch("src.sirtrade.engine.load_top_copy_trader_snapshot", return_value=None), patch(
+            "src.sirtrade.engine.generate_signals", return_value=strong_signal
+        ), patch.object(TradingEngine, "_build_entry_confluence", side_effect=_strong_confluence), patch.object(
+            TradingEngine,
+            "_simulate_model",
+            side_effect=_fake_simulate,
+            autospec=True,
+        ), patch.object(
+            TradingEngine,
+            "_select_live_entry_symbol",
+            return_value="TAOUSDT",
+            autospec=True,
+        ):
+            result = engine.run_week(days=1, market_source="binance", symbol="BTCUSDT", interval="1m")
+
+        self.assertEqual(result["trade_events_delta"]["SC_M1"][0]["symbol"], "TAOUSDT")
+        self.assertEqual(result["final_open_slots"]["SC_M1"], 1)
+
     def test_live_scalp_entry_skips_trade_when_micro_range_cannot_support_three_to_one(self) -> None:
         engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")
         engine.models = [ModelSpec("SC_M1", "Scalp Trend", "trend_vol", 1)]
@@ -2001,7 +2081,10 @@ class TradingLogicTests(unittest.TestCase):
             result = engine.run_week(days=1, market_source="binance", symbol="BTCUSDT", interval="1m")
 
         self.assertIn("ret", result["market"].columns)
-        self.assertEqual(result["champion"]["model_id"], "SC_MC")
+        self.assertEqual(result["champion"]["model_id"], "")
+        self.assertEqual(result["champion"]["name"], "Scalp | Žádný kvalifikovaný vítěz")
+        self.assertFalse(bool(result["champion"]["qualified"]))
+        self.assertEqual(float(result["champion"]["reward_usd"]), 0.0)
         self.assertEqual(result["symbol"], "BTCUSDT")
         self.assertGreaterEqual(result["portfolio_vol_annual"], 0.0)
 

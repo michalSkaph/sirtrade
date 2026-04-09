@@ -20,6 +20,21 @@ from .scoring import calmar_ratio, decision_score, pass_thresholds, sortino_rati
 
 
 BLOCKED_TRADING_SYMBOLS = {"USDCUSDT"}
+BLOCKED_STABLE_LIKE_BASE_ASSETS = {
+    "USDC",
+    "USDD",
+    "USDE",
+    "USDP",
+    "USDS",
+    "USDY",
+    "FDUSD",
+    "TUSD",
+    "BUSD",
+    "DAI",
+    "PYUSD",
+    "RLUSD",
+    "USD1",
+}
 MAX_POSITIONS_PER_MODEL = 5
 MIN_RISK_REWARD_RATIO = 3.0
 STANDARD_MODEL_BLUEPRINTS: list[tuple[str, str, str]] = [
@@ -299,6 +314,57 @@ class TradingEngine:
         digest = hashlib.md5(f"{symbol}:{self.week}:{offset}".encode("utf-8")).hexdigest()
         return int(digest[:8], 16)
 
+    @staticmethod
+    def _is_stable_like_symbol(symbol: str) -> bool:
+        normalized = str(symbol).strip().upper()
+        if not normalized.endswith("USDT"):
+            return False
+        base_asset = normalized[:-4]
+        return base_asset in BLOCKED_STABLE_LIKE_BASE_ASSETS or bool(re.fullmatch(r"USD\d+", base_asset))
+
+    def _is_allowed_candidate_symbol(self, symbol: str) -> bool:
+        normalized = str(symbol).strip().upper()
+        return bool(normalized) and normalized not in BLOCKED_TRADING_SYMBOLS and not self._is_stable_like_symbol(normalized)
+
+    def _is_qualified_champion_row(
+        self,
+        row: dict[str, Any] | pd.Series,
+        *,
+        final_position: float = 0.0,
+        final_open_slots: int = 0,
+    ) -> bool:
+        passed = bool(row.get("passed", False))
+        score = float(row.get("score", 0.0) or 0.0)
+        closed_trades = int(row.get("closed_trades", 0) or 0)
+        has_active_position = int(final_open_slots) > 0 or abs(float(final_position)) > 1e-9
+        return passed or (score > 0.0 and (closed_trades > 0 or has_active_position))
+
+    def _build_unqualified_champion(
+        self,
+        *,
+        symbol: str,
+        generation: int,
+    ) -> dict[str, Any]:
+        segment_label = self.model_label_prefix.strip() or "Segment"
+        return {
+            "model_id": "",
+            "name": f"{segment_label} | Žádný kvalifikovaný vítěz",
+            "generation": int(generation),
+            "symbol": str(symbol).upper(),
+            "sortino": 0.0,
+            "calmar": 0.0,
+            "cvar95": 0.0,
+            "max_dd": 0.0,
+            "cost": 0.0,
+            "turnover": 0.0,
+            "score": 0.0,
+            "passed": False,
+            "closed_trades": 0,
+            "win_rate": 50.0,
+            "reward_usd": 0.0,
+            "qualified": False,
+        }
+
     def _build_candidate_universe(
         self,
         market_source: str,
@@ -313,9 +379,10 @@ class TradingEngine:
         if isinstance(long_tail, pd.DataFrame) and "symbol" in long_tail.columns:
             candidate_symbols = [str(value).upper() for value in long_tail["symbol"].dropna().tolist()]
 
-        candidate_symbols = [symbol for symbol in candidate_symbols if symbol not in BLOCKED_TRADING_SYMBOLS]
+        candidate_symbols = [symbol for symbol in candidate_symbols if self._is_allowed_candidate_symbol(symbol)]
         if isinstance(long_tail, pd.DataFrame) and "symbol" in long_tail.columns:
-            long_tail = long_tail[~long_tail["symbol"].astype(str).str.upper().isin(BLOCKED_TRADING_SYMBOLS)].reset_index(drop=True)
+            allowed_mask = long_tail["symbol"].astype(str).str.upper().map(self._is_allowed_candidate_symbol)
+            long_tail = long_tail[allowed_mask].reset_index(drop=True)
 
         candidate_symbols = list(dict.fromkeys([symbol for symbol in candidate_symbols if symbol]))
         if not candidate_symbols:
@@ -986,6 +1053,51 @@ class TradingEngine:
             "signal_reset_floor": float(signal_reset_floor),
         }
 
+    def _select_live_entry_symbol(
+        self,
+        model: ModelSpec,
+        shortlist_symbols: list[str],
+        markets_by_symbol: dict[str, pd.DataFrame],
+    ) -> str | None:
+        for candidate_symbol in shortlist_symbols:
+            market = markets_by_symbol.get(candidate_symbol)
+            if market is None or market.empty:
+                continue
+
+            setup_snapshot = self._latest_setup_snapshot(model, market)
+            signal_value = float(setup_snapshot["signal_value"])
+            long_votes = int(setup_snapshot["long_votes"])
+            short_votes = int(setup_snapshot["short_votes"])
+            required_votes = int(setup_snapshot["required_votes"])
+            vol_step = float(setup_snapshot["vol_step"])
+            min_stop_floor = float(setup_snapshot["min_stop_floor"])
+
+            direction = 0
+            if long_votes >= required_votes and signal_value > 0 and long_votes > short_votes:
+                direction = 1
+            if short_votes >= required_votes and signal_value < 0 and short_votes > long_votes:
+                direction = -1
+            if direction == 0:
+                continue
+
+            close_price = float(pd.to_numeric(market["close"], errors="coerce").iloc[-1])
+            _, target_dist = self._resolve_trade_distances(
+                model=model,
+                market=market,
+                close_price=close_price,
+                vol_step=vol_step,
+                min_stop_floor=min_stop_floor,
+            )
+            if self._trade_plan_is_actionable(
+                market=market,
+                close_price=close_price,
+                target_dist=target_dist,
+                min_stop_floor=min_stop_floor,
+            ):
+                return str(candidate_symbol).upper()
+
+        return None
+
     def _scalp_invalidation_reason(
         self,
         side: str,
@@ -1633,7 +1745,7 @@ class TradingEngine:
             total_used_slots = sum(int(p.get("open_slots", 0)) for p in surviving_positions)
             remaining_slot_budget = max(0, 5 - total_used_slots)
             if len(surviving_positions) < MAX_POSITIONS_PER_MODEL and remaining_slot_budget > 0:
-                entry_symbol = str(result.symbol).upper()
+                entry_symbol = str(run.get("live_entry_symbol", result.symbol)).upper()
                 # Only evaluate entry on a symbol not already held by this model
                 model_held_symbols = {str(p.get("symbol", "")).upper() for p in surviving_positions}
                 if entry_symbol not in model_held_symbols:
@@ -1838,7 +1950,7 @@ class TradingEngine:
     ) -> list[str]:
         excluded = {str(symbol).upper() for symbol in (excluded_symbols or set())}
         ranked = sorted(
-            [symbol for symbol in candidate_symbols if symbol not in BLOCKED_TRADING_SYMBOLS and symbol not in excluded],
+            [symbol for symbol in candidate_symbols if self._is_allowed_candidate_symbol(symbol) and symbol not in excluded],
             key=lambda symbol: float(opportunity_scores.get(symbol, 0.0)),
             reverse=True,
         )
@@ -1846,7 +1958,7 @@ class TradingEngine:
         shortlist = ranked[:shortlist_size]
 
         previous_symbol = self._model_symbol_memory.get(model.model_id)
-        if previous_symbol and previous_symbol in candidate_symbols and previous_symbol not in BLOCKED_TRADING_SYMBOLS and previous_symbol not in excluded and previous_symbol not in shortlist:
+        if previous_symbol and previous_symbol in candidate_symbols and self._is_allowed_candidate_symbol(previous_symbol) and previous_symbol not in excluded and previous_symbol not in shortlist:
             shortlist = [previous_symbol] + shortlist[:-1]
 
         if model.kind == "mean_reversion" and len(ranked) > shortlist_size:
@@ -1854,7 +1966,7 @@ class TradingEngine:
             if tail_candidate not in shortlist:
                 shortlist.append(tail_candidate)
 
-        fallback_candidates = [symbol for symbol in candidate_symbols if symbol not in BLOCKED_TRADING_SYMBOLS]
+        fallback_candidates = [symbol for symbol in candidate_symbols if self._is_allowed_candidate_symbol(symbol)]
         return list(dict.fromkeys(shortlist or fallback_candidates[:1]))
 
     def run_week(
@@ -2021,7 +2133,7 @@ class TradingEngine:
                 if not shortlist_symbols:
                     shortlist_symbols = self._shortlist_candidate_symbols(model, candidate_symbols, opportunity_scores)
             for candidate_symbol in shortlist_symbols:
-                if candidate_symbol in BLOCKED_TRADING_SYMBOLS:
+                if not self._is_allowed_candidate_symbol(candidate_symbol):
                     continue
                 market = markets_by_symbol[candidate_symbol]
                 result, events, final_position, final_open_slots = self._simulate_model(model, market, symbol=candidate_symbol)
@@ -2038,6 +2150,14 @@ class TradingEngine:
             if not candidate_runs:
                 continue
             chosen_run = self._select_candidate_run(candidate_runs)
+            if effective_source in {"binance", "binance_copy"}:
+                live_entry_symbol = self._select_live_entry_symbol(
+                    model=model,
+                    shortlist_symbols=shortlist_symbols,
+                    markets_by_symbol=markets_by_symbol,
+                )
+                if live_entry_symbol:
+                    chosen_run["live_entry_symbol"] = live_entry_symbol
             self._model_symbol_memory[model.model_id] = str(chosen_run["result"].symbol).upper()
             selected_runs.append(chosen_run)
             chosen_symbol = str(chosen_run["result"].symbol).upper()
@@ -2061,12 +2181,36 @@ class TradingEngine:
             for _, row in results_df.iterrows()
         }
 
-        champion = results_df.iloc[0].to_dict()
-        champion_score = float(champion.get("score", 1.0))
-        champion["reward_usd"] = max(1.0, champion_score * 10.0)
-        champion_model_id = str(champion["model_id"])
-        champion_symbol = str(champion.get("symbol", effective_symbol)).upper()
-        champion_market = model_markets.get(champion_model_id, markets_by_symbol.get(champion_symbol))
+        best_row = results_df.iloc[0].to_dict()
+        best_model_id = str(best_row.get("model_id", ""))
+        qualified_rows = [
+            row
+            for _, row in results_df.iterrows()
+            if self._is_qualified_champion_row(
+                row,
+                final_position=float(final_positions.get(str(row.get("model_id", "")), 0.0)),
+                final_open_slots=int(final_open_slots.get(str(row.get("model_id", "")), 0)),
+            )
+        ]
+
+        if qualified_rows:
+            champion = dict(qualified_rows[0])
+            champion_score = float(champion.get("score", 1.0))
+            champion["reward_usd"] = max(1.0, champion_score * 10.0)
+            champion["qualified"] = True
+            champion_model_id = str(champion["model_id"])
+            champion_symbol = str(champion.get("symbol", effective_symbol)).upper()
+            champion_market_model_id = champion_model_id
+        else:
+            champion_symbol = str(best_row.get("symbol", effective_symbol)).upper()
+            champion = self._build_unqualified_champion(
+                symbol=champion_symbol or effective_symbol,
+                generation=int(best_row.get("generation", self.generation) or self.generation),
+            )
+            champion_model_id = str(champion["model_id"])
+            champion_market_model_id = best_model_id
+
+        champion_market = model_markets.get(champion_market_model_id, markets_by_symbol.get(champion_symbol))
         if not self._has_returns_column(champion_market):
             champion_market = next(
                 (market for market in model_markets.values() if self._has_returns_column(market)),
@@ -2099,12 +2243,19 @@ class TradingEngine:
                     model_markets[str(model_id)] = markets_by_symbol[active_symbol]
             if not results_df.empty and "model_id" in results_df.columns:
                 results_df["symbol"] = results_df["model_id"].astype(str).map(model_selected_symbols).fillna(results_df["symbol"])
-                refreshed_champion_row = results_df[results_df["model_id"].astype(str) == champion_model_id]
-                if not refreshed_champion_row.empty:
+                refreshed_champion_row = results_df[results_df["model_id"].astype(str) == champion_model_id] if champion_model_id else pd.DataFrame()
+                if champion_model_id and not refreshed_champion_row.empty:
                     champion = refreshed_champion_row.iloc[0].to_dict()
                     champion["reward_usd"] = max(1.0, float(champion.get("score", champion_score or 1.0)) * 10.0)
+                    champion["qualified"] = True
                     champion_symbol = str(champion.get("symbol", effective_symbol)).upper()
                     champion_market = model_markets.get(champion_model_id, markets_by_symbol.get(champion_symbol))
+                elif champion_market_model_id:
+                    refreshed_market_row = results_df[results_df["model_id"].astype(str) == champion_market_model_id]
+                    if not refreshed_market_row.empty:
+                        champion_symbol = str(refreshed_market_row.iloc[0].get("symbol", champion_symbol)).upper()
+                        champion["symbol"] = champion_symbol
+                        champion_market = model_markets.get(champion_market_model_id, markets_by_symbol.get(champion_symbol))
         else:
             model_open_positions = self._build_model_open_positions(
                 results_df=results_df,
