@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from .run_summary import champion_trade_metrics_from_summary
+
 
 DEFAULT_DB_PATH = Path("data/sirtrade.db")
 SQLITE_TIMEOUT_SECONDS = 30.0
@@ -427,6 +429,26 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
                     conn.execute("ALTER TABLE weekly_runs ADD COLUMN interval TEXT")
                 except sqlite3.OperationalError:
                     pass
+                try:
+                    conn.execute("ALTER TABLE weekly_runs ADD COLUMN champion_model_id TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    conn.execute("ALTER TABLE weekly_runs ADD COLUMN champion_closed_trades INTEGER NOT NULL DEFAULT 0")
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    conn.execute("ALTER TABLE weekly_runs ADD COLUMN champion_win_rate REAL NOT NULL DEFAULT 0")
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    conn.execute("ALTER TABLE weekly_runs ADD COLUMN champion_profit_factor REAL NOT NULL DEFAULT 0")
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    conn.execute("ALTER TABLE weekly_runs ADD COLUMN champion_pnl_czk REAL NOT NULL DEFAULT 0")
+                except sqlite3.OperationalError:
+                    pass
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS open_positions (
@@ -523,15 +545,17 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
 
 def save_week_result(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
     champion = summary["champion"]
+    champion_metrics = champion_trade_metrics_from_summary(summary)
     conn = _connect_db(db_path)
     try:
         conn.execute(
             """
             INSERT INTO weekly_runs (
                 segment, week, generation, market_source, symbol, interval,
-                champion_model, champion_score, champion_sortino,
+                champion_model_id, champion_model, champion_score, champion_sortino,
                 champion_calmar, champion_max_dd, champion_cvar95, reward_usd
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                , champion_closed_trades, champion_win_rate, champion_profit_factor, champion_pnl_czk
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(summary.get("segment", "")) or None,
@@ -540,6 +564,7 @@ def save_week_result(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
                 str(summary.get("market_source", "simulation")),
                 str(summary.get("symbol", "BTCUSDT")),
                 str(summary.get("interval", "")) or None,
+                str(champion_metrics.get("champion_model_id") or "") or None,
                 str(champion.get("name", "unknown")),
                 float(champion.get("score", 0.0)),
                 float(champion.get("sortino", 0.0)),
@@ -547,6 +572,10 @@ def save_week_result(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
                 float(champion.get("max_dd", 0.0)),
                 float(champion.get("cvar95", 0.0)),
                 float(champion.get("reward_usd", 0.0)),
+                int(champion_metrics.get("champion_closed_trades", 0) or 0),
+                float(champion_metrics.get("champion_win_rate", 0.0) or 0.0),
+                float(champion_metrics.get("champion_profit_factor", 0.0) or 0.0),
+                float(champion_metrics.get("champion_pnl_czk", 0.0) or 0.0),
             ),
         )
         conn.commit()
@@ -554,11 +583,23 @@ def save_week_result(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
         conn.close()
 
 
-def load_recent_runs(limit: int = 50, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
+def load_recent_runs(
+    limit: int | None = 50,
+    segment: str | None = None,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> pd.DataFrame:
     conn = _connect_db(db_path)
     try:
-        query = "SELECT * FROM weekly_runs WHERE hidden = 0 ORDER BY id DESC LIMIT ?"
-        frame = pd.read_sql_query(query, conn, params=(limit,))
+        query = "SELECT * FROM weekly_runs WHERE hidden = 0"
+        params: list[object] = []
+        if segment is not None:
+            query += " AND segment = ?"
+            params.append(str(segment))
+        query += " ORDER BY created_at DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        frame = pd.read_sql_query(query, conn, params=tuple(params))
         return frame
     finally:
         conn.close()
@@ -753,20 +794,23 @@ def save_closed_positions(summary: dict, db_path: Path = DEFAULT_DB_PATH) -> Non
         conn.close()
 
 
-def load_closed_positions(limit: int = 2000, segment: str | None = None, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
+def load_closed_positions(limit: int | None = 2000, segment: str | None = None, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
     conn = _connect_db(db_path)
     try:
         if segment is None:
-            return pd.read_sql_query(
-                "SELECT * FROM closed_positions WHERE hidden = 0 ORDER BY closed_at DESC, id DESC LIMIT ?",
-                conn,
-                params=(int(limit),),
-            )
-        return pd.read_sql_query(
-            "SELECT * FROM closed_positions WHERE hidden = 0 AND segment = ? ORDER BY closed_at DESC, id DESC LIMIT ?",
-            conn,
-            params=(str(segment), int(limit)),
-        )
+            query = "SELECT * FROM closed_positions WHERE hidden = 0 ORDER BY closed_at DESC, id DESC"
+            params: tuple[object, ...] = ()
+            if limit is not None:
+                query += " LIMIT ?"
+                params = (int(limit),)
+            return pd.read_sql_query(query, conn, params=params)
+
+        query = "SELECT * FROM closed_positions WHERE hidden = 0 AND segment = ? ORDER BY closed_at DESC, id DESC"
+        params = [str(segment)]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        return pd.read_sql_query(query, conn, params=tuple(params))
     finally:
         conn.close()
 
@@ -774,9 +818,9 @@ def load_closed_positions(limit: int = 2000, segment: str | None = None, db_path
 def clear_trade_history(db_path: Path = DEFAULT_DB_PATH) -> None:
     conn = _connect_db(db_path)
     try:
-        conn.execute("UPDATE weekly_runs SET hidden = 1 WHERE hidden = 0")
+        conn.execute("DELETE FROM weekly_runs")
         conn.execute("DELETE FROM open_positions")
-        conn.execute("UPDATE closed_positions SET hidden = 1 WHERE hidden = 0")
+        conn.execute("DELETE FROM closed_positions")
         conn.commit()
     finally:
         conn.close()

@@ -17,7 +17,7 @@ from src.sirtrade.engine import TradingEngine
 from src.sirtrade.engine import ModelResult
 from src.sirtrade.execution import build_dry_run_orders
 from src.sirtrade.copy_trading import LeadTraderProfile, fetch_copy_trader_leaderboard, get_copy_trading_status, select_best_lead_trader
-from src.sirtrade.config import DEFAULT_CONFIG
+from src.sirtrade.config import DEFAULT_CONFIG, PAPER_TRADE_SIZE_CZK
 from src.sirtrade.health_server import _build_worker_health_payload
 from src.sirtrade.live_worker import (
     _apply_trade_cutoff,
@@ -29,8 +29,19 @@ from src.sirtrade.live_worker import (
 )
 from src.sirtrade.market_stream import apply_stream_kline_to_market
 from src.sirtrade.models import ModelSpec
+from src.sirtrade.run_summary import build_segment_winner_history_table, report_json_path, reset_summary_for_new_cycle
 from src.sirtrade.scoring import decision_score
-from src.sirtrade.storage import _build_closed_positions_rows, _dedupe_closed_positions, clear_trade_history, init_db, load_open_positions, save_closed_positions, save_open_positions
+from src.sirtrade.storage import (
+    _build_closed_positions_rows,
+    _dedupe_closed_positions,
+    clear_trade_history,
+    init_db,
+    load_open_positions,
+    load_recent_runs,
+    save_closed_positions,
+    save_open_positions,
+    save_week_result,
+)
 from src.sirtrade.ui_state import (
     load_segment_runs,
     load_worker_status,
@@ -336,6 +347,7 @@ class TradingLogicTests(unittest.TestCase):
             "segment": "Scalp",
             "week": 1,
             "generation": 1,
+            "reset_token": 22,
             "portfolio_vol_annual": 0.1,
             "market_source": "simulation",
             "symbol": "BTCUSDT",
@@ -365,6 +377,7 @@ class TradingLogicTests(unittest.TestCase):
 
         restored_market = restored["Scalp"]["market"]
         restored_model_market = restored["Scalp"]["model_markets"]["SC_M1"]
+        self.assertEqual(int(restored["Scalp"]["reset_token"]), 22)
         self.assertLessEqual(len(restored_market), 360)
         self.assertLessEqual(len(restored_model_market), 360)
 
@@ -1087,11 +1100,9 @@ class TradingLogicTests(unittest.TestCase):
 
             conn = sqlite3.connect(db_path)
             try:
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM weekly_runs WHERE hidden = 0").fetchone()[0], 0)
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM weekly_runs WHERE hidden = 1").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM weekly_runs").fetchone()[0], 0)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM open_positions").fetchone()[0], 0)
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM closed_positions WHERE hidden = 0").fetchone()[0], 0)
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM closed_positions WHERE hidden = 1").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM closed_positions").fetchone()[0], 0)
             finally:
                 conn.close()
 
@@ -1435,6 +1446,41 @@ class TradingLogicTests(unittest.TestCase):
         self.assertEqual(sum(model.kind != "copy_trader" for model in engine.models), 5)
         standard_kinds = [model.kind for model in engine.models if model.kind != "copy_trader"]
         self.assertEqual(len(set(standard_kinds)), 5)
+
+    def test_run_week_does_not_advance_generation_without_minimum_closed_trades(self) -> None:
+        engine = TradingEngine(model_namespace="SC", model_label_prefix="Scalp")
+        engine.week = 23
+        market = _build_market_frame()
+        universe = pd.DataFrame([{"symbol": "BTCUSDT", "opportunity_score": 1.0}])
+
+        def fake_simulate(_engine: TradingEngine, model: ModelSpec, market_frame: pd.DataFrame, symbol: str):
+            result = ModelResult(
+                model_id=model.model_id,
+                name=model.name,
+                generation=model.generation,
+                symbol=symbol,
+                sortino=1.5,
+                calmar=1.0,
+                cvar95=0.01,
+                max_dd=0.05,
+                cost=0.0,
+                turnover=0.0,
+                score=1.2,
+                passed=True,
+                closed_trades=49,
+                win_rate=58.0,
+            )
+            return result, [], 0.0, 0
+
+        with patch("src.sirtrade.engine.scan_binance_long_tail", return_value=universe), patch(
+            "src.sirtrade.engine.get_market_data", return_value=market
+        ), patch.object(TradingEngine, "_simulate_model", side_effect=fake_simulate, autospec=True):
+            summary = engine.run_week(days=1, market_source="binance", symbol="BTCUSDT", interval="1m")
+
+        self.assertEqual(engine.week, 24)
+        self.assertEqual(engine.generation, 1)
+        self.assertEqual(int(summary["generation"]), 1)
+        self.assertEqual(int(summary["champion"]["generation"]), 1)
 
     def test_select_candidate_run_prefers_better_sampled_candidate(self) -> None:
         engine = TradingEngine()
@@ -2113,6 +2159,221 @@ class TradingLogicTests(unittest.TestCase):
         self.assertEqual(float(result["champion"]["reward_usd"]), 0.0)
         self.assertEqual(result["symbol"], "BTCUSDT")
         self.assertGreaterEqual(result["portfolio_vol_annual"], 0.0)
+
+
+class RunSummaryTests(unittest.TestCase):
+    def test_reset_summary_for_new_cycle_preserves_models_and_resets_counters(self) -> None:
+        summary = {
+            "segment": "Scalp",
+            "week": 12,
+            "generation": 4,
+            "reset_token": 7,
+            "research": [{"headline": "test"}],
+            "proposed_orders": [{"symbol": "BTCUSDT"}],
+            "trade_analytics": {"closed_trades": 5, "profit_factor": 1.7},
+            "champion_trades": [{"symbol": "BTCUSDT"}],
+            "champion": {
+                "model_id": "SC_M2",
+                "name": "Scalp | Momentum 2",
+                "generation": 4,
+                "score": 1.3,
+                "passed": True,
+            },
+            "results": pd.DataFrame(
+                [
+                    {
+                        "model_id": "SC_M1",
+                        "name": "Scalp | Momentum 1",
+                        "generation": 4,
+                        "score": 0.9,
+                        "closed_trades": 3,
+                        "win_rate": 66.7,
+                        "passed": True,
+                    },
+                    {
+                        "model_id": "SC_M2",
+                        "name": "Scalp | Momentum 2",
+                        "generation": 4,
+                        "score": 1.3,
+                        "closed_trades": 5,
+                        "win_rate": 80.0,
+                        "passed": True,
+                    },
+                ]
+            ),
+            "model_trades": {"SC_M1": [{"akce": "foo"}], "SC_M2": [{"akce": "bar"}]},
+            "trade_events_delta": {"SC_M1": [{"akce": "foo"}], "SC_M2": [{"akce": "bar"}]},
+            "final_positions": {"SC_M1": 1.0, "SC_M2": -1.0},
+            "final_open_slots": {"SC_M1": 2, "SC_M2": 1},
+            "model_open_positions": {"SC_M1": [{"symbol": "BTCUSDT"}], "SC_M2": [{"symbol": "ETHUSDT"}]},
+            "live_model_state": {"SC_M1": {"entry_armed": False}, "SC_M2": {"entry_armed": False}},
+        }
+
+        reset_summary = reset_summary_for_new_cycle(summary)
+
+        self.assertIsNotNone(reset_summary)
+        self.assertEqual(reset_summary["week"], 0)
+        self.assertEqual(reset_summary["generation"], 1)
+        self.assertEqual(int(reset_summary["reset_token"]), 7)
+        self.assertEqual(reset_summary["champion"]["name"], "Scalp | Momentum 2")
+        self.assertEqual(reset_summary["champion"]["generation"], 1)
+        self.assertEqual(float(reset_summary["champion"].get("score", 0.0)), 0.0)
+        self.assertEqual(reset_summary["results"]["name"].tolist(), ["Scalp | Momentum 1", "Scalp | Momentum 2"])
+        self.assertTrue((reset_summary["results"]["generation"] == 1).all())
+        self.assertTrue((reset_summary["results"]["closed_trades"] == 0).all())
+        self.assertTrue((reset_summary["results"]["win_rate"] == 0.0).all())
+        self.assertEqual(reset_summary["model_trades"], {"SC_M1": [], "SC_M2": []})
+        self.assertEqual(reset_summary["trade_events_delta"], {"SC_M1": [], "SC_M2": []})
+        self.assertEqual(reset_summary["final_positions"], {"SC_M1": 0.0, "SC_M2": 0.0})
+        self.assertEqual(reset_summary["final_open_slots"], {"SC_M1": 0, "SC_M2": 0})
+        self.assertEqual(reset_summary["proposed_orders"], [])
+        self.assertEqual(reset_summary["research"], [])
+        self.assertEqual(int(reset_summary["trade_analytics"]["closed_trades"]), 0)
+
+    def test_save_week_result_persists_champion_trade_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "sirtrade.db"
+            init_db(db_path)
+            summary = {
+                "segment": "Scalp",
+                "week": 2,
+                "generation": 3,
+                "market_source": "simulation",
+                "symbol": "BTCUSDT",
+                "interval": "1m",
+                "champion": {
+                    "model_id": "SC_M1",
+                    "name": "Scalp | Momentum 1",
+                    "score": 1.25,
+                    "sortino": 1.4,
+                    "calmar": 0.9,
+                    "max_dd": 0.12,
+                    "cvar95": 0.08,
+                    "reward_usd": 3.5,
+                    "closed_trades": 15,
+                    "win_rate": 60.0,
+                    "profit_factor": 1.8,
+                    "pnl_czk": 12_500.0,
+                },
+                "model_trades": {
+                    "SC_M1": [
+                        {
+                            "akce": "Vstup LONG (+1)",
+                            "strana": "LONG",
+                            "symbol": "BTCUSDT",
+                            "executed_at": "2024-01-01T00:00:00Z",
+                            "opened_at": "2024-01-01T00:00:00Z",
+                            "entry_price": 100.0,
+                            "cena": 100.0,
+                            "quantity_slots": 1,
+                            "model_name": "Scalp | Momentum 1",
+                        },
+                        {
+                            "akce": "Výstup LONG (-1)",
+                            "strana": "LONG",
+                            "symbol": "BTCUSDT",
+                            "executed_at": "2024-01-01T01:00:00Z",
+                            "opened_at": "2024-01-01T00:00:00Z",
+                            "entry_price": 100.0,
+                            "cena": 110.0,
+                            "quantity_slots": 1,
+                            "model_name": "Scalp | Momentum 1",
+                            "duvod_vystupu": "TARGET",
+                        },
+                    ]
+                },
+            }
+
+            save_week_result(summary, db_path=db_path)
+            rows = load_recent_runs(limit=None, segment="Scalp", db_path=db_path)
+
+        self.assertEqual(len(rows), 1)
+        row = rows.iloc[0]
+        self.assertEqual(row["champion_model_id"], "SC_M1")
+        self.assertEqual(int(row["champion_closed_trades"]), 15)
+        self.assertAlmostEqual(float(row["champion_win_rate"]), 60.0)
+        self.assertAlmostEqual(float(row["champion_profit_factor"]), 1.8)
+        self.assertAlmostEqual(float(row["champion_pnl_czk"]), 12_500.0)
+
+    def test_build_segment_winner_history_table_reconstructs_metrics_for_legacy_runs(self) -> None:
+        weekly_runs = pd.DataFrame(
+            [
+                {
+                    "id": 1,
+                    "created_at": "2024-02-01T11:00:00Z",
+                    "segment": "Scalp",
+                    "week": 23,
+                    "generation": 3,
+                    "market_source": "simulation",
+                    "symbol": "BTCUSDT",
+                    "champion_model": "Scalp | Mid-cycle Winner",
+                    "champion_model_id": None,
+                    "champion_closed_trades": 0,
+                    "champion_win_rate": 0.0,
+                    "champion_profit_factor": 0.0,
+                    "champion_pnl_czk": 0.0,
+                },
+                {
+                    "id": 2,
+                    "created_at": "2024-02-01T12:00:00Z",
+                    "segment": "Scalp",
+                    "week": 24,
+                    "generation": 4,
+                    "market_source": "simulation",
+                    "symbol": "BTCUSDT",
+                    "champion_model": "Scalp | Legacy Winner",
+                    "champion_model_id": None,
+                    "champion_closed_trades": 0,
+                    "champion_win_rate": 0.0,
+                    "champion_profit_factor": 0.0,
+                    "champion_pnl_czk": 0.0,
+                }
+            ]
+        )
+        closed_positions = pd.DataFrame()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            reports_dir = Path(tmp_dir)
+            json_path = report_json_path(
+                week=24,
+                generation=4,
+                segment="scalp",
+                symbol="BTCUSDT",
+                market_source="simulation",
+                reports_dir=reports_dir,
+            )
+            json_path.write_text(
+                (
+                    '{"champion": {'
+                    '"model_id": "SC_M9", '
+                    '"name": "Scalp | Legacy Winner", '
+                    '"generation": 3, '
+                    '"closed_trades": 52, '
+                    '"win_rate": 61.5, '
+                    '"profit_factor": 1.82, '
+                    '"pnl_czk": 12345.6'
+                    '}}'
+                ),
+                encoding="utf-8",
+            )
+
+            history = build_segment_winner_history_table(
+                weekly_runs,
+                closed_positions,
+                reports_dir=reports_dir,
+                trade_size_czk=PAPER_TRADE_SIZE_CZK,
+            )
+
+        self.assertEqual(len(history), 1)
+        row = history.iloc[0]
+        self.assertEqual(int(row["Týden"]), 24)
+        self.assertEqual(int(row["Generace"]), 3)
+        self.assertEqual(row["Model"], "Scalp | Legacy Winner")
+        self.assertEqual(row["Model ID"], "SC_M9")
+        self.assertEqual(int(row["Uzavřené obchody před výhrou"]), 52)
+        self.assertAlmostEqual(float(row["Win rate"]), 61.5)
+        self.assertAlmostEqual(float(row["Profit factor"]), 1.82)
+        self.assertAlmostEqual(float(row["PnL CZK"]), 12345.6)
 
 
 if __name__ == "__main__":

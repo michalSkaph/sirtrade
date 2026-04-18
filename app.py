@@ -24,6 +24,11 @@ from src.sirtrade.engine import TradingEngine
 from src.sirtrade.health_server import DEFAULT_HEALTH_PORT, ensure_health_server_started
 from src.sirtrade.live_worker import ensure_live_worker_started, is_live_worker_started, should_start_embedded_worker
 from src.sirtrade.reporting import export_weekly_report
+from src.sirtrade.run_summary import (
+    build_segment_winner_history_table,
+    hydrate_engine_from_summary,
+    reset_summary_for_new_cycle,
+)
 from src.sirtrade.storage import (
     clear_trade_history,
     init_db,
@@ -147,7 +152,8 @@ def _load_segment_runs_cached() -> dict[str, dict[str, object]]:
     return runs if isinstance(runs, dict) else {}
 
 
-def _load_closed_positions_cached(limit: int, segment: str | None = None) -> pd.DataFrame:
+@st.cache_data(ttl=10, show_spinner=False)
+def _load_closed_positions_cached(limit: int | None, segment: str | None = None) -> pd.DataFrame:
     return load_closed_positions(limit=limit, segment=segment)
 
 
@@ -156,8 +162,8 @@ def _load_open_positions_cached(segment: str | None = None) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def _load_recent_runs_cached(limit: int) -> pd.DataFrame:
-    return load_recent_runs(limit=limit)
+def _load_recent_runs_cached(limit: int | None, segment: str | None = None) -> pd.DataFrame:
+    return load_recent_runs(limit=limit, segment=segment)
 
 
 @st.cache_data(ttl=1, show_spinner=False)
@@ -221,27 +227,6 @@ def _report_paths_from_summary(summary: dict[str, object] | None) -> dict[str, s
         "csv": str(Path("reports") / f"{stem}.csv"),
         "json": str(Path("reports") / f"{stem}.json"),
     }
-
-
-def _reset_summary_trade_state(summary: dict[str, object] | None) -> dict[str, object] | None:
-    if not isinstance(summary, dict):
-        return None
-
-    reset_summary = dict(summary)
-    results = summary.get("results")
-    model_ids: list[str] = []
-    if isinstance(results, pd.DataFrame) and "model_id" in results.columns:
-        model_ids = [str(value) for value in results["model_id"].tolist()]
-
-    reset_summary["model_trades"] = {model_id: [] for model_id in model_ids}
-    reset_summary["champion_trades"] = []
-    reset_summary["final_positions"] = {model_id: 0.0 for model_id in model_ids}
-    reset_summary["final_open_slots"] = {model_id: 0 for model_id in model_ids}
-    reset_summary["model_open_positions"] = {model_id: [] for model_id in model_ids}
-    reset_summary["trade_events_delta"] = {model_id: [] for model_id in model_ids}
-    reset_summary["live_model_state"] = {model_id: {"entry_armed": True} for model_id in model_ids}
-    reset_summary["proposed_orders"] = []
-    return reset_summary
 
 
 def _to_prague_timestamps(values: object) -> pd.Series:
@@ -994,11 +979,56 @@ def _placeholder_market_frame(last_price: float, interval: str, periods: int = 1
     )
 
 
-def _restore_missing_segments_from_storage(existing_segments: set[str]) -> dict[str, dict[str, object]]:
+def _infer_segment_from_weekly_run_row(row: pd.Series) -> str | None:
+    stored_segment = str(row.get("segment") or "").strip()
+    if stored_segment in SEGMENT_DEFAULTS:
+        return stored_segment
+
+    champion_model_id = str(row.get("champion_model_id") or "").strip().upper()
+    if champion_model_id:
+        namespace = champion_model_id.split("_", 1)[0]
+        if namespace == "SC":
+            return "Scalp"
+        if namespace == "ID":
+            return "Intraday"
+        if namespace == "SW":
+            return "Swing"
+
+    inferred_from_name = _infer_segment_from_model_name(row.get("champion_model"))
+    return inferred_from_name or None
+
+
+def _filter_weekly_runs_for_segment(frame: pd.DataFrame, segment: str) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+
+    filtered = frame.copy()
+    filtered["segment_inferred"] = filtered.apply(_infer_segment_from_weekly_run_row, axis=1)
+    return filtered[filtered["segment_inferred"] == segment].copy()
+
+
+def _summary_reset_token(summary: dict[str, object] | None, default: int = 0) -> int:
+    if not isinstance(summary, dict):
+        return default
+    return max(0, _coerce_int(summary.get("reset_token"), default))
+
+
+def _restore_missing_segments_from_storage(
+    existing_segments: set[str],
+    *,
+    cutoff_ts: object | None = None,
+) -> dict[str, dict[str, object]]:
     restored: dict[str, dict[str, object]] = {}
     recent_runs = _load_recent_runs_cached(limit=300)
     if recent_runs.empty:
         return restored
+
+    cutoff = pd.to_datetime(cutoff_ts, errors="coerce", utc=True)
+    if not pd.isna(cutoff) and "created_at" in recent_runs.columns:
+        created_at = pd.to_datetime(recent_runs["created_at"], errors="coerce", utc=True)
+        recent_runs = recent_runs.loc[created_at.notna() & (created_at >= cutoff)].copy()
+        if recent_runs.empty:
+            return restored
 
     open_positions = _load_open_positions_cached()
     closed_positions = _load_closed_positions_cached(limit=5000)
@@ -1092,7 +1122,8 @@ def _restore_missing_segments_from_storage(existing_segments: set[str]) -> dict[
                 model_name = str(closed_row.get("model_name", model_id))
                 known_models.setdefault(model_id, model_name)
 
-        champion_model_id = next(
+        stored_champion_model_id = str(row.get("champion_model_id") or "").strip()
+        champion_model_id = stored_champion_model_id or next(
             (model_id for model_id, model_name in known_models.items() if model_name == champion_name),
             f"{namespace}RESTORED",
         )
@@ -1347,7 +1378,6 @@ def _render_graph_view_body() -> None:
 
         p_sel1, p_sel2, p_sel3 = st.columns(3)
         p_sel1.metric("Vybraná pozice", f"{selected_symbol_for_overlay} | {selected_side}")
-        p_sel2.metric("Vstup → Aktuální", f"{selected_entry:.6f}", f"{selected_current:.6f}")
         p_sel3.metric("Průběžné PnL", f"{selected_pnl_pct:.3f}%")
 
     final_positions = latest.get("final_positions", {})
@@ -1420,14 +1450,14 @@ def _hydrate_engines_from_history(
         if not history:
             continue
 
-        latest = history[-1]
-        latest_week = max(0, _coerce_int(latest.get("week"), 0))
-        latest_generation = max(1, _coerce_int(latest.get("generation"), 1))
+        hydrate_engine_from_summary(engine, history[-1])
 
-        engine.week = max(engine.week, latest_week)
-        engine.generation = max(engine.generation, latest_generation)
-        for model in engine.models:
-            model.generation = engine.generation
+
+def _reset_engine_to_new_cycle(engine: TradingEngine) -> None:
+    engine.week = 0
+    engine.generation = 1
+    for model in engine.models:
+        model.generation = 1
 
 st.markdown(
     """
@@ -1446,6 +1476,62 @@ SEGMENT_DEFAULTS = {
     "Swing": {"interval": "4h", "sim_days": 30, "namespace": "SW"},
 }
 
+
+def _load_history_from_ui_state_only(expected_reset_token: int | None = None) -> dict[str, list[dict[str, object]]]:
+    history_by_segment: dict[str, list[dict[str, object]]] = {
+        segment: [] for segment in SEGMENT_DEFAULTS.keys()
+    }
+
+    restored_by_segment = load_segment_runs()
+    if isinstance(restored_by_segment, dict) and restored_by_segment:
+        for segment, restored in restored_by_segment.items():
+            if expected_reset_token is not None and _summary_reset_token(restored) < expected_reset_token:
+                continue
+            restored_segment = _infer_segment_name(restored)
+            if restored_segment in history_by_segment:
+                history_by_segment[restored_segment] = [restored]
+        return history_by_segment
+
+    restored = load_last_ui_run()
+    if isinstance(restored, dict):
+        if expected_reset_token is not None and _summary_reset_token(restored) < expected_reset_token:
+            return history_by_segment
+        restored_segment = _infer_segment_name(restored)
+        if restored_segment in history_by_segment:
+            restored["segment"] = restored_segment
+            history_by_segment[restored_segment] = [restored]
+    return history_by_segment
+
+
+def _sync_session_state_from_runtime_reset(runtime_state: dict[str, object]) -> None:
+    persisted_reset_token = max(0, _coerce_int(runtime_state.get("reset_token"), 0))
+    current_reset_token = max(-1, _coerce_int(st.session_state.get("reset_token"), -1))
+    if persisted_reset_token <= current_reset_token:
+        return
+
+    persisted_segment_state = runtime_state.get("simulation_running_by_segment", {})
+    fallback_running = bool(runtime_state.get("simulation_running", False))
+    st.session_state.simulation_running_by_segment = {
+        segment: bool(persisted_segment_state.get(segment, fallback_running))
+        for segment in SEGMENT_DEFAULTS.keys()
+    }
+    st.session_state.reset_token = persisted_reset_token
+    st.session_state.paper_trade_cutoff_ts = runtime_state.get("paper_trade_cutoff_ts")
+    st.session_state.active_segment = str(runtime_state.get("active_segment", st.session_state.get("active_segment", "Swing")))
+    st.session_state.data_source = str(runtime_state.get("data_source", st.session_state.get("data_source", "binance")))
+    st.session_state.symbol = str(runtime_state.get("symbol", st.session_state.get("symbol", "BTCUSDT")))
+    st.session_state.active_view = str(runtime_state.get("active_view", st.session_state.get("active_view", "Dashboard")))
+    st.session_state.last_simulation_tick = float(runtime_state.get("last_simulation_tick", 0.0))
+    st.session_state.live_segment_cursor = int(runtime_state.get("live_segment_cursor", 0))
+    st.session_state.history_by_segment = _load_history_from_ui_state_only(expected_reset_token=persisted_reset_token)
+    _hydrate_engines_from_history(st.session_state.engines, st.session_state.history_by_segment)
+    for segment, history in st.session_state.history_by_segment.items():
+        if history:
+            continue
+        _reset_engine_to_new_cycle(st.session_state.engines[segment])
+    st.session_state.last_exports = {}
+    st.session_state.pop("_runtime_state_signature", None)
+
 if "engines" not in st.session_state:
     st.session_state.engines = {
         segment: TradingEngine(
@@ -1459,21 +1545,28 @@ if "engines" not in st.session_state:
 if "history_by_segment" not in st.session_state:
     st.session_state.history_by_segment = {segment: [] for segment in SEGMENT_DEFAULTS.keys()}
     normalized_restored: dict[str, dict[str, object]] = {}
+    expected_reset_token = max(0, _coerce_int(runtime_state.get("reset_token"), 0))
     restored_by_segment = _load_segment_runs_cached()
     if restored_by_segment:
         for segment, restored in restored_by_segment.items():
+            if _summary_reset_token(restored) < expected_reset_token:
+                continue
             restored_segment = _infer_segment_name(restored)
             if restored_segment in st.session_state.history_by_segment:
                 normalized_restored[restored_segment] = restored
     else:
         restored = _load_last_ui_run_cached()
         if restored:
-            restored_segment = _infer_segment_name(restored)
-            if restored_segment in st.session_state.history_by_segment:
-                restored["segment"] = restored_segment
-                normalized_restored[restored_segment] = restored
+            if _summary_reset_token(restored) >= expected_reset_token:
+                restored_segment = _infer_segment_name(restored)
+                if restored_segment in st.session_state.history_by_segment:
+                    restored["segment"] = restored_segment
+                    normalized_restored[restored_segment] = restored
 
-    recovered_from_storage = _restore_missing_segments_from_storage(set(normalized_restored.keys()))
+    recovered_from_storage = _restore_missing_segments_from_storage(
+        set(normalized_restored.keys()),
+        cutoff_ts=runtime_state.get("paper_trade_cutoff_ts"),
+    )
     normalized_restored.update(recovered_from_storage)
 
     for segment, restored in normalized_restored.items():
@@ -1522,6 +1615,8 @@ if "reset_token" not in st.session_state:
     st.session_state.reset_token = int(runtime_state.get("reset_token", 0))
 if "paper_trade_cutoff_ts" not in st.session_state:
     st.session_state.paper_trade_cutoff_ts = runtime_state.get("paper_trade_cutoff_ts")
+
+_sync_session_state_from_runtime_reset(runtime_state)
 
 st.session_state.live_refresh_seconds = FIXED_LIVE_REFRESH_SECONDS
 st.session_state.simulation_cycle_seconds = FIXED_SIMULATION_CYCLE_SECONDS
@@ -1659,53 +1754,63 @@ if reset_btn:
     st.session_state.simulation_running_by_segment = {segment: False for segment in SEGMENT_DEFAULTS.keys()}
     st.session_state.reset_token += 1
     st.session_state.paper_trade_cutoff_ts = pd.Timestamp.utcnow().isoformat()
-    clear_trade_history()
-    clear_last_ui_run()
 
     reset_segment_runs: dict[str, dict[str, object]] = {}
     for segment in SEGMENT_DEFAULTS.keys():
         history = st.session_state.history_by_segment.get(segment, [])
         latest_summary = history[-1] if history else None
-        reset_summary = _reset_summary_trade_state(latest_summary)
+        reset_summary = reset_summary_for_new_cycle(latest_summary)
         st.session_state.history_by_segment[segment] = [reset_summary] if isinstance(reset_summary, dict) else []
         if isinstance(reset_summary, dict):
+            reset_summary["reset_token"] = int(st.session_state.reset_token)
             reset_segment_runs[segment] = reset_summary
+            hydrate_engine_from_summary(st.session_state.engines[segment], reset_summary, reset_counters=True)
+        else:
+            _reset_engine_to_new_cycle(st.session_state.engines[segment])
 
     if reset_segment_runs:
         save_segment_runs(reset_segment_runs)
         active_reset_summary = reset_segment_runs.get(st.session_state.active_segment)
         if isinstance(active_reset_summary, dict):
             save_last_ui_run(active_reset_summary)
-            st.session_state.last_exports = _report_paths_from_summary(active_reset_summary)
+            st.session_state.last_exports = {}
     else:
         clear_last_ui_run()
         clear_segment_runs()
         st.session_state.last_exports = {}
 
-    _save_runtime_state_if_changed(
-        {
-            "simulation_running": False,
-            "simulation_running_by_segment": st.session_state.simulation_running_by_segment,
-            "auto_center_last_candle": st.session_state.auto_center_last_candle,
-            "active_segment": st.session_state.active_segment,
-            "data_source": st.session_state.data_source,
-            "symbol": st.session_state.symbol,
-            "live_refresh_enabled": st.session_state.live_refresh_enabled,
-            "live_refresh_seconds": int(st.session_state.live_refresh_seconds),
-            "live_refresh_when_stopped": st.session_state.live_refresh_when_stopped,
-            "simulation_cycle_seconds": int(st.session_state.simulation_cycle_seconds),
-            "active_view": st.session_state.active_view,
-            "last_simulation_tick": 0.0,
-            "live_segment_cursor": int(st.session_state.live_segment_cursor),
-            "reset_token": int(st.session_state.reset_token),
-            "paper_trade_cutoff_ts": st.session_state.paper_trade_cutoff_ts,
-        }
+    reset_runtime_state = {
+        "simulation_running": False,
+        "simulation_running_by_segment": st.session_state.simulation_running_by_segment,
+        "auto_center_last_candle": st.session_state.auto_center_last_candle,
+        "active_segment": st.session_state.active_segment,
+        "data_source": st.session_state.data_source,
+        "symbol": st.session_state.symbol,
+        "live_refresh_enabled": st.session_state.live_refresh_enabled,
+        "live_refresh_seconds": int(st.session_state.live_refresh_seconds),
+        "live_refresh_when_stopped": st.session_state.live_refresh_when_stopped,
+        "simulation_cycle_seconds": int(st.session_state.simulation_cycle_seconds),
+        "active_view": st.session_state.active_view,
+        "last_simulation_tick": 0.0,
+        "live_segment_cursor": int(st.session_state.live_segment_cursor),
+        "reset_token": int(st.session_state.reset_token),
+        "paper_trade_cutoff_ts": st.session_state.paper_trade_cutoff_ts,
+    }
+    save_runtime_state(reset_runtime_state)
+    st.session_state["_runtime_state_signature"] = json.dumps(
+        reset_runtime_state,
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
     )
+    clear_trade_history()
     _clear_optional_streamlit_cache(_load_last_ui_run_cached)
     _clear_optional_streamlit_cache(_load_segment_runs_cached)
+    _clear_optional_streamlit_cache(_load_runtime_state_cached)
     _clear_optional_streamlit_cache(_load_open_positions_cached)
     _clear_optional_streamlit_cache(_load_closed_positions_cached)
     _clear_optional_streamlit_cache(_load_recent_runs_cached)
+    _clear_optional_streamlit_cache(_fetch_platform_status_cached)
     st.rerun()
 
 view_options = ["Dashboard", "Grafy", "Pozice", "Uzavřené pozice", "Analýza", "Historie & Export"]
@@ -1796,11 +1901,16 @@ st.caption(
 
 persisted_segment_runs = _load_segment_runs_cached()
 if persisted_segment_runs:
+    persisted_runtime_reset_token = max(0, _coerce_int(runtime_state.get("reset_token"), 0))
     for segment, summary in persisted_segment_runs.items():
         normalized_segment = _infer_segment_name(summary)
         if normalized_segment in st.session_state.history_by_segment:
+            incoming_reset_token = _summary_reset_token(summary)
+            if incoming_reset_token < persisted_runtime_reset_token:
+                continue
             current_history = st.session_state.history_by_segment.get(normalized_segment, [])
             current_latest = current_history[-1] if current_history else None
+            current_reset_token = _summary_reset_token(current_latest, default=persisted_runtime_reset_token)
             current_key = (
                 int(current_latest.get("week", 0)) if isinstance(current_latest, dict) else -1,
                 int(current_latest.get("generation", 0)) if isinstance(current_latest, dict) else -1,
@@ -1809,7 +1919,9 @@ if persisted_segment_runs:
                 int(summary.get("week", 0)) if isinstance(summary, dict) else -1,
                 int(summary.get("generation", 0)) if isinstance(summary, dict) else -1,
             )
-            if incoming_key >= current_key:
+            if incoming_reset_token > current_reset_token or (
+                incoming_reset_token == current_reset_token and incoming_key >= current_key
+            ):
                 st.session_state.history_by_segment[normalized_segment] = [summary]
                 if normalized_segment == st.session_state.active_segment:
                     st.session_state.last_exports = _report_paths_from_summary(summary)
@@ -2312,50 +2424,54 @@ else:
         )
 
     if st.session_state.active_view == "Historie & Export":
-        st.subheader("Persisted historie (SQLite)")
-        persisted = _load_recent_runs_cached(limit=25)
-        segment_prefix = f"{st.session_state.active_segment} | "
-        if not persisted.empty and "champion_model" in persisted.columns:
-            persisted = persisted[persisted["champion_model"].astype(str).str.startswith(segment_prefix)].copy()
+        st.subheader(f"Historie vítězů generací segmentu {st.session_state.active_segment}")
+        st.caption(
+            "Každý řádek ukazuje pouze okamžik uzavření celé generace. "
+            "Metriky vítěze jsou brané z vyhodnocení modelu, které rozhodlo o jeho vítězství; "
+            "u starších historických řádků mohou být některé hodnoty prázdné, pokud je dřívější report neukládal."
+        )
+        persisted = _filter_weekly_runs_for_segment(
+            _load_recent_runs_cached(limit=None),
+            st.session_state.active_segment,
+        )
         if persisted.empty:
             st.info(f"Pro segment {st.session_state.active_segment} zatím není v historii žádný uložený běh.")
             st.stop()
-        persisted_view = persisted.rename(
-        columns={
-            "id": "ID",
-            "created_at": "Vytvořeno",
-            "week": "Týden",
-            "generation": "Generace",
-            "market_source": "Zdroj dat",
-            "symbol": "Symbol",
-            "champion_model": "Vítězný model",
-            "champion_score": "Skóre vítěze",
-            "champion_sortino": "Sortino vítěze",
-            "champion_calmar": "Calmar vítěze",
-            "champion_max_dd": "Max DD vítěze",
-            "champion_cvar95": "CVaR95 vítěze",
-            "reward_usd": "Odměna (USD)",
+
+        history_closed = _load_closed_positions_cached(limit=None, segment=st.session_state.active_segment)
+        winner_history = build_segment_winner_history_table(
+            persisted,
+            history_closed,
+            reports_dir=Path("reports"),
+            trade_size_czk=PAPER_TRADE_SIZE_CZK,
+        )
+        if winner_history.empty:
+            st.info(f"Pro segment {st.session_state.active_segment} zatím není možné sestavit historii vítězů.")
+            st.stop()
+
+        winner_history["Zdroj dat"] = winner_history["Zdroj dat"].replace(
+            {"simulation": "Simulace", "binance": "Binance", "binance_copy": "Binance Copy"}
+        )
+        winner_history = _split_datetime_column(winner_history, "Vítězství", "Vítězství")
+        winner_history = winner_history.drop(columns=["Model ID"], errors="ignore")
+        winner_history = winner_history.where(pd.notna(winner_history), None)
+        history_config = {
+            "Vítězství - Datum": st.column_config.TextColumn("Datum", help="Datum uzavření generace."),
+            "Vítězství - Čas": st.column_config.TextColumn("Čas", help="Čas uzavření generace."),
+            "Týden": st.column_config.NumberColumn("Týden", help="Týden, ve kterém se uzavřela celá generace."),
+            "Generace": st.column_config.NumberColumn("Generace", help="Uzavřená generace, ze které vítězný model vzešel."),
+            "Model": st.column_config.TextColumn("Vítězný model", help="Model, který vyhrál uzavřenou generaci."),
+            "Uzavřené obchody před výhrou": st.column_config.NumberColumn(
+                "Uzavřené obchody",
+                help="Kolik uzavřených obchodů měl vítězný model ve vyhodnocení, které rozhodlo o jeho vítězství.",
+            ),
+            "Profit factor": st.column_config.NumberColumn("Profit factor", help="Profit factor vítězného modelu ve vítězném vyhodnocení."),
+            "PnL CZK": st.column_config.NumberColumn("PnL CZK", help="PnL vítězného modelu ve vítězném vyhodnocení."),
+            "Win rate": st.column_config.NumberColumn("Win rate", help="Win rate vítězného modelu ve vítězném vyhodnocení."),
+            "Zdroj dat": st.column_config.TextColumn("Zdroj dat", help="Simulace nebo živá Binance data."),
+            "Symbol": st.column_config.TextColumn("Symbol", help="Primární symbol běhu, ve kterém model vyhrál."),
         }
-    )
-        persisted_view["Zdroj dat"] = persisted_view["Zdroj dat"].replace({"simulation": "Simulace", "binance": "Binance", "binance_copy": "Binance Copy"})
-        persisted_view = _split_datetime_column(persisted_view, "Vytvořeno", "Vytvořeno")
-        persisted_config = {
-        "ID": st.column_config.NumberColumn("ID", help="Interní ID uloženého běhu."),
-        "Vytvořeno - Datum": st.column_config.TextColumn("Vytvořeno - Datum", help="Datum uložení záznamu (dd.mm.yy)."),
-        "Vytvořeno - Čas": st.column_config.TextColumn("Vytvořeno - Čas", help="Čas uložení záznamu (hh:mm)."),
-        "Týden": st.column_config.NumberColumn("Týden", help="Pořadí týdenního vyhodnocení."),
-        "Generace": st.column_config.NumberColumn("Generace", help="Generace modelové populace."),
-        "Zdroj dat": st.column_config.TextColumn("Zdroj dat", help="Použitý zdroj tržních dat (Simulace/Binance)."),
-        "Symbol": st.column_config.TextColumn("Symbol", help="Hlavní obchodovaný symbol pro běh."),
-        "Vítězný model": st.column_config.TextColumn("Vítězný model", help="Model s nejvyšším skóre v daném týdnu."),
-        "Skóre vítěze": st.column_config.NumberColumn("Skóre vítěze", help="Výstup decision matrix vítězného modelu."),
-        "Sortino vítěze": st.column_config.NumberColumn("Sortino vítěze", help="Sortino ratio vítězného modelu."),
-        "Calmar vítěze": st.column_config.NumberColumn("Calmar vítěze", help="Calmar ratio vítězného modelu."),
-        "Max DD vítěze": st.column_config.NumberColumn("Max DD vítěze", help="Největší pokles vítězného modelu."),
-        "CVaR95 vítěze": st.column_config.NumberColumn("CVaR95 vítěze", help="Tail-risk metrika vítěze (95 %)."),
-        "Odměna (USD)": st.column_config.NumberColumn("Odměna (USD)", help="Gamifikovaná odměna vítězi kola."),
-    }
-        st.dataframe(persisted_view, use_container_width=True, column_config=persisted_config)
+        st.dataframe(winner_history, use_container_width=True, column_config=history_config, hide_index=True)
 
         st.warning(
             "Pokud je notebook vypnutý, pozice zůstanou uložené v databázi. "

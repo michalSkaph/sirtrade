@@ -25,6 +25,7 @@ from .engine import TradingEngine
 from .execution import build_dry_run_orders
 from .market_stream import get_stream_diagnostics
 from .reporting import export_weekly_report
+from .run_summary import hydrate_engine_from_summary
 from .storage import init_db, save_closed_positions, save_open_positions, save_week_result
 from .ui_state import (
     load_runtime_state,
@@ -416,12 +417,7 @@ def _hydrate_engines_from_saved_runs(
         summary = segment_runs.get(segment)
         if not isinstance(summary, dict):
             continue
-        week = max(0, _coerce_int(summary.get("week"), 0))
-        generation = max(1, _coerce_int(summary.get("generation"), 1))
-        engine.week = max(engine.week, week)
-        engine.generation = max(engine.generation, generation)
-        for model in engine.models:
-            model.generation = engine.generation
+        hydrate_engine_from_summary(engine, summary)
 
 
 def _choose_segments(
@@ -518,6 +514,7 @@ def _run_worker_loop() -> None:
                         previous_summary=segment_runs.get(segment),
                     )
                 result = _apply_trade_cutoff(result, paper_trade_cutoff_ts)
+                result["reset_token"] = _coerce_int(reset_token, 0)
                 latest_runtime_state = load_runtime_state()
                 latest_running = latest_runtime_state.get("simulation_running_by_segment", {})
                 if (

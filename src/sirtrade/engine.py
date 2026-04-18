@@ -62,6 +62,8 @@ class ModelResult:
     passed: bool
     closed_trades: int = 0
     win_rate: float = 50.0
+    profit_factor: float = 0.0
+    pnl_czk: float = 0.0
 
 
 def _current_execution_timestamp() -> pd.Timestamp:
@@ -299,15 +301,26 @@ class TradingEngine:
         required_trades = self._min_closed_trades_for_evolution()
         return float(np.clip(float(max(0, closed_trades)) / float(required_trades), 0.0, 1.0))
 
+    def _has_minimum_trades_for_evolution(self, leaderboard: pd.DataFrame) -> bool:
+        if not isinstance(leaderboard, pd.DataFrame) or leaderboard.empty or "closed_trades" not in leaderboard.columns:
+            return False
+        closed_trades = pd.to_numeric(leaderboard["closed_trades"], errors="coerce").fillna(0.0)
+        required_trades = float(self._min_closed_trades_for_evolution())
+        return bool((closed_trades >= required_trades).any())
+
     def _stabilized_win_rate(self, raw_win_rate: float, closed_trades: int) -> float:
         confidence = self._sample_confidence(closed_trades)
         return 50.0 + ((float(raw_win_rate) - 50.0) * confidence)
 
     def _trade_analytics_for_events(self, model_id: str, events: list[dict[str, Any]]) -> dict[str, float | int]:
         analytics = self._summarize_trade_analytics({str(model_id): list(events or [])})
+        closed_trades = int(analytics.get("closed_trades", 0) or 0)
+        total_pnl_czk = float(analytics.get("expectancy_czk", 0.0) or 0.0) * float(closed_trades)
         return {
-            "closed_trades": int(analytics.get("closed_trades", 0) or 0),
+            "closed_trades": closed_trades,
             "win_rate": float(analytics.get("win_rate", 50.0) or 50.0),
+            "profit_factor": float(analytics.get("profit_factor", 0.0) or 0.0),
+            "pnl_czk": float(total_pnl_czk),
         }
 
     def _market_seed(self, symbol: str, offset: int = 0) -> int:
@@ -638,6 +651,8 @@ class TradingEngine:
             passed=passed,
             closed_trades=int(trade_analytics["closed_trades"]),
             win_rate=float(trade_analytics["win_rate"]),
+            profit_factor=float(trade_analytics.get("profit_factor", 0.0)),
+            pnl_czk=float(trade_analytics.get("pnl_czk", 0.0)),
         )
         return {
             "result": result,
@@ -1443,6 +1458,8 @@ class TradingEngine:
             passed=passed,
             closed_trades=int(trade_analytics["closed_trades"]),
             win_rate=float(trade_analytics["win_rate"]),
+            profit_factor=float(trade_analytics.get("profit_factor", 0.0)),
+            pnl_czk=float(trade_analytics.get("pnl_czk", 0.0)),
         )
         final_position = float(pos.iloc[-1]) if not pos.empty else 0.0
         final_open_slots = int(current_slots if side != 0 else 0)
@@ -2277,7 +2294,7 @@ class TradingEngine:
         )
         trade_analytics = self._summarize_trade_analytics(model_trades)
 
-        if self.week % self.config.generation_horizon_weeks == 0:
+        if self.week % self.config.generation_horizon_weeks == 0 and self._has_minimum_trades_for_evolution(results_df):
             self._evolve_generation(results_df)
 
         summary = {
