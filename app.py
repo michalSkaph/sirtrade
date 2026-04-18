@@ -6,7 +6,6 @@ import html
 import urllib.error
 import urllib.request
 import re
-import subprocess
 import time
 import zipfile
 import os
@@ -16,6 +15,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+from src.sirtrade.build_info import get_last_commit_info
 from src.sirtrade.config import DEFAULT_CONFIG, INITIAL_PAPER_WALLET_CZK, PAPER_TRADE_SIZE_CZK
 from src.sirtrade.copy_trading import get_copy_trading_status
 from src.sirtrade.data import fetch_binance_market
@@ -89,34 +89,7 @@ ensure_health_server_started()
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _get_last_commit_info() -> str:
-    env_val = os.getenv("SIRTRADE_LAST_COMMIT")
-    if env_val:
-        return env_val
-
-    for fname in ("LAST_COMMIT", ".last_commit"):
-        path = Path(fname)
-        if not path.exists():
-            continue
-        try:
-            content = path.read_text(encoding="utf-8").strip()
-        except Exception:
-            continue
-        if content:
-            return content
-
-    try:
-        if Path(".git").exists():
-            output = subprocess.check_output(
-                ["git", "log", "-1", "--format=%cI"],
-                stderr=subprocess.DEVNULL,
-            )
-            value = output.decode().strip()
-            if value:
-                return value
-    except Exception:
-        pass
-
-    return "unknown"
+    return get_last_commit_info()
 
 
 try:
@@ -152,7 +125,6 @@ def _load_segment_runs_cached() -> dict[str, dict[str, object]]:
     return runs if isinstance(runs, dict) else {}
 
 
-@st.cache_data(ttl=10, show_spinner=False)
 def _load_closed_positions_cached(limit: int | None, segment: str | None = None) -> pd.DataFrame:
     return load_closed_positions(limit=limit, segment=segment)
 

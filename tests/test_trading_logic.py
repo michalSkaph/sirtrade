@@ -18,7 +18,7 @@ from src.sirtrade.engine import ModelResult
 from src.sirtrade.execution import build_dry_run_orders
 from src.sirtrade.copy_trading import LeadTraderProfile, fetch_copy_trader_leaderboard, get_copy_trading_status, select_best_lead_trader
 from src.sirtrade.config import DEFAULT_CONFIG, PAPER_TRADE_SIZE_CZK
-from src.sirtrade.health_server import _build_worker_health_payload
+from src.sirtrade.health_server import _build_status_payload, _build_worker_health_payload
 from src.sirtrade.live_worker import (
     _apply_trade_cutoff,
     _choose_segments,
@@ -501,8 +501,29 @@ class TradingLogicTests(unittest.TestCase):
                 is_fresh, payload = _build_worker_health_payload()
 
             self.assertTrue(is_fresh)
+            self.assertTrue(str(payload["deployed_commit"]).strip())
             self.assertTrue(bool(payload["worker"]["fresh"]))
             self.assertEqual(payload["worker"]["status"], "ok")
+
+    def test_worker_health_payload_includes_deployed_commit(self) -> None:
+        with patch(
+            "src.sirtrade.health_server.load_worker_status",
+            return_value={"status": "running", "heartbeat_at": pd.Timestamp.now(tz="UTC")},
+        ), patch("src.sirtrade.health_server.get_last_commit_info", return_value="ead5d08 2026-04-18T14:46:42+02:00 v16"):
+            is_fresh, payload = _build_worker_health_payload()
+
+        self.assertTrue(is_fresh)
+        self.assertEqual(payload["deployed_commit"], "ead5d08 2026-04-18T14:46:42+02:00 v16")
+
+    def test_status_payload_includes_deployed_commit(self) -> None:
+        with patch("src.sirtrade.health_server.load_runtime_state", return_value={"active_segment": "Scalp"}), patch(
+            "src.sirtrade.health_server.load_worker_status", return_value={"status": "running", "active_segment": "Scalp"}
+        ), patch("src.sirtrade.health_server.get_last_commit_info", return_value="ead5d08 2026-04-18T14:46:42+02:00 v16"):
+            payload = _build_status_payload()
+
+        self.assertEqual(payload["deployed_commit"], "ead5d08 2026-04-18T14:46:42+02:00 v16")
+        self.assertEqual(payload["runtime_state"]["active_segment"], "Scalp")
+        self.assertEqual(payload["worker"]["status"], "running")
 
     def test_running_segment_heartbeat_refreshes_worker_status(self) -> None:
         heartbeat = _RunningSegmentHeartbeat(

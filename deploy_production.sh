@@ -13,6 +13,10 @@ cd "$PROJECT_DIR"
 echo "[1/5] Pulling latest code..."
 git pull --ff-only
 
+CURRENT_COMMIT="$(git log -1 --format='%h %cI %s')"
+printf '%s\n' "$CURRENT_COMMIT" > LAST_COMMIT
+echo "Deploying commit: $CURRENT_COMMIT"
+
 echo "[2/5] Building and starting containers..."
 sudo docker-compose up -d --build
 

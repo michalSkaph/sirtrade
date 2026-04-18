@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 
+from .build_info import get_last_commit_info
 from .copy_trading import get_copy_trading_status
 from .data import fetch_binance_market
 from .market_stream import get_stream_diagnostics
@@ -76,9 +77,11 @@ def _build_worker_health_payload() -> tuple[bool, dict[str, object]]:
     heartbeat = pd.to_datetime(status.get("heartbeat_at"), utc=True, errors="coerce")
     stale_after = int(os.getenv("SIRTRADE_WORKER_STALE_SECONDS", str(DEFAULT_WORKER_STALE_SECONDS)))
     stream_status = status.get("market_stream") if isinstance(status.get("market_stream"), dict) else get_stream_diagnostics()
+    deployed_commit = get_last_commit_info()
 
     if pd.isna(heartbeat):
         return False, {
+            "deployed_commit": deployed_commit,
             "worker": {
                 "status": "missing",
                 "fresh": False,
@@ -90,6 +93,7 @@ def _build_worker_health_payload() -> tuple[bool, dict[str, object]]:
     age_seconds = max(0.0, (pd.Timestamp.now(tz="UTC") - heartbeat).total_seconds())
     fresh = age_seconds <= stale_after
     payload = {
+        "deployed_commit": deployed_commit,
         "worker": {
             **status,
             "fresh": fresh,
@@ -105,6 +109,7 @@ def _build_status_payload() -> dict[str, object]:
     runtime_state = load_runtime_state()
     worker_status = load_worker_status()
     return {
+        "deployed_commit": get_last_commit_info(),
         "runtime_state": runtime_state,
         "worker": worker_status,
         "market_stream": worker_status.get("market_stream", get_stream_diagnostics()),

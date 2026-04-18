@@ -88,6 +88,7 @@ docker compose up -d --build
 ```
 
 Docker Compose nyní předá copy-trader proměnné z host prostředí nebo z lokálního `.env` souboru i do workeru a health serveru.
+Deploy skript navíc před buildem vygeneruje soubor `LAST_COMMIT`, takže UI vpravo dole ukáže přesný commit nasazený v produkci.
 
 Tím se spustí:
 - `sirtrade-ui` na portu `8501`
@@ -108,7 +109,7 @@ docker compose logs -f sirtrade-health
 
 ### 4) Health endpointy
 - `http://<server>:8080/health` — stav health serveru + čerstvost heartbeat workeru (200 = OK, 503 = degraded)
-- `http://<server>:8080/status` — detail runtime stavu workeru, runtime_state a diagnostika Binance streamů
+- `http://<server>:8080/status` — detail runtime stavu workeru, runtime_state, `deployed_commit` a diagnostika Binance streamů
 - `http://<server>:8080/market-chart?symbol=BTCUSDT&interval=1m&limit=300` — JSON feed pro live OHLC graf bez refresh blikání UI
 
 ### 5) Live data vrstva
