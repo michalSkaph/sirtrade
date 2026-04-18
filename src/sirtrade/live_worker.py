@@ -142,6 +142,62 @@ def _write_worker_status(**fields: Any) -> None:
     save_worker_status(payload)
 
 
+class _RunningSegmentHeartbeat:
+    def __init__(
+        self,
+        *,
+        segment: str,
+        market_source: str,
+        symbol: str,
+        interval: str,
+        interval_seconds: float = WORKER_HEARTBEAT_SECONDS,
+    ) -> None:
+        self.segment = segment
+        self.market_source = market_source
+        self.symbol = symbol
+        self.interval = interval
+        self.interval_seconds = max(0.1, float(interval_seconds))
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_RunningSegmentHeartbeat":
+        self.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        self.stop()
+        return False
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"sirtrade-heartbeat-{self.segment.lower()}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is None:
+            return
+        self._thread.join(timeout=self.interval_seconds + 1.0)
+        self._thread = None
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.interval_seconds):
+            _write_worker_status(
+                status="running",
+                active_segment=self.segment,
+                market_source=self.market_source,
+                symbol=self.symbol,
+                interval=self.interval,
+                message=f"Running segment {self.segment}",
+            )
+
+
 def _extract_slot_delta(action: str, entry: bool) -> int:
     pattern = r"\(\+(\d+)\)" if entry else r"\(-?(\d+)\)"
     match = re.search(pattern, str(action))
@@ -446,15 +502,21 @@ def _run_worker_loop() -> None:
                     interval=str(cfg["interval"]),
                     message=f"Running segment {segment}",
                 )
-                result = run_segment_cycle(
-                    engine=engines[segment],
+                with _RunningSegmentHeartbeat(
                     segment=segment,
                     market_source=data_source,
                     symbol=symbol,
-                    days=int(cfg["sim_days"]),
                     interval=str(cfg["interval"]),
-                    previous_summary=segment_runs.get(segment),
-                )
+                ):
+                    result = run_segment_cycle(
+                        engine=engines[segment],
+                        segment=segment,
+                        market_source=data_source,
+                        symbol=symbol,
+                        days=int(cfg["sim_days"]),
+                        interval=str(cfg["interval"]),
+                        previous_summary=segment_runs.get(segment),
+                    )
                 result = _apply_trade_cutoff(result, paper_trade_cutoff_ts)
                 latest_runtime_state = load_runtime_state()
                 latest_running = latest_runtime_state.get("simulation_running_by_segment", {})

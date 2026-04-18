@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -23,6 +23,7 @@ from src.sirtrade.live_worker import (
     _apply_trade_cutoff,
     _choose_segments,
     _get_binance_cadence_seconds,
+    _RunningSegmentHeartbeat,
     _WorkerProcessLock,
     should_start_embedded_worker,
 )
@@ -489,6 +490,31 @@ class TradingLogicTests(unittest.TestCase):
             self.assertTrue(is_fresh)
             self.assertTrue(bool(payload["worker"]["fresh"]))
             self.assertEqual(payload["worker"]["status"], "ok")
+
+    def test_running_segment_heartbeat_refreshes_worker_status(self) -> None:
+        heartbeat = _RunningSegmentHeartbeat(
+            segment="Scalp",
+            market_source="binance",
+            symbol="BTCUSDT",
+            interval="1m",
+            interval_seconds=0.1,
+        )
+        mock_event = Mock()
+        mock_event.wait.side_effect = [False, False, True]
+        heartbeat._stop_event = mock_event
+
+        with patch("src.sirtrade.live_worker._write_worker_status") as write_worker_status:
+            heartbeat._run()
+
+        self.assertEqual(write_worker_status.call_count, 2)
+        first_call = write_worker_status.call_args_list[0].kwargs
+        self.assertEqual(first_call["status"], "running")
+        self.assertEqual(first_call["active_segment"], "Scalp")
+        self.assertEqual(first_call["market_source"], "binance")
+        self.assertEqual(first_call["symbol"], "BTCUSDT")
+        self.assertEqual(first_call["interval"], "1m")
+        self.assertEqual(first_call["message"], "Running segment Scalp")
+
     def test_live_cycle_allows_same_symbol_side_across_models(self) -> None:
         engine = TradingEngine()
         engine.models = [
